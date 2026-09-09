@@ -1,0 +1,243 @@
+# Multi-architecture build-and-publish workflow for the rootless ioBroker
+# container image. (Task 16.1)
+#
+# Trigger model:
+#   - Pushed git tag matching `v*`  -> BUILD + PUBLISH (multi-arch manifest push).
+#   - Pull requests / pushes to main -> BUILD-ONLY (both arches, gate runs, no push).
+#   - workflow_dispatch              -> manual dry-run BUILD-ONLY (no push).
+#
+# NODE_MAJOR (from `nodeMajor`) and DEBIAN_CODENAME (from `debianCodename`) are
+# read once from the maintainer-owned Build_Config in package.json (the
+# `containerImage` key), reusing the same strict derivation as lib/node-major.js
+# + lib/build-config.js. The workflow FAILS FAST before any build step in EVERY
+# trigger mode when a knob is missing/empty/invalid. (Req 5.4, 5.5, 5.7)
+#
+# The image is published EXPLICITLY as ghcr.io/<owner>/iobroker (lowercased),
+# NOT derived from github.repository (which would give ...iobroker.container-image).
+# (Req 1.3)
+#
+# Per-arch build jobs target the Dockerfile `verify` stage so the
+# runtime-dependency verification gate (task 15.1) runs inside each architecture
+# build. The publish job pushes the single multi-arch manifest of the shippable
+# `runtime` stage, and only after BOTH per-arch build+gate jobs succeed
+# (all-or-nothing). (Req 1.1, 1.2, 1.6, 1.8, 2.6, 2.7)
+
+name: build-publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Least-privilege: read the repo everywhere; only the publish job additionally
+# requests packages:write (declared at the job level).
+permissions:
+  contents: read
+
+env:
+  # Explicit, lowercase GHCR image name: <owner>/iobroker. The owner is
+  # normalized to lowercase in the read-build-config job (GHCR requires
+  # lowercase names, and github.repository_owner may contain uppercase).
+  IMAGE_NAME: iobroker
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fail-fast Build_Config read. Runs in ALL trigger modes and MUST succeed
+  # before any build job starts (every build job `needs` this job). If
+  # package.json `containerImage.nodeMajor` is missing/empty/invalid, or
+  # `debianCodename` is missing/empty, this job fails and no build ever runs.
+  # (Req 5.4, 5.5, 5.7)
+  # ---------------------------------------------------------------------------
+  read-build-config:
+    name: Read Build_Config (fail-fast)
+    runs-on: ubuntu-latest
+    outputs:
+      node_major: ${{ steps.read.outputs.node_major }}
+      debian_codename: ${{ steps.read.outputs.debian_codename }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read NODE_MAJOR and DEBIAN_CODENAME from package.json containerImage
+        id: read
+        # Reuse the exact strict derivation from lib/node-major.js +
+        # lib/build-config.js. Read the maintainer-owned Build_Config from the
+        # repo-root package.json `containerImage` key. Fail (exit 1) with a
+        # naming error if nodeMajor is missing/empty/invalid or debianCodename is
+        # missing/empty — never fall back to a system default. (Req 5.4, 5.5, 5.7)
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { readPackageJson, readDebianCodename } from './lib/build-config.js';
+          import { deriveNodeMajorFromPackageJson } from './lib/node-major.js';
+
+          try {
+            const pkg = readPackageJson('./package.json');
+
+            const major = deriveNodeMajorFromPackageJson(pkg);
+
+            const codename = readDebianCodename(pkg);
+            if (typeof codename !== 'string' || codename.trim().length === 0) {
+              throw new Error(
+                'Build_Config field `debianCodename` is missing or empty in package.json containerImage.',
+              );
+            }
+
+            console.log(
+              `Read NODE_MAJOR=${major} (nodeMajor), DEBIAN_CODENAME=${codename.trim()} ` +
+                `(debianCodename) from package.json containerImage.`,
+            );
+            appendFileSync(process.env.GITHUB_OUTPUT, `node_major=${major}\n`);
+            appendFileSync(process.env.GITHUB_OUTPUT, `debian_codename=${codename.trim()}\n`);
+          } catch (err) {
+            console.error(`ERROR: ${err && err.message ? err.message : err}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Resolve lowercase image reference
+        id: image
+        # Published image name is set EXPLICITLY as ghcr.io/<owner>/iobroker,
+        # NOT github.repository (which would yield ...iobroker.container-image).
+        # GHCR names must be lowercase. (Req 1.3)
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Per-architecture build + runtime-dependency gate. Runs for EVERY trigger
+  # (PRs, main, tags, dispatch) with push disabled: it builds each arch and
+  # targets the Dockerfile `verify` stage so the runtime-dependency gate runs
+  # in-build. A failing arch fails its matrix leg and names the architecture.
+  # (Req 1.1, 1.2, 2.6, 2.7)
+  # ---------------------------------------------------------------------------
+  build-arch:
+    name: Build ${{ matrix.arch }} (+ gate)
+    needs: read-build-config
+    runs-on: ubuntu-latest
+    strategy:
+      # Do not cancel the other arch when one fails, so the log clearly reports
+      # which architecture failed.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.arch }} and run runtime-dependency gate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Single arch per matrix leg so a failure clearly maps to an arch.
+          platforms: ${{ matrix.platform }}
+          # Target the verify stage so the runtime-dependency gate (task 15.1)
+          # executes as part of this build. If the gate fails, the build fails.
+          target: verify
+          # Build-only: never push from the per-arch validation job.
+          push: false
+          load: false
+          build-args: |
+            NODE_MAJOR=${{ needs.read-build-config.outputs.node_major }}
+            DEBIAN_CODENAME=${{ needs.read-build-config.outputs.debian_codename }}
+
+      - name: Report failing architecture
+        if: failure()
+        run: |
+          echo "::error title=Build failed::Architecture '${{ matrix.arch }}' (${{ matrix.platform }}) failed to build or did not pass the runtime-dependency gate."
+
+  # ---------------------------------------------------------------------------
+  # Publish a single multi-arch manifest. Runs ONLY on a pushed v* git tag, and
+  # ONLY after BOTH per-arch builds + gates succeed (all-or-nothing). buildx
+  # pushes one manifest list referencing both arch variants under the shared
+  # immutable version tag + latest. (Req 1.3, 1.6, 1.8)
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish multi-arch manifest
+    needs:
+      - read-build-config
+      - build-arch
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Explicit image name (NOT github.repository). (Req 1.3)
+          images: ${{ needs.read-build-config.outputs.image }}
+          tags: |
+            # Immutable version tag from the v* git tag (semver, leading v
+            # stripped) applied to the single multi-arch manifest.
+            type=semver,pattern={{version}}
+            # latest applied to the same manifest on tag pushes.
+            type=raw,value=latest
+          labels: |
+            # Link the GHCR package (name `iobroker`) back to its source repo.
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push single multi-arch manifest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Both platforms in one push -> one manifest list. buildx pushes the
+          # manifest only after both platform builds succeed, so no
+          # single-arch image is ever published. (Req 1.6, 1.8)
+          platforms: linux/amd64,linux/arm64
+          # Publish the shippable `runtime` stage (NOT the verify stage, which
+          # only adds gate RUN layers). The runtime-dependency gate is still
+          # enforced all-or-nothing before this job runs: `publish` needs the
+          # per-arch `build-arch` jobs, each of which builds the `verify` target
+          # and fails if the gate fails, so no push happens unless BOTH arches
+          # passed the gate. (Req 2.6, 2.7, 1.8)
+          target: runtime
+          push: true
+          build-args: |
+            NODE_MAJOR=${{ needs.read-build-config.outputs.node_major }}
+            DEBIAN_CODENAME=${{ needs.read-build-config.outputs.debian_codename }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

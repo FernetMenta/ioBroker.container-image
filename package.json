@@ -1,0 +1,39 @@
+{
+  "name": "iobroker-container-image",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rootless, multi-architecture ioBroker container image: pure decision-logic modules and their tests.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "containerImage": {
+    "nodeMajor": 22,
+    "debianCodename": "trixie"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "build:local": "scripts/build-local.sh single",
+    "build:local:multi": "scripts/build-local.sh multi"
+  },
+  "license": "MIT",
+  "author": "FernetMenta <fernetmenta@online.de>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FernetMenta/ioBroker.container-image"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^9.1.0",
+    "fast-check": "^3.19.0",
+    "globals": "^15.0.0",
+    "prettier": "^3.3.0",
+    "vitest": "^3.2.7"
+  }
+}
