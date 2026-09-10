@@ -86,6 +86,30 @@ See [docs/volumes-and-multihost.md](docs/volumes-and-multihost.md) for
 persistence behavior, startup reconciliation, multihost clusters (networked
 jsonl or Redis), and Kubernetes probe examples.
 
+## Upgrading
+
+You upgrade js-controller and the whole runtime by pulling a newer image and
+recreating the container against the same volumes. Your data is kept and the new
+container runs the new code:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+(The commands work the same with Podman — substitute `podman` for `docker`.)
+
+There is intentionally no "upgrade js-controller" button in the admin UI (that
+path is tied to the official image, which this rootless image is not); adapter
+upgrades from the admin UI still work as usual.
+
+One thing to know: if you mounted the optional `node_modules` volume, you also
+need to empty that folder before starting the new image, otherwise the container
+keeps running the old js-controller from the volume. Your configuration and
+state are not affected.
+
+See the [Upgrade guide](docs/upgrading.md) for step-by-step instructions
+(Docker, Compose, Kubernetes), backups, and the `node_modules` details.
+
 ## Configuration
 
 ioBroker-specific settings use the `IOB_` prefix (for example `IOB_ADMIN_PORT`,

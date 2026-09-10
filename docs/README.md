@@ -14,5 +14,6 @@ Content is authored in task 17:
 
 Available now:
 
+- [Upgrading ioBroker](upgrading.md) - how to upgrade js-controller and the runtime by pulling a new image, backups, rollback, the optional `node_modules` volume step, and why there is no in-admin controller-upgrade button.
 - [Building the image locally](building.md) - the local build path that mirrors CI (task 16.2).
 - [Volumes, persistence, and multihost](volumes-and-multihost.md) - persistence layout (Data/Log/Modules volumes), reconciliation behavior, Docker/Podman/k8s mount examples, multihost/database-backend usage, and Kubernetes liveness/readiness probe examples (task 17.3).

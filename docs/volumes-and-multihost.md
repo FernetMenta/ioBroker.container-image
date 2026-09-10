@@ -14,6 +14,11 @@ The image installs ioBroker under `/opt/iobroker`, ships its entrypoint and
 helper scripts under `/opt/scripts` (with decision modules under `/opt/lib`),
 and exposes the healthcheck at `/opt/scripts/healthcheck.sh`.
 
+> **Upgrading?** js-controller and the runtime are upgraded by pulling a newer
+> image and recreating the container — see the dedicated
+> [Upgrade guide](./upgrading.md). This page focuses on the persistence layout
+> those upgrades rely on.
+
 ## Persistence layout
 
 The image persists only the folders that hold configuration, state, logs, and
