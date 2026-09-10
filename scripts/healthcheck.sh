@@ -8,11 +8,22 @@
 #      that timeout; a non-zero exit OR a timeout is a failed check
 #      (Req 9.1, 9.2),
 #   2. gathers the facts a decision needs — how long the runtime has been up,
-#      the two tolerance-window sizes, and whether an upgrade is in progress —
-#      and
+#      the tolerance-window sizes, and whether a reconcile is in progress
+#      together with its heartbeat age — and
 #   3. hands those facts to the pure decision module `lib/health-state.js`
 #      (computeHealthState) and exits with the exit code it returns: 0 for
 #      healthy/starting, 1 for unhealthy (Req 9.5, 9.10).
+#
+# NOTE on the Upgrade_Tolerance_Window (Req 9.4/9.9): the pure module still
+# supports an independent upgrade-tolerance window and the operator knob
+# `IOB_UPGRADE_TOLERANCE_WINDOW` remains available, but this script does NOT try
+# to detect an in-progress upgrade. In this image, js-controller/adapter upgrades
+# are quick and do not restart the whole container long enough to matter, and the
+# genuinely slow phase (first-boot / post-upgrade reconciliation) is covered by
+# the reconcile-liveness heartbeat below rather than a fixed window. The upgrade
+# window is therefore left dormant (upgradeInProgress is always reported false)
+# unless a future component supplies the fact; the knob is retained so operators
+# can still widen tolerance if their environment needs it.
 #
 # All decision logic (the two independent tolerance windows, the healthy /
 # starting / unhealthy mapping) lives in the pure module so it can be
@@ -32,14 +43,21 @@
 # Environment (Req 9.8, 9.9; design §10 env table):
 #   IOB_STARTUP_GRACE_PERIOD      Startup_Grace_Period in seconds  (default 300)
 #   IOB_UPGRADE_TOLERANCE_WINDOW  Upgrade_Tolerance_Window seconds (default 600)
+#   IOB_RECONCILE_STALL_TOLERANCE Reconcile_Stall_Tolerance seconds (default 120):
+#                                 max the reconcile heartbeat may go stale before
+#                                 a live reconcile is no longer assumed. This
+#                                 bounds STALL, not total reconcile duration.
 #
 # Environment overrides (primarily for testing / non-default layouts):
 #   IOB_ROOT              ioBroker install root (default /opt/iobroker)
 #   IOB_START_MARKER      path to the runtime start marker written by the
 #                         entrypoint (default $IOB_ROOT/iobroker-data/.iob-started)
-#   IOB_UPGRADE_MARKER    path to the upgrade-in-progress sentinel written by the
-#                         entrypoint/upgrade hook (default
-#                         $IOB_ROOT/iobroker-data/.iob-upgrading)
+#   IOB_RECONCILE_MARKER  path to the reconcile-in-progress marker written by
+#                         scripts/reconcile.sh (default
+#                         $IOB_ROOT/iobroker-data/.iob-reconciling)
+#   IOB_RECONCILE_HEARTBEAT path to the reconcile liveness heartbeat advanced by
+#                         scripts/reconcile.sh (default
+#                         $IOB_ROOT/iobroker-data/.iob-reconcile-heartbeat)
 #   IOB_STATUS_CMD        the status command to run (default "iobroker status");
 #                         word-split, so it may include arguments
 #   IOB_CHECK_TIMEOUT     per-check timeout in seconds (default 30; Req 9.1)
@@ -60,7 +78,8 @@ HEALTH_MODULE="${REPO_ROOT}/lib/health-state.js"
 IOB_ROOT="${IOB_ROOT:-/opt/iobroker}"
 IOB_DATA_DIR="${IOB_DATA_DIR:-${IOB_ROOT}/iobroker-data}"
 IOB_START_MARKER="${IOB_START_MARKER:-${IOB_DATA_DIR}/.iob-started}"
-IOB_UPGRADE_MARKER="${IOB_UPGRADE_MARKER:-${IOB_DATA_DIR}/.iob-upgrading}"
+IOB_RECONCILE_MARKER="${IOB_RECONCILE_MARKER:-${IOB_DATA_DIR}/.iob-reconciling}"
+IOB_RECONCILE_HEARTBEAT="${IOB_RECONCILE_HEARTBEAT:-${IOB_DATA_DIR}/.iob-reconcile-heartbeat}"
 IOB_STATUS_CMD="${IOB_STATUS_CMD:-iobroker status}"
 IOB_CHECK_TIMEOUT="${IOB_CHECK_TIMEOUT:-30}"
 
@@ -70,6 +89,7 @@ IOB_CHECK_TIMEOUT="${IOB_CHECK_TIMEOUT:-30}"
 # here; the entrypoint owns range validation of operator config.
 STARTUP_GRACE_PERIOD="${IOB_STARTUP_GRACE_PERIOD:-300}"
 UPGRADE_TOLERANCE_WINDOW="${IOB_UPGRADE_TOLERANCE_WINDOW:-600}"
+RECONCILE_STALL_TOLERANCE="${IOB_RECONCILE_STALL_TOLERANCE:-120}"
 
 log() { echo "healthcheck: $*" >&2; }
 
@@ -130,33 +150,51 @@ if [[ "${startup_elapsed_seconds}" -lt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Detect upgrade-in-progress and, when in progress, its elapsed time.
+# 3. Upgrade-in-progress: not detected in this image (dormant window).
 #
-# Two independent signals (design §6): a sentinel marker file written by the
-# entrypoint/upgrade hook, and/or a running js-controller/adapter upgrade
-# process. Either one means an upgrade is in progress. When the marker is
-# present we take the upgrade's elapsed time from its modification time; a bare
-# running-process signal without a marker yields elapsed 0 (freshly detected),
-# which keeps us inside the upgrade window.
+# The pure module keeps an independent Upgrade_Tolerance_Window and the operator
+# knob `IOB_UPGRADE_TOLERANCE_WINDOW` is retained, but this script does not probe
+# for an in-progress upgrade: js-controller/adapter upgrades here are quick, and
+# the slow first-boot / post-upgrade phase is covered by the reconcile-liveness
+# heartbeat (step 3b), not a fixed window. So we always report upgradeInProgress
+# = false, which — since the window only applies while an upgrade is in progress
+# — leaves the upgrade window inert without changing the module's contract. If a
+# future component learns to signal an in-progress upgrade, set these two facts.
 # ---------------------------------------------------------------------------
 upgrade_in_progress=false
 upgrade_elapsed_seconds=0
 
-if [[ -f "${IOB_UPGRADE_MARKER}" ]]; then
-  upgrade_in_progress=true
-  up_mtime="$(stat -c '%Y' -- "${IOB_UPGRADE_MARKER}" 2>/dev/null || echo "")"
-  if [[ -n "${up_mtime}" ]]; then
-    upgrade_elapsed_seconds=$(( now - up_mtime ))
-    if [[ "${upgrade_elapsed_seconds}" -lt 0 ]]; then
-      upgrade_elapsed_seconds=0
+# ---------------------------------------------------------------------------
+# 3b. Detect reconcile-in-progress and, when in progress, its heartbeat age.
+#
+# The entrypoint runs reconciliation BEFORE js-controller starts, so the status
+# command fails for that whole phase. Unlike startup/upgrade, reconcile has no
+# meaningful upper time bound (slow link / slow SD card / many adapters), so we
+# do NOT gate it on an elapsed-since-start window. Instead reconcile.sh publishes
+# a marker (in progress) and a heartbeat it advances around every step; we report
+# the heartbeat AGE and let the pure module tolerate failures only while that age
+# stays under the stall tolerance. A live reconcile is thus tolerated for any
+# duration; a stalled one (stale heartbeat) is not.
+# ---------------------------------------------------------------------------
+reconcile_in_progress=false
+reconcile_heartbeat_age_seconds=0
+
+if [[ -f "${IOB_RECONCILE_MARKER}" ]]; then
+  reconcile_in_progress=true
+  hb_mtime="$(stat -c '%Y' -- "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || echo "")"
+  if [[ -n "${hb_mtime}" ]]; then
+    reconcile_heartbeat_age_seconds=$(( now - hb_mtime ))
+    if [[ "${reconcile_heartbeat_age_seconds}" -lt 0 ]]; then
+      reconcile_heartbeat_age_seconds=0
     fi
+    log "reconcile in progress (${IOB_RECONCILE_MARKER}); heartbeat age ${reconcile_heartbeat_age_seconds}s"
+  else
+    # Marker present but no readable heartbeat: treat as maximally stale so we do
+    # not tolerate indefinitely on a missing heartbeat. A value past any sane
+    # stall tolerance makes the module fall through to the other conditions.
+    reconcile_heartbeat_age_seconds=$(( RECONCILE_STALL_TOLERANCE + 1 ))
+    log "reconcile marker present but heartbeat unreadable; treating heartbeat as stale"
   fi
-  log "upgrade marker present (${IOB_UPGRADE_MARKER}); elapsed ${upgrade_elapsed_seconds}s"
-elif pgrep -f 'iobroker[ ].*(upgrade|update)' >/dev/null 2>&1; then
-  # A running controller/adapter upgrade process, no marker: in progress, fresh.
-  upgrade_in_progress=true
-  upgrade_elapsed_seconds=0
-  log "upgrade process detected via process table; treating as in progress"
 fi
 
 # ---------------------------------------------------------------------------
@@ -173,6 +211,9 @@ result="$(
   IOB_HC_UPGRADE_IN_PROGRESS="${upgrade_in_progress}" \
   IOB_HC_UPGRADE_ELAPSED="${upgrade_elapsed_seconds}" \
   IOB_HC_UPGRADE_WINDOW="${UPGRADE_TOLERANCE_WINDOW}" \
+  IOB_HC_RECONCILE_IN_PROGRESS="${reconcile_in_progress}" \
+  IOB_HC_RECONCILE_HB_AGE="${reconcile_heartbeat_age_seconds}" \
+  IOB_HC_RECONCILE_STALL="${RECONCILE_STALL_TOLERANCE}" \
   node --input-type=module -e "
     import { computeHealthState } from '${HEALTH_MODULE}';
     const num = (v) => Number(String(v ?? '').trim());
@@ -183,6 +224,9 @@ result="$(
       upgradeInProgress: process.env.IOB_HC_UPGRADE_IN_PROGRESS === 'true',
       upgradeElapsedSeconds: num(process.env.IOB_HC_UPGRADE_ELAPSED),
       upgradeToleranceWindowSeconds: num(process.env.IOB_HC_UPGRADE_WINDOW),
+      reconcileInProgress: process.env.IOB_HC_RECONCILE_IN_PROGRESS === 'true',
+      reconcileHeartbeatAgeSeconds: num(process.env.IOB_HC_RECONCILE_HB_AGE),
+      reconcileStallToleranceSeconds: num(process.env.IOB_HC_RECONCILE_STALL),
     });
     // Emit '<state> <exitCode>' on a single line for the shell to consume.
     process.stdout.write(state + ' ' + exitCode);
@@ -202,6 +246,8 @@ fi
 log "state=${state} exit=${exit_code} (checkSucceeded=${check_succeeded}" \
   "startupElapsed=${startup_elapsed_seconds}/${STARTUP_GRACE_PERIOD}" \
   "upgradeInProgress=${upgrade_in_progress}" \
-  "upgradeElapsed=${upgrade_elapsed_seconds}/${UPGRADE_TOLERANCE_WINDOW})"
+  "upgradeElapsed=${upgrade_elapsed_seconds}/${UPGRADE_TOLERANCE_WINDOW}" \
+  "reconcileInProgress=${reconcile_in_progress}" \
+  "reconcileHeartbeatAge=${reconcile_heartbeat_age_seconds}/${RECONCILE_STALL_TOLERANCE})"
 
 exit "${exit_code}"

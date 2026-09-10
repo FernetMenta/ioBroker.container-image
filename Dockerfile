@@ -492,9 +492,16 @@ USER 1000
 
 # Upgrade-tolerant healthcheck. Exposed as a Docker-style HEALTHCHECK so Docker
 # and Podman can use it; the same script is invokable by Kubernetes probes. The
-# script owns the per-check 30s timeout and the grace/upgrade tolerance logic;
-# the HEALTHCHECK-level --timeout is a coarse outer bound. (Req 9.6)
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+# script owns the per-check 30s timeout and the grace/upgrade/reconcile tolerance
+# logic; the HEALTHCHECK-level --timeout is a coarse outer bound. (Req 9.6)
+#
+# The script itself decides healthy/starting/unhealthy — during startup, an
+# upgrade, or a live reconcile it returns exit 0 (starting) so it does not consume
+# the retry budget. --start-period is therefore a coarse safety buffer, not the
+# primary mechanism: it is kept generous (60s) so that even the very first probes
+# during a normal cold start are not counted, while the reconcile heartbeat (not a
+# fixed window) is what tolerates arbitrarily long first-boot reconciliation.
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD ["/opt/scripts/healthcheck.sh"]
 
 # PID 1 = tini, which execs the entrypoint pipeline. The scripts resolve their

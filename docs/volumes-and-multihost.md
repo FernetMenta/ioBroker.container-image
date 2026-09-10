@@ -524,8 +524,16 @@ Notes:
 - Tune the tolerance windows with `IOB_STARTUP_GRACE_PERIOD` (default `300`
   seconds) and `IOB_UPGRADE_TOLERANCE_WINDOW` (default `600` seconds). While the
   runtime is inside either window, the healthcheck does not report unhealthy, so
-  you generally do not need a large `initialDelaySeconds` on the probes. See
-  [environment-variables.md](./environment-variables.md) for both variables.
+  you generally do not need a large `initialDelaySeconds` on the probes.
+- First-boot and post-upgrade reconciliation (adapter installs, native module
+  rebuilds) can run far longer than any fixed window on a slow connection or slow
+  storage. This is handled separately by a **liveness heartbeat**, not a time
+  window: while reconciliation keeps making progress the healthcheck tolerates the
+  failing status check for any duration, and only reports unhealthy if the
+  heartbeat goes stale for longer than `IOB_RECONCILE_STALL_TOLERANCE` (default
+  `120` seconds). You therefore do not need to size a probe delay to your worst
+  case reconcile time. See
+  [environment-variables.md](./environment-variables.md) for all three variables.
 
 ## See also
 

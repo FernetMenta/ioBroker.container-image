@@ -59,7 +59,52 @@ IOB_DATA_DIR="${IOB_DATA_DIR:-${IOB_ROOT}/iobroker-data}"
 IOB_NODE_MODULES_DIR="${IOB_NODE_MODULES_DIR:-${IOB_ROOT}/node_modules}"
 IOB_RECONCILE_DRY_RUN="${IOB_RECONCILE_DRY_RUN:-false}"
 
+# Reconcile liveness markers consumed by scripts/healthcheck.sh + lib/health-state.js.
+# The entrypoint runs reconciliation BEFORE js-controller starts, so `iobroker
+# status` fails for the whole reconcile phase. That phase has no meaningful upper
+# time bound (slow link / slow SD card / many adapters), so instead of a fixed
+# grace we publish a liveness signal the healthcheck can bound by STALL:
+#   * IOB_RECONCILE_MARKER   present => a reconcile is in progress.
+#   * IOB_RECONCILE_HEARTBEAT its mtime is advanced around every executed step;
+#     while its age stays under Reconcile_Stall_Tolerance the healthcheck treats
+#     reconcile as alive and tolerates the failing status check, for any total
+#     duration. If the heartbeat goes stale, reconcile is stuck and the check
+#     stops being tolerated.
+# Both live in the Data_Volume (same dir the healthcheck defaults to) and are
+# overridable for tests.
+IOB_RECONCILE_MARKER="${IOB_RECONCILE_MARKER:-${IOB_DATA_DIR}/.iob-reconciling}"
+IOB_RECONCILE_HEARTBEAT="${IOB_RECONCILE_HEARTBEAT:-${IOB_DATA_DIR}/.iob-reconcile-heartbeat}"
+
 log() { echo "reconcile: $*" >&2; }
+
+# -- Reconcile liveness signalling -------------------------------------------
+
+# heartbeat: advance the heartbeat file's mtime to "now". Best-effort — a
+# non-writable Data_Volume must not abort reconciliation, it just means the
+# healthcheck falls back to the other tolerance conditions. Creates the file on
+# first call and touches it thereafter.
+heartbeat() {
+  : >>"${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || return 0
+  touch -- "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
+}
+
+# begin_reconcile: mark reconcile in progress and lay down an initial heartbeat.
+begin_reconcile() {
+  : >>"${IOB_RECONCILE_MARKER}" 2>/dev/null || \
+    log "could not create reconcile marker ${IOB_RECONCILE_MARKER} (healthcheck will rely on other tolerance windows)"
+  heartbeat
+}
+
+# end_reconcile: remove the in-progress marker and the heartbeat. Registered on
+# EXIT so the markers are cleared whether reconciliation succeeds, fails, or the
+# script is interrupted — a leftover marker must never make a dead reconcile
+# look alive.
+end_reconcile() {
+  rm -f -- "${IOB_RECONCILE_MARKER}" "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
+}
+trap end_reconcile EXIT
+
+begin_reconcile
 
 # -- Observations (thin, side-effect-free where possible) --------------------
 
@@ -215,16 +260,34 @@ plan="$(
 # In dry-run mode we log the concrete command instead of running it, so tests
 # and diagnostics can assert the mapping without a real ioBroker install.
 run() {
+  # Advance the liveness heartbeat immediately before AND after each executed
+  # command. The before-touch resets the stall clock so a long-but-alive command
+  # (a slow `iobroker add` / `npm rebuild`) does not look stalled while it runs;
+  # the after-touch records that the step made progress. This is the coarse,
+  # per-step liveness signal (no per-command output watchdog by design).
+  heartbeat
   if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
     log "[dry-run] $*"
+    heartbeat
     return 0
   fi
-  "$@"
+  # Capture the command's exit status without letting `set -e` abort here: the
+  # callers decide how to react to a failure (the planner's required install/
+  # rebuild steps are invoked bare so their failure still propagates), and we
+  # want the after-touch to run regardless. `|| rc=$?` keeps the pipeline's
+  # status in `rc` while neutralising set -e for this one line.
+  local rc=0
+  "$@" || rc=$?
+  heartbeat
+  return "${rc}"
 }
 
 # Iterate over the plan lines. Empty plan (no steps) is valid and does nothing.
 while IFS=$'\t' read -r action args_rest; do
   [[ -n "${action}" ]] || continue
+  # Mark progress at the start of every plan step so the heartbeat advances even
+  # for steps that do not go through run() (e.g. a pure log line).
+  heartbeat
   # Split the tab-separated remainder back into an array of arguments.
   args=()
   if [[ -n "${args_rest}" ]]; then

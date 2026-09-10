@@ -259,9 +259,9 @@ reconcile() {
 A single script used by both Docker `HEALTHCHECK` and k8s probes. (Req 9.6, 9.7)
 
 - Runs `iobroker status` (js-controller status command) with a 30s per-check timeout; success only on exit 0 within the timeout. (Req 9.1, 9.2)
-- Computes state from three inputs: check result, elapsed time since start vs `Startup_Grace_Period` (default 300s), and, when an upgrade is in progress, elapsed time within `Upgrade_Tolerance_Window` (default 600s). The two windows are independent — being inside either alone prevents an unhealthy report. (Req 9.3, 9.4, 9.8, 9.9, 9.11)
-- Upgrade-in-progress is detected via an upgrade marker (a sentinel file written by the entrypoint/upgrade hook, and/or presence of a running controller upgrade process).
-- Exit codes: `0` healthy/starting (Docker treats non-zero as unhealthy, so starting maps to 0 within windows), `1` unhealthy outside both windows. (Req 9.5, 9.10)
+- Computes state from these inputs: check result; elapsed time since start vs `Startup_Grace_Period` (default 300s); when an upgrade is in progress, elapsed time within `Upgrade_Tolerance_Window` (default 600s); and, while first-boot/post-upgrade reconciliation is running, the age of a reconcile liveness heartbeat vs `Reconcile_Stall_Tolerance` (default 120s). These tolerance conditions are independent — being inside any one alone prevents an unhealthy report. (Req 9.3, 9.4, 9.8, 9.9, 9.11)
+- The pure module retains an independent `Upgrade_Tolerance_Window` (operator knob `IOB_UPGRADE_TOLERANCE_WINDOW`), but the script does NOT detect an in-progress upgrade: adapter/controller upgrades in this image are quick, so `upgradeInProgress` is always reported false and the window stays dormant unless a future component supplies the fact. The genuinely unbounded phase (reconciliation on a slow link / slow storage / many adapters) is instead covered by a liveness heartbeat: `scripts/reconcile.sh` writes an in-progress marker and advances a heartbeat around every step, and the script reports the heartbeat age. A reconcile is tolerated for ANY total duration while the heartbeat stays fresh; a stale heartbeat (older than `Reconcile_Stall_Tolerance`) is treated as stuck.
+- Exit codes: `0` healthy/starting (Docker treats non-zero as unhealthy, so starting maps to 0 within a tolerance condition), `1` unhealthy outside all tolerance conditions. (Req 9.5, 9.10)
 
 State machine:
 

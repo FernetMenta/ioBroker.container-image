@@ -261,6 +261,22 @@ fi
 # user startup script is ever sourced, and any mounted one is ignored — there
 # is no hook step here by design (Req 13.1, 13.2, 13.3).
 # ---------------------------------------------------------------------------
+# Write the runtime start marker just before handing off to js-controller. The
+# healthcheck anchors its startup grace window to this marker's mtime ("since
+# THIS runtime started") and only falls back to PID 1's start time when the
+# marker is absent. Writing it here — after reconciliation and DB configuration,
+# immediately before exec — means the startup grace clock begins when the
+# controller actually starts, not when the (possibly long) reconcile phase began;
+# the reconcile phase has its own liveness signal. Best-effort: a non-writable
+# Data_Volume must not block startup, it just leaves the healthcheck on its PID 1
+# fallback. The reconcile markers are already cleared by reconcile.sh's EXIT trap.
+IOB_START_MARKER="${IOB_START_MARKER:-${IOBROKER_DIR}/iobroker-data/.iob-started}"
+if : >>"${IOB_START_MARKER}" 2>/dev/null && touch -- "${IOB_START_MARKER}" 2>/dev/null; then
+  log "wrote runtime start marker ${IOB_START_MARKER}"
+else
+  log "could not write start marker ${IOB_START_MARKER} (healthcheck will fall back to PID 1 start time)"
+fi
+
 if [[ ! -f "${JS_CONTROLLER}" ]]; then
   die "js-controller not found at ${JS_CONTROLLER}. \
 This usually means the ${IOBROKER_DIR}/node_modules mount is empty or shadows \
