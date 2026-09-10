@@ -100,6 +100,10 @@ MODE="${1:-single}"
 # the per-mode arguments are added below.
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 IMAGE_TAG="${IMAGE_TAG:-iobroker:local}"
+# js-controller version to pin in the image. Empty => let the Dockerfile default
+# (`stable`) apply. Set to a concrete version (e.g. 6.0.11) or dist-tag to build
+# an image for upgrade/downgrade testing.
+JS_CONTROLLER_VERSION="${JS_CONTROLLER_VERSION:-}"
 # Default target is the shippable `runtime` stage — the rootless (USER 1000)
 # image you actually run. The runtime-dependency verification gate (`verify`
 # stage) is still run on every build, but as a SEPARATE non-loaded build (see
@@ -220,6 +224,15 @@ if [[ -n "${BUILD_TARGET}" ]] \
   BUILD_TARGET="runtime"
 fi
 
+# Optional js-controller version override, passed as a build arg only when set
+# so the Dockerfile's own default (`stable`) applies otherwise. Shared by the
+# gate build and the main build below.
+jsc_build_arg=()
+if [[ -n "${JS_CONTROLLER_VERSION}" ]]; then
+  jsc_build_arg=(--build-arg "JS_CONTROLLER_VERSION=${JS_CONTROLLER_VERSION}")
+  echo "build-local: pinning JS_CONTROLLER_VERSION=${JS_CONTROLLER_VERSION}" >&2
+fi
+
 echo "build-local: engine=${CONTAINER_ENGINE}, mode=${MODE}, target=${BUILD_TARGET}, tag=${IMAGE_TAG}, debian=${DEBIAN_CODENAME}" >&2
 
 # --- Run the runtime-dependency verification gate ---------------------------
@@ -249,6 +262,7 @@ run_verify_gate() {
     -f "${REPO_ROOT}/Dockerfile"
     --build-arg "NODE_MAJOR=${NODE_MAJOR}"
     --build-arg "DEBIAN_CODENAME=${DEBIAN_CODENAME}"
+    "${jsc_build_arg[@]}"
     --target "${VERIFY_TARGET}"
   )
   if [[ "${MODE}" == "multi" ]]; then
@@ -271,6 +285,7 @@ build_args=(
   -f "${REPO_ROOT}/Dockerfile"
   --build-arg "NODE_MAJOR=${NODE_MAJOR}"
   --build-arg "DEBIAN_CODENAME=${DEBIAN_CODENAME}"
+  "${jsc_build_arg[@]}"
   --target "${BUILD_TARGET}"
   -t "${IMAGE_TAG}"
 )

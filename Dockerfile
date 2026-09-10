@@ -44,6 +44,14 @@ ARG NODE_MAJOR
 # ioBroker installs under /opt/iobroker inside the image. (Req 8.1)
 ARG IOB_DIR=/opt/iobroker
 
+# js-controller version to install. Defaults to the `stable` npm dist-tag (the
+# normal, shipped behavior). Override with a concrete version (e.g.
+# `--build-arg JS_CONTROLLER_VERSION=6.0.11`) or any npm range/dist-tag to build
+# an image pinned to a specific js-controller — used for upgrade/downgrade
+# testing (build an old-version image, start it with a persisted Data_Volume,
+# then swap to a newer image and confirm the upgrade path on start).
+ARG JS_CONTROLLER_VERSION=stable
+
 # Promote the build args to ENV so they are visible to the shell inside the
 # BuildKit heredoc install step below. Docker does NOT expand Dockerfile ARG
 # references inside a single-quoted (`<<'EOF'`) heredoc body, so the install
@@ -52,6 +60,7 @@ ARG IOB_DIR=/opt/iobroker
 # still rejects an empty/invalid value before any install). (Req 5.4)
 ENV IOB_DIR=${IOB_DIR}
 ENV NODE_MAJOR=${NODE_MAJOR}
+ENV JS_CONTROLLER_VERSION=${JS_CONTROLLER_VERSION}
 
 # Non-interactive apt for reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -150,11 +159,17 @@ update-notifier=false
 engine-strict=true
 NPMRC
 
-# ioBroker's install manifest: pin ONLY the js-controller to the `stable` npm
-# dist-tag. No adapters are bundled — the Data_Volume is the source of truth
-# and reconciliation installs adapters from the registry at runtime, so
-# bundling them here would be dead weight (see design: Bundled content policy).
-cat > "${IOB_DIR}/package.json" <<'PKGJSON'
+# ioBroker's install manifest: pin ONLY the js-controller. Its version comes
+# from JS_CONTROLLER_VERSION (default `stable`), promoted to an env var above so
+# it is readable inside this single-quoted heredoc step. No adapters are bundled
+# — the Data_Volume is the source of truth and reconciliation installs adapters
+# from the registry at runtime, so bundling them here would be dead weight (see
+# design: Bundled content policy). The version string is embedded via an
+# UNQUOTED heredoc delimiter so ${JS_CONTROLLER_VERSION} expands; it is our own
+# controlled build arg, not untrusted input.
+: "${JS_CONTROLLER_VERSION:=stable}"
+echo "Pinning iobroker.js-controller to '${JS_CONTROLLER_VERSION}'."
+cat > "${IOB_DIR}/package.json" <<PKGJSON
 {
   "name": "iobroker.inst",
   "version": "3.0.0",
@@ -164,7 +179,7 @@ cat > "${IOB_DIR}/package.json" <<'PKGJSON'
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "iobroker.js-controller": "stable"
+    "iobroker.js-controller": "${JS_CONTROLLER_VERSION}"
   }
 }
 PKGJSON
