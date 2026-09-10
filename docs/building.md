@@ -122,10 +122,59 @@ The local path is deliberately kept equivalent to the CI build (task 16.1):
 | Runtime-dependency gate | separate `--target verify` build         | same gate stage per architecture         |
 | Architectures           | host (single) or amd64+arm64 (multi)     | `linux/amd64,linux/arm64`                |
 | Debian base             | `debianCodename` (default `trixie`)      | same default (`trixie`)                  |
-| Push                    | never                                    | only on `v*` tag pushes                  |
+| js-controller version   | `JS_CONTROLLER_VERSION` (default `stable`) | pinned from the release tag on tag pushes, else `stable` |
+| Push                    | never                                    | only on `<version>-r<n>` tag pushes      |
 
 Because the build-knob source, the Dockerfile, and the gate stage are identical,
 a successful local build reproduces what CI builds.
+
+## Versioning and release tags
+
+The image version is driven entirely by the **git tag**, which is identical to
+the immutable image tag:
+
+```
+<version>-r<n>      e.g.  7.2.2-r2
+```
+
+- `<version>` (`7.2.2`) is the bundled **iobroker.js-controller** version — the
+  thing users track. It bumps when js-controller is bumped.
+- `-r<n>` is the **image revision**. It bumps on a rebuild of the *same*
+  controller version (base-image security patch, `Dockerfile` change, dependency
+  bump) and resets to `-r1` whenever `<version>` changes.
+
+There is **no `v` prefix**, so the git tag and the image tag are byte-for-byte
+identical.
+
+Node major and Debian codename are **not** in the tag. They are recorded as OCI
+image labels (`org.iobroker.node.major`, `org.iobroker.debian.codename`,
+`org.opencontainers.image.base.name`) so the tag stays focused on the two things
+that matter while node/os stay discoverable via `docker inspect`.
+
+### The tag pins the controller (no `stable` drift)
+
+Pushing a release tag makes CI pass the parsed `<version>` to the build as
+`JS_CONTROLLER_VERSION`, so an image tagged `7.2.2-r2` is built against **exactly**
+js-controller `7.2.2` — never the drifting `stable` dist-tag. The `Dockerfile`
+then asserts, after install, that the installed controller version equals the
+requested one and **fails the build on mismatch** (a moved dist-tag, a typo'd
+tag, a yanked version). That check runs in the per-arch `verify` gate too, so a
+bad tag fails **before** anything is published.
+
+On non-tag builds (PRs, pushes to `main`, `workflow_dispatch`) there is nothing
+to pin, so `JS_CONTROLLER_VERSION` stays `stable` (the normal shipped default)
+and the exact-version check is skipped.
+
+### On a release, CI publishes
+
+| Image tag        | Kind      | Points at                                   |
+| ---------------- | --------- | ------------------------------------------- |
+| `7.2.2-r2`       | immutable | this exact build                            |
+| `7.2.2`          | moving    | newest revision for that controller version |
+| `latest`         | moving    | newest release overall                      |
+
+To cut a release: bump `containerImage` in `package.json` if node/os changed,
+then push the tag, e.g. `git tag 7.2.2-r1 && git push origin 7.2.2-r1`.
 
 ## Configuration (environment overrides)
 
@@ -154,6 +203,13 @@ a successful local build reproduces what CI builds.
 - `DEBIAN_CODENAME` — override the Debian release from the Build_Config (default
   read from `containerImage.debianCodename`; set to `bookworm` for oldstable).
   Shared by both build stages.
+- `JS_CONTROLLER_VERSION` — the `iobroker.js-controller` version to install
+  (passed straight through as the `--build-arg` of the same name). Defaults to
+  the `stable` npm dist-tag. Set an exact version (e.g. `7.2.2`) to pin — the
+  `Dockerfile` then verifies the installed version matches and fails the build
+  otherwise. Dist-tags (`stable`, `latest`) and npm ranges skip that check. This
+  is what CI passes from the release tag; locally it is handy for building an
+  old-version image to test the upgrade path.
 
 Examples:
 
@@ -163,6 +219,9 @@ RUN_VERIFY_GATE=false IMAGE_TAG=iobroker:dev npm run build:local
 
 # multi-arch validation on bookworm:
 DEBIAN_CODENAME=bookworm npm run build:local:multi
+
+# build an image pinned to an older controller (e.g. to test the upgrade path):
+JS_CONTROLLER_VERSION=7.1.0 npm run build:local
 ```
 
 ## Building with Podman

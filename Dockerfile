@@ -195,6 +195,29 @@ npm install --omit=dev --loglevel error
 # stage / healthcheck use.
 test -f "${IOB_DIR}/node_modules/iobroker.js-controller/controller.js"
 test -x "${IOB_DIR}/iobroker"
+
+# Fail fast if the INSTALLED js-controller version does not match the version
+# that was explicitly requested. This guards the release path: CI passes the
+# `<version>` parsed from the git tag (e.g. `7.2.2`) as JS_CONTROLLER_VERSION,
+# so an image tagged `7.2.2-r<n>` MUST actually contain js-controller 7.2.2. If
+# npm resolved something else (a moved dist-tag, a typo'd tag, a yanked
+# version), the build fails here instead of shipping a mislabeled image. The
+# check is SKIPPED when the request is not an exact version — `stable`/`latest`
+# dist-tags or an npm range (^/~/x/*, etc.) legitimately resolve to whatever npm
+# picks (the normal non-release build path), so there is nothing to assert.
+case "${JS_CONTROLLER_VERSION}" in
+    *[!0-9.]* )
+        echo "js-controller requested as '${JS_CONTROLLER_VERSION}' (dist-tag/range); skipping exact-version match check."
+        ;;
+    * )
+        installed="$(node -p "require('${IOB_DIR}/node_modules/iobroker.js-controller/package.json').version")"
+        if [ "${installed}" != "${JS_CONTROLLER_VERSION}" ]; then
+            echo "ERROR: js-controller version mismatch: requested '${JS_CONTROLLER_VERSION}', installed '${installed}'. Refusing to build a mislabeled image." >&2
+            exit 1
+        fi
+        echo "Verified installed js-controller version '${installed}' matches requested '${JS_CONTROLLER_VERSION}'."
+        ;;
+esac
 INSTALL
 
 # Ensure any native node_modules are (re)built against the selected Node major
@@ -256,6 +279,14 @@ FROM node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim AS runtime
 # ioBroker install location; mirrors the Build_Stage so the COPY target matches.
 # (Req 8.1)
 ARG IOB_DIR=/opt/iobroker
+
+# Re-declare the global build args inside the runtime stage so they are readable
+# by the LABEL block below (ARGs declared before the first FROM parameterize the
+# base image tag but are otherwise out of scope inside a stage). These record
+# the Node major and Debian codename in OCI labels instead of the image tag, so
+# the tag stays `<version>-r<n>` while node/os remain discoverable on the image.
+ARG NODE_MAJOR
+ARG DEBIAN_CODENAME=trixie
 
 # Non-interactive apt for reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -477,12 +508,21 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/opt/scripts/entrypoint.sh"]
 # repository `ioBroker.container-image`; the GHCR package is published under a
 # different name (`iobroker`), and this label is what links the published
 # package back to its source repository. (Req 1.3)
+# The Node major and Debian codename are recorded as OCI labels (driven by the
+# NODE_MAJOR / DEBIAN_CODENAME build args re-declared at the top of this stage),
+# NOT baked into the image tag. This keeps the tag as `<version>-r<n>` (the
+# js-controller version + image revision) while node/os stay discoverable via
+# `docker inspect` / the registry. The description no longer hardcodes a Node
+# major so it cannot drift from the actual base image. (Req 1.3)
 LABEL org.opencontainers.image.title="ioBroker" \
-      org.opencontainers.image.description="Rootless, multi-architecture ioBroker container image (Node.js 22 LTS 'jod', slim multi-stage build)." \
+      org.opencontainers.image.description="Rootless, multi-architecture ioBroker container image (slim multi-stage build)." \
       org.opencontainers.image.source="https://github.com/FernetMenta/ioBroker.container-image" \
       org.opencontainers.image.url="https://github.com/FernetMenta/ioBroker.container-image" \
       org.opencontainers.image.documentation="https://github.com/FernetMenta/ioBroker.container-image" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.base.name="node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim" \
+      org.iobroker.node.major="${NODE_MAJOR}" \
+      org.iobroker.debian.codename="${DEBIAN_CODENAME}"
 
 # =============================================================================
 # Runtime-dependency verification gate (task 15.1)

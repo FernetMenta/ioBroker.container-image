@@ -2,9 +2,22 @@
 # container image. (Task 16.1)
 #
 # Trigger model:
-#   - Pushed git tag matching `v*`  -> BUILD + PUBLISH (multi-arch manifest push).
+#   - Pushed git tag matching `<version>-r<n>` (e.g. `7.2.2-r2`, NO leading `v`)
+#     -> BUILD + PUBLISH (multi-arch manifest push).
 #   - Pull requests / pushes to main -> BUILD-ONLY (both arches, gate runs, no push).
 #   - workflow_dispatch              -> manual dry-run BUILD-ONLY (no push).
+#
+# Versioning scheme (see docs): the git tag is the source of truth and is
+# identical to the immutable image tag, e.g. `7.2.2-r2`, where:
+#   - `7.2.2` is the bundled iobroker.js-controller version (the thing users
+#     track); it bumps when js-controller is bumped.
+#   - `-r<n>` is the image REVISION; it bumps on a rebuild of the SAME controller
+#     version (base-image patch, Dockerfile change, dependency bump) and resets
+#     to `-r1` whenever the controller version changes.
+# Node major and Debian codename are NOT in the tag — they are recorded as OCI
+# image labels (see the Dockerfile LABEL block), driven by the same build args.
+# The publish job derives the moving `<version>` alias (e.g. `7.2.2`) and
+# `latest` from this tag.
 #
 # NODE_MAJOR (from `nodeMajor`) and DEBIAN_CODENAME (from `debianCodename`) are
 # read once from the maintainer-owned Build_Config in package.json (the
@@ -29,7 +42,8 @@ on:
     branches:
       - main
     tags:
-      - 'v*'
+      # Release tags are `<version>-r<n>` with NO leading `v`, e.g. `7.2.2-r2`.
+      - '[0-9]+.[0-9]+.[0-9]+-r[0-9]+'
   pull_request:
     branches:
       - main
@@ -61,6 +75,16 @@ jobs:
       node_major: ${{ steps.read.outputs.node_major }}
       debian_codename: ${{ steps.read.outputs.debian_codename }}
       image: ${{ steps.image.outputs.image }}
+      # js-controller version to PIN in the build. On a release-tag push this is
+      # the `<version>` parsed from the tag (e.g. `7.2.2`), so the image is built
+      # against exactly the controller version the tag claims. On non-tag builds
+      # (PRs, main, dispatch) it is `stable` — the normal shipped default — since
+      # there is no version to pin. (see `parse-tag` step)
+      js_controller_version: ${{ steps.parse-tag.outputs.js_controller_version }}
+      # The immutable `<version>-r<n>` release tag on a tag push, else empty.
+      release_tag: ${{ steps.parse-tag.outputs.release_tag }}
+      # The moving `<version>` alias on a tag push, else empty.
+      release_version: ${{ steps.parse-tag.outputs.release_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,6 +142,39 @@ jobs:
           owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           echo "image=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Parse release tag -> pinned js-controller version
+        id: parse-tag
+        # Single source of truth for tag parsing, shared by BOTH the per-arch
+        # build+gate and the publish job. The git tag is `<version>-r<n>` (e.g.
+        # `7.2.2-r2`) and is identical to the immutable image tag; split off the
+        # moving `<version>` alias (`7.2.2`).
+        #
+        # The `<version>` is passed to the build as JS_CONTROLLER_VERSION so the
+        # image is PINNED to exactly the controller version the tag claims —
+        # never the drifting `stable` dist-tag. On non-tag builds (PRs, main,
+        # dispatch) there is nothing to pin, so it stays `stable` (the normal
+        # shipped default). A malformed release tag fails here, before any build.
+        run: |
+          set -euo pipefail
+          ref="${{ github.ref }}"
+          name="${{ github.ref_name }}"
+          if [[ "$ref" == refs/tags/* ]]; then
+            if [[ ! "$name" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-r[0-9]+$ ]]; then
+              echo "::error title=Bad release tag::Tag '$name' is not of the form <version>-r<n> (e.g. 7.2.2-r2)."
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+            echo "release_tag=${name}" >> "$GITHUB_OUTPUT"
+            echo "release_version=${version}" >> "$GITHUB_OUTPUT"
+            echo "js_controller_version=${version}" >> "$GITHUB_OUTPUT"
+            echo "Release tag '${name}' -> pin js-controller '${version}', alias '${version}'."
+          else
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            echo "release_version=" >> "$GITHUB_OUTPUT"
+            echo "js_controller_version=stable" >> "$GITHUB_OUTPUT"
+            echo "Non-tag build -> js-controller 'stable' (no pin)."
+          fi
+
   # ---------------------------------------------------------------------------
   # Per-architecture build + runtime-dependency gate. Runs for EVERY trigger
   # (PRs, main, tags, dispatch) with push disabled: it builds each arch and
@@ -165,6 +222,11 @@ jobs:
           build-args: |
             NODE_MAJOR=${{ needs.read-build-config.outputs.node_major }}
             DEBIAN_CODENAME=${{ needs.read-build-config.outputs.debian_codename }}
+            # On a release tag this is the pinned `<version>` (e.g. 7.2.2), so
+            # the verify build installs exactly the tagged controller and the
+            # Dockerfile version-match check fires here — catching a bad tag
+            # BEFORE publish. On non-tag builds it is `stable`.
+            JS_CONTROLLER_VERSION=${{ needs.read-build-config.outputs.js_controller_version }}
 
       - name: Report failing architecture
         if: failure()
@@ -172,17 +234,18 @@ jobs:
           echo "::error title=Build failed::Architecture '${{ matrix.arch }}' (${{ matrix.platform }}) failed to build or did not pass the runtime-dependency gate."
 
   # ---------------------------------------------------------------------------
-  # Publish a single multi-arch manifest. Runs ONLY on a pushed v* git tag, and
-  # ONLY after BOTH per-arch builds + gates succeed (all-or-nothing). buildx
-  # pushes one manifest list referencing both arch variants under the shared
-  # immutable version tag + latest. (Req 1.3, 1.6, 1.8)
+  # Publish a single multi-arch manifest. Runs ONLY on a pushed release tag
+  # (`<version>-r<n>`, e.g. `7.2.2-r2`), and ONLY after BOTH per-arch builds +
+  # gates succeed (all-or-nothing). buildx pushes one manifest list referencing
+  # both arch variants under the immutable `<version>-r<n>` tag, the moving
+  # `<version>` alias, and `latest`. (Req 1.3, 1.6, 1.8)
   # ---------------------------------------------------------------------------
   publish:
     name: Publish multi-arch manifest
     needs:
       - read-build-config
       - build-arch
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -211,14 +274,20 @@ jobs:
           # Explicit image name (NOT github.repository). (Req 1.3)
           images: ${{ needs.read-build-config.outputs.image }}
           tags: |
-            # Immutable version tag from the v* git tag (semver, leading v
-            # stripped) applied to the single multi-arch manifest.
-            type=semver,pattern={{version}}
-            # latest applied to the same manifest on tag pushes.
+            # Immutable tag: the exact git tag `<version>-r<n>` (e.g. 7.2.2-r2)
+            # applied to the single multi-arch manifest. Parsed once in the
+            # read-build-config job.
+            type=raw,value=${{ needs.read-build-config.outputs.release_tag }}
+            # Moving alias: `<version>` (e.g. 7.2.2) -> newest revision for that
+            # js-controller version.
+            type=raw,value=${{ needs.read-build-config.outputs.release_version }}
+            # latest applied to the same manifest on release-tag pushes.
             type=raw,value=latest
           labels: |
             # Link the GHCR package (name `iobroker`) back to its source repo.
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            # Record the js-controller version and image revision.
+            org.opencontainers.image.version=${{ needs.read-build-config.outputs.release_tag }}
 
       - name: Build and push single multi-arch manifest
         uses: docker/build-push-action@v6
@@ -239,5 +308,9 @@ jobs:
           build-args: |
             NODE_MAJOR=${{ needs.read-build-config.outputs.node_major }}
             DEBIAN_CODENAME=${{ needs.read-build-config.outputs.debian_codename }}
+            # Pin the controller to the `<version>` from the release tag so the
+            # published image installs exactly what the tag claims, never the
+            # drifting `stable` dist-tag.
+            JS_CONTROLLER_VERSION=${{ needs.read-build-config.outputs.js_controller_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
