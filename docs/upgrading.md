@@ -123,6 +123,53 @@ major upgrade:
 - Keep the previous image tag. If something goes wrong, start the old tag again
   against the same volumes to roll back.
 
+## Reclaim disk space: prune orphaned anonymous volumes
+
+This applies to the **default** setup where you did **not** explicitly mount a
+`node_modules` volume (no named volume and no host folder for it).
+
+`/opt/iobroker/node_modules` is a declared volume in the image. If you don't
+mount anything there, Docker/Podman automatically create an **anonymous volume**
+for it each time a container is created. `node_modules` is large (js-controller
+plus adapter code), so every upgrade that removes the old container and creates
+a new one (`docker rm` + `docker run`, or a Compose recreate) can leave the old
+container's anonymous volume behind. Over several upgrades these orphaned
+volumes add up to a lot of disk space.
+
+After confirming the upgrade is healthy, remove dangling volumes:
+
+```bash
+docker volume prune         # removes volumes not used by any container
+# Podman: podman volume prune
+```
+
+Notes:
+
+- `docker volume prune` only removes volumes **not attached to any container**,
+  so your running ioBroker's volumes are not touched. Still, review the list it
+  offers before confirming.
+- `docker rm -v <old-container>` removes a specific stopped container together
+  with its **anonymous** volumes — a safe, targeted way to clean up as you go,
+  because it does not touch named volumes or host folders.
+- `docker compose down -v` is a convenient one-shot cleanup, **but what `-v`
+  does depends on how your data volumes are declared:**
+  - If `iobroker-data` and `log` are **host-backed** volumes — either plain
+    bind mounts, or `local` volumes with `driver_opts` `o: bind` /
+    `device: <host path>` — then `-v` removes the Docker volume objects but the
+    data stays in the host folders. The next `docker compose up` recreates the
+    volumes pointing at the same folders with your data intact, while the
+    dangling anonymous `node_modules` volume is cleaned up. In this setup
+    `down -v` is exactly what you want.
+  - If `iobroker-data`/`log` are **plain named volumes** (no `device:`, data
+    lives inside the Docker volume), then `-v` **deletes that data**. The next
+    `up` starts as a fresh install (data is not restored on recreation). Do not
+    use `down -v` here unless you intend to wipe everything and have a backup.
+- This does **not** apply if you mounted a **named** volume for `node_modules`
+  (it is reused across upgrades, not orphaned) or a **host folder** (not a
+  Docker volume at all). Your `iobroker-data` and `log` volumes are likewise
+  unaffected as long as their container is running or they are named volumes you
+  keep.
+
 ## Why there is no in-admin js-controller upgrade button
 
 On a normal host install, admin can upgrade js-controller from the UI. On the
