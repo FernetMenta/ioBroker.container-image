@@ -76,11 +76,11 @@ The image persists only the folders that hold configuration, state, logs, and
 (optionally) installed adapter code — you never bind-mount the whole
 `/opt/iobroker` installation:
 
-| Mount point | Purpose | Required |
-|---|---|---|
-| `/opt/iobroker/iobroker-data` | ioBroker configuration + state (source of truth) | Recommended |
-| `/opt/iobroker/log` | ioBroker logs | Recommended |
-| `/opt/iobroker/node_modules` | Installed adapter code, persisted across upgrades | Optional |
+| Mount point                   | Purpose                                           | Required    |
+| ----------------------------- | ------------------------------------------------- | ----------- |
+| `/opt/iobroker/iobroker-data` | ioBroker configuration + state (source of truth)  | Recommended |
+| `/opt/iobroker/log`           | ioBroker logs                                     | Recommended |
+| `/opt/iobroker/node_modules`  | Installed adapter code, persisted across upgrades | Optional    |
 
 See [docs/volumes-and-multihost.md](docs/volumes-and-multihost.md) for
 persistence behavior, startup reconciliation, multihost clusters (networked
@@ -115,12 +115,18 @@ Local builds mirror CI (same `Dockerfile`, same build knobs read from
 `package.json`, same runtime-dependency verification gate):
 
 ```bash
-# single-arch build for your host platform (loaded into the local image store):
+# single-arch build for your host platform: loads the shippable rootless
+# runtime image into the local image store, and runs the verification gate:
 scripts/build-local.sh single
 
 # multi-arch validation build (linux/amd64,linux/arm64), no push:
 scripts/build-local.sh multi
 ```
+
+The loaded image is the shippable `runtime` stage (rootless, `USER 1000`); the
+runtime-dependency gate (`verify` stage) runs as a separate build so it fires
+without landing a root-running image in your store. See
+[docs/building.md](docs/building.md#single-arch-vs-multi-arch) for details.
 
 Docker with Buildx is the supported build engine. Building with Podman is not
 currently supported — see

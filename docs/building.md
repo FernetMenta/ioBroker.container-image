@@ -92,12 +92,22 @@ To make the change permanent, edit `containerImage.debianCodename` in
 
 `scripts/build-local.sh` takes one positional argument, the mode:
 
-- `single` (default) — builds for your **local host platform** and `--load`s the
-  result into your local docker image store so you can run and inspect it.
+- `single` (default) — builds the shippable **`runtime`** stage for your **local
+  host platform** and `--load`s it into your local docker image store so you can
+  run and inspect the rootless (`USER 1000`) image you would actually ship. The
+  verification gate runs too, as a separate non-loaded build (see below).
 - `multi` — builds `linux/amd64,linux/arm64`. Buildx cannot `--load` a
   multi-platform result into the docker store, so this mode neither loads nor
-  pushes: it **validates both architectures** (and runs the gate on each)
-  without producing a local image and without publishing.
+  pushes: it **validates both architectures** (runtime plus the verify gate on
+  each) without producing a local image and without publishing.
+
+> **Why the loaded image is the `runtime` stage, not `verify`.** The `verify`
+> stage exists only to assert runtime dependencies during the build; it derives
+> `FROM runtime` and ends on `USER root`, so it is not something you want sitting
+> in your image store as `iobroker:local`. The script therefore loads the
+> `runtime` stage and runs the `verify` gate as a separate build (no `--load`,
+> no `--push`). BuildKit reuses the `runtime` layers, so the gate build is cheap.
+> Skip the gate for a fast inner loop with `RUN_VERIFY_GATE=false`.
 
 ## Equivalence with CI
 
@@ -108,7 +118,8 @@ The local path is deliberately kept equivalent to the CI build (task 16.1):
 | Dockerfile              | `-f Dockerfile`                          | same `Dockerfile`                        |
 | Build knob source       | `package.json` `containerImage` (lib/)   | same `package.json` `containerImage`     |
 | Build args              | `--build-arg NODE_MAJOR/DEBIAN_CODENAME` | `--build-arg NODE_MAJOR/DEBIAN_CODENAME` |
-| Runtime-dependency gate | `--target <gate stage>`                  | same gate stage per architecture         |
+| Loaded/shipped stage    | `runtime` (rootless `USER 1000`)         | `runtime` (rootless `USER 1000`)         |
+| Runtime-dependency gate | separate `--target verify` build         | same gate stage per architecture         |
 | Architectures           | host (single) or amd64+arm64 (multi)     | `linux/amd64,linux/arm64`                |
 | Debian base             | `debianCodename` (default `trixie`)      | same default (`trixie`)                  |
 | Push                    | never                                    | only on `v*` tag pushes                  |
@@ -129,11 +140,15 @@ a successful local build reproduces what CI builds.
 - `BUILD_CONFIG_JSON` — path to the `package.json` holding the `containerImage`
   Build_Config. Defaults to the repo-root `./package.json`.
 - `IMAGE_TAG` — image reference/tag for the build. Defaults to `iobroker:local`.
-- `BUILD_TARGET` — the `Dockerfile` stage to build. Defaults to the
-  runtime-dependency verification gate stage (the same gate CI runs). Set it to
-  `runtime` to build only the shippable image without the gate. If the requested
-  stage is not present in the `Dockerfile` yet, the script warns and falls back
-  to the `runtime` stage.
+- `BUILD_TARGET` — the `Dockerfile` stage to build and load. Defaults to
+  `runtime` (the shippable rootless image). Override to build a specific stage;
+  when overridden away from `runtime`, the separate verify gate is skipped
+  (you are targeting a stage on purpose). If the requested stage is not present
+  in the `Dockerfile`, the script warns and falls back to `runtime`.
+- `RUN_VERIFY_GATE` — when `true` (default), also run the `verify` gate as a
+  separate non-loaded build so the dependency gate fires locally. Set to `false`
+  for a fast inner-loop rebuild.
+- `VERIFY_TARGET` — name of the verification gate stage (default `verify`).
 - `PLATFORMS` — override the multi-arch platform list (default
   `linux/amd64,linux/arm64`).
 - `DEBIAN_CODENAME` — override the Debian release from the Build_Config (default
@@ -143,8 +158,8 @@ a successful local build reproduces what CI builds.
 Examples:
 
 ```sh
-# build only the shippable runtime stage (skip the gate), custom tag:
-BUILD_TARGET=runtime IMAGE_TAG=iobroker:dev npm run build:local
+# skip the verification gate for a fast inner-loop rebuild, custom tag:
+RUN_VERIFY_GATE=false IMAGE_TAG=iobroker:dev npm run build:local
 
 # multi-arch validation on bookworm:
 DEBIAN_CODENAME=bookworm npm run build:local:multi

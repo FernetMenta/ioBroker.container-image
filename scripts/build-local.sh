@@ -16,16 +16,28 @@
 #   - same Build_Config read       (deriveNodeMajorFromPackageJson from lib/,
 #                                    debianCodename from package.json)
 #   - same build args             (--build-arg NODE_MAJOR / DEBIAN_CODENAME)
-#   - same runtime-dependency gate (--target "${BUILD_TARGET}")
+#   - same runtime-dependency gate (a separate `--target verify` build, run by
+#                                    run_verify_gate, matching the gate CI runs)
 # so a local build reproduces what CI builds.
 #
+# What gets built/loaded:
+#   The loadable/validation build targets the SHIPPABLE `runtime` stage — the
+#   rootless (USER 1000) image you actually run. The runtime-dependency
+#   verification gate (the `verify` stage, which ends on `USER root` and only
+#   asserts dependencies during the build) is run as a SEPARATE non-loaded build
+#   so it fires locally without polluting the image store. Loading the `verify`
+#   stage itself would place a root-running, gate-topped image in your store,
+#   which is not what you want to run — hence the split.
+#
 # Modes:
-#   single (default) - build for the local host platform and load the result
-#                      into the local docker image store (`--load`).
+#   single (default) - build the runtime stage for the local host platform and
+#                      load it into the local docker image store (`--load`);
+#                      the verify gate runs first (host platform).
 #   multi            - build linux/amd64,linux/arm64. buildx cannot `--load` a
 #                      multi-platform result into the docker store, so a multi
-#                      build validates both architectures without producing a
-#                      loadable local image and WITHOUT pushing.
+#                      build validates both architectures (runtime + the verify
+#                      gate per arch) without producing a loadable local image
+#                      and WITHOUT pushing.
 #
 # This script NEVER pushes. There is no push option here on purpose; publishing
 # is CI's job (task 16.1). (design: "Local builds do not push by default.")
@@ -55,9 +67,14 @@
 #   BUILD_CONFIG_JSON  Path to the package.json holding the containerImage
 #                      Build_Config. Defaults to the repo-root ./package.json.
 #   IMAGE_TAG      Image reference/tag for the build (default: iobroker:local).
-#   BUILD_TARGET   Dockerfile stage to build (default: the runtime-dependency
-#                  verification gate stage — the same gate CI runs). Override to
-#                  `runtime` to build only the shippable image without the gate.
+#   BUILD_TARGET   Dockerfile stage to build and load (default: `runtime`, the
+#                  shippable rootless image). Override to build a specific stage;
+#                  when overridden away from `runtime` the separate verify gate
+#                  is skipped (you are targeting a stage on purpose).
+#   RUN_VERIFY_GATE  When "true" (default), also run the `verify` gate as a
+#                    separate non-loaded build so the dependency gate fires
+#                    locally. Set "false" for a fast inner-loop rebuild.
+#   VERIFY_TARGET  Name of the verification gate stage (default: `verify`).
 #   PLATFORMS      Override the multi-arch platform list
 #                  (default: linux/amd64,linux/arm64).
 #   DEBIAN_CODENAME  Override the Debian codename from the Build_Config (e.g.
@@ -83,9 +100,21 @@ MODE="${1:-single}"
 # the per-mode arguments are added below.
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 IMAGE_TAG="${IMAGE_TAG:-iobroker:local}"
-# Default target is the runtime-dependency verification gate stage, so a local
-# build runs the SAME gate CI runs. CI targets this gate too (task 15.1 / 16.1).
-BUILD_TARGET="${BUILD_TARGET:-verify}"
+# Default target is the shippable `runtime` stage — the rootless (USER 1000)
+# image you actually run. The runtime-dependency verification gate (`verify`
+# stage) is still run on every build, but as a SEPARATE non-loaded build (see
+# below), so a local build both loads a runnable image AND runs the same gate CI
+# runs. Loading the `verify` stage itself is wrong: it ends on `USER root` and
+# is a build-time assertion, not something you want in your image store.
+# Override BUILD_TARGET to build a specific stage instead.
+BUILD_TARGET="${BUILD_TARGET:-runtime}"
+# The verification gate stage. Run before/alongside the loadable build so the
+# dependency gate still fires locally. Set RUN_VERIFY_GATE=false to skip it
+# (e.g. for a fast inner-loop rebuild). Ignored when BUILD_TARGET is overridden
+# to something other than `runtime`, since the caller is then targeting a
+# specific stage on purpose.
+VERIFY_TARGET="${VERIFY_TARGET:-verify}"
+RUN_VERIFY_GATE="${RUN_VERIFY_GATE:-true}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 
 # Source of the build knobs: the maintainer-owned Build_Config in package.json
@@ -178,22 +207,60 @@ else
 fi
 
 # --- Resolve the build target stage -----------------------------------------
-# The intended default is the runtime-dependency verification gate stage, so a
-# local build runs the SAME gate CI runs. That gate stage (task 15.1) may not
-# exist in the Dockerfile yet; if the requested target stage is absent we fall
-# back to the final shippable stage ('runtime') with a warning so the local
-# build path keeps working. Once the gate stage lands, no change is needed here
-# — it will be picked up automatically.
+# The default target is the shippable `runtime` stage (the runnable rootless
+# image). The verification gate runs separately (see run_verify_gate below). If
+# the caller overrode BUILD_TARGET to a stage that does not exist in the
+# Dockerfile, fall back to `runtime` with a warning so the build still produces
+# a usable image rather than failing on an unknown stage.
 if [[ -n "${BUILD_TARGET}" ]] \
   && ! grep -Eq "^[[:space:]]*FROM[[:space:]].+[[:space:]]+[Aa][Ss][[:space:]]+${BUILD_TARGET}([[:space:]]|$)" \
       "${REPO_ROOT}/Dockerfile"; then
   echo "build-local: WARNING target stage '${BUILD_TARGET}' not found in Dockerfile;" \
-    "falling back to 'runtime'. (The runtime-dependency gate stage may not be" \
-    "implemented yet — task 15.1.)" >&2
+    "falling back to 'runtime'." >&2
   BUILD_TARGET="runtime"
 fi
 
 echo "build-local: engine=${CONTAINER_ENGINE}, mode=${MODE}, target=${BUILD_TARGET}, tag=${IMAGE_TAG}, debian=${DEBIAN_CODENAME}" >&2
+
+# --- Run the runtime-dependency verification gate ---------------------------
+# The loadable/validation build below targets the shippable stage (default
+# `runtime`). The verification gate is a SEPARATE build of the `verify` stage
+# that runs the dependency assertions during the build (its checks live in a
+# `RUN`), so a local build fires the SAME gate CI runs. We do NOT `--load` it
+# (it ends on `USER root` and is a build-time assertion, not a runnable image)
+# and never `--push`. BuildKit reuses the `runtime` layers, so this is cheap.
+#
+# Skipped when: the caller opted out (RUN_VERIFY_GATE=false), the caller
+# overrode BUILD_TARGET to something other than `runtime` (they are targeting a
+# specific stage on purpose), or the Dockerfile has no `verify` stage.
+run_verify_gate() {
+  [[ "${RUN_VERIFY_GATE}" == "true" ]] || { echo "build-local: verification gate skipped (RUN_VERIFY_GATE=false)." >&2; return 0; }
+  [[ "${BUILD_TARGET}" == "runtime" ]] || { echo "build-local: verification gate skipped (BUILD_TARGET overridden to '${BUILD_TARGET}')." >&2; return 0; }
+  if ! grep -Eq "^[[:space:]]*FROM[[:space:]].+[[:space:]]+[Aa][Ss][[:space:]]+${VERIFY_TARGET}([[:space:]]|$)" \
+      "${REPO_ROOT}/Dockerfile"; then
+    echo "build-local: verification gate stage '${VERIFY_TARGET}' not found in Dockerfile; skipping gate." >&2
+    return 0
+  fi
+
+  # Build the gate for the same platform(s) as the main build so the gate runs
+  # per target architecture, matching CI. No --load, no --push.
+  local gate_args=(
+    buildx build
+    -f "${REPO_ROOT}/Dockerfile"
+    --build-arg "NODE_MAJOR=${NODE_MAJOR}"
+    --build-arg "DEBIAN_CODENAME=${DEBIAN_CODENAME}"
+    --target "${VERIFY_TARGET}"
+  )
+  if [[ "${MODE}" == "multi" ]]; then
+    gate_args+=(--platform "${PLATFORMS}")
+  fi
+  gate_args+=("${REPO_ROOT}")
+
+  echo "build-local: running verification gate: ${CONTAINER_ENGINE} ${gate_args[*]}" >&2
+  "${CONTAINER_ENGINE}" "${gate_args[@]}"
+}
+
+run_verify_gate
 
 # --- Assemble the buildx command --------------------------------------------
 # Common arguments shared by both modes and both engines: same Dockerfile, same
