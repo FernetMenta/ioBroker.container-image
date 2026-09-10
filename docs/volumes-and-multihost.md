@@ -20,11 +20,11 @@ The image persists only the folders that hold configuration, state, logs, and
 (optionally) installed adapter code — you never need to bind-mount the whole
 `/opt/iobroker` installation. Three mount points are declared as volumes:
 
-| Mount point | Name | Required | What it holds |
-|---|---|---|---|
-| `/opt/iobroker/iobroker-data` | Data_Volume | Recommended | ioBroker configuration + state. **Source of truth** for the set of installed adapters and their versions. (Req 8.2) |
-| `/opt/iobroker/log` | Log_Volume | Recommended | ioBroker logs. (Req 8.3) |
-| `/opt/iobroker/node_modules` | Modules_Volume | Optional | Installed adapter code, persisted across container upgrades. (Req 8.4) |
+| Mount point                   | Name           | Required    | What it holds                                                                                                       |
+| ----------------------------- | -------------- | ----------- | ------------------------------------------------------------------------------------------------------------------- |
+| `/opt/iobroker/iobroker-data` | Data_Volume    | Recommended | ioBroker configuration + state. **Source of truth** for the set of installed adapters and their versions. (Req 8.2) |
+| `/opt/iobroker/log`           | Log_Volume     | Recommended | ioBroker logs. (Req 8.3)                                                                                            |
+| `/opt/iobroker/node_modules`  | Modules_Volume | Optional    | Installed adapter code, persisted across container upgrades. (Req 8.4)                                              |
 
 Key point: the **Data_Volume is authoritative**. It records which adapters (and
 which versions) are installed. Installed adapter code in `node_modules` is
@@ -49,19 +49,23 @@ adapter code against the adapters recorded in the Data_Volume. What happens
 depends on two things: whether the Modules_Volume is mounted, and whether the
 adapter registry is reachable.
 
-| Modules_Volume mounted? | Registry reachable? | Behavior |
-|---|---|---|
-| No (default) | Yes | Installs the full set of adapters recorded in the Data_Volume from the registry, so the installed set matches the Data_Volume. |
-| No (default) | No | Starts with whatever is present and logs a warning; adapters recorded in the Data_Volume but not installed cannot be fetched offline. |
-| Yes | Yes | Treats the persisted `node_modules` as authoritative and installs only the Data_Volume adapters that are **missing** from it. |
-| Yes | No | Starts using the persisted `node_modules` **without failing** — offline operation is supported. |
+| Modules_Volume mounted? | Registry reachable? | Behavior                                                                                                                              |
+| ----------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| No (default)            | Yes                 | Installs the full set of adapters recorded in the Data_Volume from the registry, so the installed set matches the Data_Volume.        |
+| No (default)            | No                  | Starts with whatever is present and logs a warning; adapters recorded in the Data_Volume but not installed cannot be fetched offline. |
+| Yes                     | Yes                 | Treats the persisted `node_modules` as authoritative and installs only the Data_Volume adapters that are **missing** from it.         |
+| Yes                     | No                  | Starts using the persisted `node_modules` **without failing** — offline operation is supported.                                       |
 
 Additionally, if the Node.js ABI of the running image differs from the ABI the
 persisted native modules were built for (which can happen after an image
 upgrade that changes the Node version), reconciliation attempts an `npm rebuild`
-of the affected native modules. If a rebuild is needed but the registry or build
-resources are unreachable, it logs a warning naming the affected modules and
-still starts the runtime.
+of the affected native modules. The image records the built-against ABI in a
+`node_modules/.node-abi` marker that travels with the persisted Modules_Volume;
+the reconciler compares it to the running Node's ABI to decide whether a rebuild
+is needed, and refreshes it after a successful rebuild. If a rebuild is needed
+but the registry or build resources are unreachable, it logs a warning naming
+the affected modules and still starts the runtime. See
+[Node.js major upgrades and the Modules_Volume](#nodejs-major-upgrades-and-the-modules_volume).
 
 **Practical guidance:**
 
@@ -72,6 +76,122 @@ still starts the runtime.
   natively compiled modules) to survive upgrades without a network round trip,
   or when you need the container to start adapters while the registry is
   unreachable (air-gapped or restricted environments).
+
+### Named volumes vs. host bind mounts
+
+How the mount is seeded on first start differs by mount type, and this matters
+most for the Modules_Volume:
+
+- **Named volumes** (e.g. `-v iobroker-modules:/opt/iobroker/node_modules`):
+  Docker/Podman seed an _empty_ named volume from the image's directory content
+  the first time it is mounted, so the volume starts pre-populated with what the
+  image shipped. This is the documented, recommended form.
+- **Host bind mounts** (e.g. `-v /data/on-host:/opt/iobroker/node_modules`):
+  bind mounts are **never** seeded from the image. Whatever is on the host path
+  is what the container sees, and it fully shadows the image content.
+
+**Why this matters most for the Modules_Volume:** `/opt/iobroker/node_modules`
+is not just adapter code — it is where **js-controller itself and its entire
+dependency tree live**. The entrypoint execs
+`/opt/iobroker/node_modules/iobroker.js-controller/controller.js` and refuses to
+start if that file is missing. So:
+
+- An **empty host bind mount** over `node_modules` shadows the image's
+  js-controller with nothing. The container fails to start (`js-controller not
+found`), and reconciliation **cannot** recover it: reconciliation only runs
+  `iobroker add <adapter>` for adapters and `npm rebuild` for native modules —
+  it never reconstructs js-controller or its dependencies, and the `iobroker`
+  CLI it would need is itself missing. **Do not bind-mount an empty host
+  directory over `node_modules`.**
+- A **named volume** does not have this problem: Docker/Podman seed an empty
+  named volume from the image on first mount, so js-controller and its
+  dependencies are copied in before the first start. This is why every
+  Modules_Volume example in this document uses a named volume.
+- A **non-empty host bind mount** is only safe if its content is a complete,
+  ABI-compatible `node_modules` for this image — for example one this exact
+  image previously wrote. It stays fragile across image / Node.js upgrades (see
+  below).
+
+By contrast, an **empty** Data_Volume or Log_Volume bind mount **is** fine: the
+Data_Volume is initialized by `iobroker setup first` on first start, and the log
+directory is just written into. The "empty bind mount is a problem" caveat is
+specific to `node_modules`, because that mount point contains the runtime
+itself.
+
+With a host bind mount you also own the directory's ownership and permissions.
+The entrypoint makes a best-effort `chgrp 0` + group-writable adjustment for the
+arbitrary-UID case, but a root-owned host directory may still need you to fix
+ownership so uid 1000 (or GID 0) can write to it.
+
+### Node.js major upgrades and the Modules_Volume
+
+Natively compiled modules are built against a specific Node.js ABI. When you
+move to an image built on a **new Node.js major** (for example Node 22 → Node
+26), native modules persisted in the Modules_Volume were compiled for the old
+ABI and may be incompatible with the new runtime. In that state js-controller or
+individual adapters can fail to start.
+
+**Automatic rebuild.** The image records the Node.js ABI its native modules were
+built against in a marker file (`node_modules/.node-abi`) that travels with the
+persisted Modules_Volume. On each start the reconciler compares that marker to
+the running Node's ABI; on a mismatch it runs `npm rebuild` of the affected
+native modules and then refreshes the marker, so the rebuild is a one-time cost
+per Node major upgrade. This covers modules that ship prebuilt binaries for the
+new ABI or are pure-JS.
+
+**When you still need to intervene.** The default slim runtime ships **no
+compiler toolchain**, so a native module that must be _compiled_ (no prebuilt
+binary for your architecture and the new ABI) cannot be rebuilt in place — the
+reconciler logs a warning naming it and starts anyway, which can leave that
+adapter broken. For those cases, either clear/recreate the Modules_Volume so the
+adapter is reinstalled fresh from the registry, or use a derived image with a
+build toolchain (see
+[Adapters with native code and no prebuilt binary](#adapters-with-native-code-and-no-prebuilt-binary)).
+
+**What to do after a Node major upgrade if you persist the Modules_Volume:**
+
+- If you do **not** persist the Modules_Volume (Data_Volume + Log_Volume only):
+  nothing to do. `node_modules` is rebuilt from the registry against the new
+  Node, so there is no stale native code to worry about.
+- If you **do** persist the Modules_Volume and adapters misbehave or
+  js-controller does not come up after the upgrade: **recreate the
+  Modules_Volume from the new image** and start again. With the Data_Volume
+  intact (it is the source of truth for which adapters are installed), the new
+  image supplies the new js-controller and reconciliation reinstalls the
+  recorded adapter set fresh against the new Node major (requires registry
+  connectivity).
+
+  The important detail is that the volume must be **re-seeded from the image**,
+  which only happens for a **named volume**:
+
+  ```bash
+  # Docker: remove and recreate the modules NAMED volume, keep data + log.
+  # A fresh empty named volume is re-seeded from the new image on next start,
+  # so the new js-controller + its dependencies are copied back in.
+  docker rm -f iobroker
+  docker volume rm iobroker-modules
+  docker volume create iobroker-modules
+  # start the container again with the same -v flags
+  ```
+
+  For **Kubernetes**, delete and recreate the Modules_Volume PVC (leaving the
+  Data_Volume and Log_Volume PVCs untouched); the fresh volume is populated from
+  the new image the same way.
+
+  > **Do not simply empty a host bind-mount directory.** Unlike a named volume,
+  > a bind mount is never re-seeded from the image, so emptying it leaves
+  > js-controller missing and the container will not start. If you use a host
+  > bind mount for `node_modules`, either switch to a named volume, or
+  > repopulate the directory from the new image yourself (for example, copy
+  > `/opt/iobroker/node_modules` out of a throwaway container of the new image
+  > into the host path) before starting.
+
+- Adapters whose native code must be **compiled** (no prebuilt binary for your
+  architecture) are the exception noted under "When you still need to intervene"
+  above: the automatic rebuild cannot help them in the default slim image, so
+  clear/recreate the Modules_Volume or use a derived image with a build
+  toolchain (see
+  [Adapters with native code and no prebuilt binary](#adapters-with-native-code-and-no-prebuilt-binary)).
 
 ## What ships in the image (no bundled adapters)
 
@@ -166,8 +286,8 @@ services:
     image: ghcr.io/fernetmenta/iobroker
     container_name: iobroker
     ports:
-      - "8081:8081"   # admin UI (IOB_ADMIN_PORT)
-      - "8082:8082"   # web adapter (IOB_WEB_PORT)
+      - '8081:8081' # admin UI (IOB_ADMIN_PORT)
+      - '8082:8082' # web adapter (IOB_WEB_PORT)
     volumes:
       - iobroker-data:/opt/iobroker/iobroker-data
       - iobroker-log:/opt/iobroker/log
@@ -191,7 +311,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: iobroker-data
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: ['ReadWriteOnce']
   resources:
     requests:
       storage: 2Gi
@@ -201,7 +321,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: iobroker-log
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: ['ReadWriteOnce']
   resources:
     requests:
       storage: 1Gi
@@ -212,7 +332,7 @@ kind: PersistentVolumeClaim
 metadata:
   name: iobroker-modules
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: ['ReadWriteOnce']
   resources:
     requests:
       storage: 4Gi
@@ -239,8 +359,8 @@ spec:
         - name: iobroker
           image: ghcr.io/fernetmenta/iobroker
           ports:
-            - containerPort: 8081   # admin UI
-            - containerPort: 8082   # web adapter
+            - containerPort: 8081 # admin UI
+            - containerPort: 8082 # web adapter
           volumeMounts:
             - name: iobroker-data
               mountPath: /opt/iobroker/iobroker-data
@@ -295,17 +415,17 @@ master.
 
 ### Variables
 
-| Variable | Values | Purpose |
-|---|---|---|
-| `IOB_MULTIHOST` | `master` \| `slave` | Multihost role (unset = standalone). |
-| `IOB_OBJECTSDB_TYPE` | `jsonl` \| `file` \| `redis` | Objects DB type. |
-| `IOB_OBJECTSDB_HOST` | hostname / IP | Objects DB host (e.g. the master). |
-| `IOB_OBJECTSDB_PORT` | `1`–`65535` | Objects DB port (jsonl default 9001). |
-| `IOB_OBJECTSDB_NAME` / `IOB_OBJECTSDB_PASS` | string | Optional objects DB name / password. |
-| `IOB_STATESDB_TYPE` | `jsonl` \| `file` \| `redis` | States DB type. |
-| `IOB_STATESDB_HOST` | hostname / IP | States DB host. |
-| `IOB_STATESDB_PORT` | `1`–`65535` | States DB port (jsonl default 9000). |
-| `IOB_STATESDB_NAME` / `IOB_STATESDB_PASS` | string | Optional states DB name / password. |
+| Variable                                    | Values                       | Purpose                               |
+| ------------------------------------------- | ---------------------------- | ------------------------------------- |
+| `IOB_MULTIHOST`                             | `master` \| `slave`          | Multihost role (unset = standalone).  |
+| `IOB_OBJECTSDB_TYPE`                        | `jsonl` \| `file` \| `redis` | Objects DB type.                      |
+| `IOB_OBJECTSDB_HOST`                        | hostname / IP                | Objects DB host (e.g. the master).    |
+| `IOB_OBJECTSDB_PORT`                        | `1`–`65535`                  | Objects DB port (jsonl default 9001). |
+| `IOB_OBJECTSDB_NAME` / `IOB_OBJECTSDB_PASS` | string                       | Optional objects DB name / password.  |
+| `IOB_STATESDB_TYPE`                         | `jsonl` \| `file` \| `redis` | States DB type.                       |
+| `IOB_STATESDB_HOST`                         | hostname / IP                | States DB host.                       |
+| `IOB_STATESDB_PORT`                         | `1`–`65535`                  | States DB port (jsonl default 9000).  |
+| `IOB_STATESDB_NAME` / `IOB_STATESDB_PASS`   | string                       | Optional states DB name / password.   |
 
 ### Docker: master + slave over networked jsonl (no Redis)
 
@@ -348,19 +468,19 @@ docker run -d \
 ```yaml
 env:
   - name: IOB_MULTIHOST
-    value: "slave"
+    value: 'slave'
   - name: IOB_OBJECTSDB_TYPE
-    value: "jsonl"
+    value: 'jsonl'
   - name: IOB_OBJECTSDB_HOST
-    value: "iobroker-master"   # in-cluster Service of the master
+    value: 'iobroker-master' # in-cluster Service of the master
   - name: IOB_OBJECTSDB_PORT
-    value: "9001"
+    value: '9001'
   - name: IOB_STATESDB_TYPE
-    value: "jsonl"
+    value: 'jsonl'
   - name: IOB_STATESDB_HOST
-    value: "iobroker-master"
+    value: 'iobroker-master'
   - name: IOB_STATESDB_PORT
-    value: "9000"
+    value: '9000'
 ```
 
 For a Redis-backed cluster, set the `*_TYPE` values to `redis` and point the
@@ -381,13 +501,13 @@ containers:
     image: ghcr.io/fernetmenta/iobroker
     livenessProbe:
       exec:
-        command: ["/opt/scripts/healthcheck.sh"]
+        command: ['/opt/scripts/healthcheck.sh']
       periodSeconds: 30
       timeoutSeconds: 30
       failureThreshold: 3
     readinessProbe:
       exec:
-        command: ["/opt/scripts/healthcheck.sh"]
+        command: ['/opt/scripts/healthcheck.sh']
       periodSeconds: 30
       timeoutSeconds: 30
 ```

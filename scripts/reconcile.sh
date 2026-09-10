@@ -267,6 +267,19 @@ while IFS=$'\t' read -r action args_rest; do
         log "npm rebuild of affected native modules (${#args[@]}): ${args[*]}"
         run npm rebuild "${args[@]}"
       fi
+      # Refresh the ABI marker to the NOW-running Node ABI. The persisted volume
+      # still carries the OLD marker (that is what triggered this rebuild); if we
+      # left it stale, every subsequent start would detect the same mismatch and
+      # rebuild again. Rewriting it makes the rebuild a one-time cost per Node
+      # major upgrade. Skipped in dry-run so tests observe only the rebuild call.
+      if [[ "${IOB_RECONCILE_DRY_RUN}" != "true" ]]; then
+        if node -e 'process.stdout.write(String(process.versions.modules))' \
+            > "${IOB_NODE_MODULES_DIR}/.node-abi" 2>/dev/null; then
+          log "updated ABI marker to running Node ABI"
+        else
+          log "could not update ABI marker (continuing; may rebuild again next start)"
+        fi
+      fi
       ;;
 
     warn-and-start)

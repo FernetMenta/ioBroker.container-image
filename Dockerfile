@@ -192,6 +192,24 @@ RUN set -eux; \
         npm rebuild --build-from-source || npm rebuild; \
     fi
 
+# Record the Node.js ABI the native node_modules were just compiled against, as
+# a marker file INSIDE node_modules. The runtime reconciler
+# (scripts/reconcile.sh -> abi_mismatch()) reads this file and compares it to
+# the running Node's `process.versions.modules`; a difference (e.g. after an
+# image upgrade that bumps the Node major, Node 22 -> 26) triggers an
+# `npm rebuild` of the affected native modules. Writing it here — after the
+# rebuild, inside node_modules — is what makes the marker (a) reflect the ABI
+# the modules were actually built for, (b) travel forward via
+# `COPY --from=build /opt/iobroker`, and (c) be seeded into a fresh named
+# Modules_Volume alongside the modules it describes. Without this file the
+# reconciler's abi_mismatch() short-circuits to "no mismatch" and the
+# auto-rebuild never fires. (Req 8.12)
+RUN set -eux; \
+    cd "${IOB_DIR}"; \
+    mkdir -p node_modules; \
+    node -e 'process.stdout.write(String(process.versions.modules))' > node_modules/.node-abi; \
+    test -s node_modules/.node-abi
+
 # Drop the js-controller-initialized data directory before it is carried into
 # the Runtime_Image. Installing `iobroker.js-controller` runs a lifecycle step
 # that lays down a populated `iobroker-data/` (iobroker.json + objects.jsonl +

@@ -262,7 +262,12 @@ fi
 # is no hook step here by design (Req 13.1, 13.2, 13.3).
 # ---------------------------------------------------------------------------
 if [[ ! -f "${JS_CONTROLLER}" ]]; then
-  die "js-controller not found at ${JS_CONTROLLER}"
+  die "js-controller not found at ${JS_CONTROLLER}. \
+This usually means the ${IOBROKER_DIR}/node_modules mount is empty or shadows \
+the image's node_modules: js-controller and its dependencies live there and are \
+NOT rebuilt by reconciliation. Use a NAMED volume for node_modules (it is \
+seeded from the image on first start) rather than an empty host bind mount, or \
+omit the node_modules mount entirely. See docs/volumes-and-multihost.md."
 fi
 
 log "starting js-controller"
