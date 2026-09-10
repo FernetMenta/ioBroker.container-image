@@ -63,6 +63,21 @@ IOB_DATA_DIR="${IOB_DATA_DIR:-${IOB_ROOT}/iobroker-data}"
 IOB_NODE_MODULES_DIR="${IOB_NODE_MODULES_DIR:-${IOB_ROOT}/node_modules}"
 IOB_RECONCILE_DRY_RUN="${IOB_RECONCILE_DRY_RUN:-false}"
 
+# IOB_RECONCILE_PHASE selects which part of the plan to execute, so the
+# entrypoint can split reconciliation around database configuration:
+#   * "init"    run ONLY the init-default-config action (create iobroker.json +
+#               local DB on an empty Data_Volume). This must happen BEFORE
+#               configure-db patches iobroker.json to point at a multihost
+#               master, because there must be a file to patch.
+#   * "install" run everything EXCEPT init-default-config (desired-adapter query,
+#               install-missing, npm-rebuild, warn-and-start). This runs AFTER
+#               configure-db so the desired-adapter query (`iobroker list
+#               instances`) reads the master's shared objects DB when configured,
+#               not the throwaway local one.
+#   * "all"     (default) run the whole plan in one pass — standalone behavior,
+#               unchanged, and what tests exercise unless they override it.
+IOB_RECONCILE_PHASE="${IOB_RECONCILE_PHASE:-all}"
+
 # Reconcile liveness markers consumed by scripts/healthcheck.sh + lib/health-state.js.
 # The entrypoint runs reconciliation BEFORE js-controller starts, so `iobroker
 # status` fails for the whole reconcile phase. That phase has no meaningful upper
@@ -120,7 +135,18 @@ data_volume_empty() {
   fi
   # `find ... -mindepth 1` prints nothing for an empty dir; use it so we do not
   # depend on `ls` output formatting or hidden-file globbing quirks.
-  if [[ -z "$(find "${IOB_DATA_DIR}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  #
+  # Exclude our OWN reconcile liveness markers (.iob-reconciling /
+  # .iob-reconcile-heartbeat): begin_reconcile writes them into IOB_DATA_DIR
+  # BEFORE this check runs, so counting them would make a genuinely fresh volume
+  # look non-empty and skip `iobroker setup first`. We match on the marker file
+  # names so the check reflects real ioBroker content only.
+  local marker_name heartbeat_name
+  marker_name="$(basename -- "${IOB_RECONCILE_MARKER}")"
+  heartbeat_name="$(basename -- "${IOB_RECONCILE_HEARTBEAT}")"
+  if [[ -z "$(find "${IOB_DATA_DIR}" -mindepth 1 \
+    ! -name "${marker_name}" ! -name "${heartbeat_name}" \
+    -print -quit 2>/dev/null)" ]]; then
     return 0
   fi
   return 1
@@ -325,6 +351,24 @@ while IFS=$'\t' read -r action args_rest; do
   if [[ -n "${args_rest}" ]]; then
     IFS=$'\t' read -r -a args <<<"${args_rest}"
   fi
+
+  # Phase gating: the entrypoint may run reconciliation in two passes around
+  # database configuration (see IOB_RECONCILE_PHASE above). "init" performs only
+  # the init-default-config action; "install" performs everything else; "all"
+  # (default) performs the whole plan. Skipping is silent so the two-pass log
+  # stays clean.
+  case "${IOB_RECONCILE_PHASE}" in
+    init)
+      [[ "${action}" == "init-default-config" ]] || continue
+      ;;
+    install)
+      [[ "${action}" != "init-default-config" ]] || continue
+      ;;
+    all) : ;;
+    *)
+      log "unknown IOB_RECONCILE_PHASE='${IOB_RECONCILE_PHASE}'; treating as 'all'"
+      ;;
+  esac
 
   case "${action}" in
     init-default-config)

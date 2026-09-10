@@ -22,13 +22,19 @@
 #      GID 0 and ensure the writable dirs are group-writable (arbitrary-UID
 #      path only).                                                (Req 4.1-4.6)
 #   6. Ensure .npmrc via scripts/ensure-npmrc.sh (block if corrupt).  (Req 11.4)
-#   7. Run reconciliation via scripts/reconcile.sh: init default config on an
-#      empty Data_Volume (creates the objects/states DB + iobroker.json),
-#      bootstrap admin, install recorded adapters.                    (Req 8)
+#   7. Reconcile INIT phase via scripts/reconcile.sh (IOB_RECONCILE_PHASE=init):
+#      on an empty Data_Volume, initialize the default config + local DB so
+#      iobroker.json exists for the next step to patch.                (Req 8.6)
 #   8. Configure objects/states DB backends + multihost role via
 #      scripts/configure-db.sh (idempotent; patches only operator-specified
-#      fields). Runs AFTER reconciliation so iobroker.json exists.    (Req 12)
-#   9. exec js-controller under tini.
+#      fields). Runs AFTER init so iobroker.json exists, and BEFORE the install
+#      phase so the desired-adapter query reads the master's shared DB when a
+#      multihost slave/backend is configured.                          (Req 12)
+#   9. Reconcile INSTALL phase via scripts/reconcile.sh
+#      (IOB_RECONCILE_PHASE=install): query the (now correctly targeted) DB for
+#      this host's adapters, install their code, and rebuild native modules on
+#      an ABI mismatch.                                                (Req 8)
+#  10. exec js-controller under tini.
 #
 # It NEVER sources a user startup script and ignores any mounted startup script
 # (Req 13.1, 13.2, 13.3): there is simply no hook-sourcing step in this pipeline.
@@ -70,6 +76,54 @@ run_node() {
   node --input-type=module -e "${snippet}" "$@"
 }
 
+# --- Human-readable staged startup logging ----------------------------------
+# The pipeline logs each stage as a boxed banner (plus per-line detail via
+# `log`) so an operator reading `docker logs` can see how far startup got and
+# where it stopped if something goes wrong. This is diagnostic output only; the
+# banners carry no logic. Width matches the classic reference image (80 cols).
+BANNER_WIDTH=80
+
+# rule: a full-width line of a single repeated character (default '-').
+rule() {
+  local ch="${1:--}"
+  printf '%*s\n' "${BANNER_WIDTH}" '' | tr ' ' "${ch}"
+}
+
+# banner_line: center TEXT inside a "-----   ...   -----" framed line so the
+# blocks line up regardless of message length.
+banner_line() {
+  local text="$1"
+  local inner=$((BANNER_WIDTH - 12)) # space between the two "----- " frames
+  local pad_total=$((inner - ${#text}))
+  ((pad_total < 0)) && pad_total=0
+  local left=$((pad_total / 2))
+  local right=$((pad_total - left))
+  printf -- '----- %*s%s%*s -----\n' "${left}" '' "${text}" "${right}" '' >&2
+}
+
+# stage: emit a boxed banner announcing a startup stage, e.g.
+#   stage "Step 3 of 6: Reconciling adapters"
+stage() {
+  {
+    rule
+    banner_line "$1"
+    rule
+  } >&2
+}
+
+# kv_line: a right-framed "key: value" info line used by the summary block,
+# padded so the trailing "-----" frame lands on the banner's right edge.
+kv_line() {
+  local key="$1" val="$2"
+  # Interior between the two 5-dash frames, minus the 5-space left indent.
+  local inner=$((BANNER_WIDTH - 10 - 5))
+  local body
+  body="$(printf '%-24s%s' "${key}" "${val}")"
+  # Truncate an over-long body so the frame stays aligned.
+  ((${#body} > inner)) && body="${body:0:inner}"
+  printf -- '-----     %-*s -----\n' "${inner}" "${body}" >&2
+}
+
 # ---------------------------------------------------------------------------
 # 1. Capture initial env snapshot.
 #
@@ -80,6 +134,36 @@ run_node() {
 # ---------------------------------------------------------------------------
 log "capturing initial environment snapshot"
 ENV_SNAPSHOT="$(run_node "process.stdout.write(JSON.stringify(process.env));")"
+
+# --- Welcome banner + system / version / environment summary ----------------
+# Printed once at the very top so `docker logs` opens with a clear, greppable
+# snapshot of the container's identity and the ioBroker-relevant environment.
+# Purely informational; nothing below depends on it.
+{
+  rule
+  banner_line "$(date '+%Y-%m-%d %H:%M:%S')"
+  rule
+  banner_line ""
+  banner_line "Welcome to your rootless ioBroker container!"
+  banner_line "Startup is now running - please be patient."
+  banner_line ""
+  rule
+  banner_line "System Information"
+  kv_line "arch:" "$(uname -m 2>/dev/null || echo unknown)"
+  kv_line "hostname:" "$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
+  kv_line "node:" "$(node --version 2>/dev/null || echo unknown)"
+  kv_line "npm:" "$(npm --version 2>/dev/null || echo unknown)"
+  banner_line ""
+  banner_line "ioBroker Environment"
+  # Only surface the ioBroker-relevant variables (unset ones show as empty).
+  for _v in IOB_MULTIHOST \
+    IOB_OBJECTSDB_TYPE IOB_OBJECTSDB_HOST IOB_OBJECTSDB_PORT \
+    IOB_STATESDB_TYPE IOB_STATESDB_HOST IOB_STATESDB_PORT \
+    IOB_ADMIN_PORT IOB_WEB_PORT TZ LANG; do
+    kv_line "${_v}:" "${!_v:-}"
+  done
+  rule
+} >&2
 
 # ---------------------------------------------------------------------------
 # 2. Resolve defaults from the snapshot via lib/defaults.
@@ -188,33 +272,32 @@ fi
 # the settings file is corrupt or inaccessible and the adapter install must be
 # blocked, so we refuse to continue (Req 11.4 / 11.5).
 # ---------------------------------------------------------------------------
+stage "Step 1 of 5: Ensuring npm settings"
 log "ensuring .npmrc npm settings"
 if ! "${SCRIPT_DIR}/ensure-npmrc.sh"; then
   die "npm settings could not be ensured; refusing to start js-controller"
 fi
 
+# Shared environment for both reconcile passes (init and install).
+RECONCILE_ENV=(
+  "IOB_ROOT=${IOBROKER_DIR}"
+  "IOB_DATA_DIR=${IOBROKER_DIR}/iobroker-data"
+  "IOB_NODE_MODULES_DIR=${IOBROKER_DIR}/node_modules"
+)
+
 # ---------------------------------------------------------------------------
-# 7. Run reconciliation via scripts/reconcile.sh.
+# 7. Reconcile INIT phase via scripts/reconcile.sh (IOB_RECONCILE_PHASE=init).
 #
-# reconcile.sh is the thin glue that OBSERVES the environment (empty Data_Volume,
-# node_modules mount state, registry reachability, ABI mismatch, recorded vs.
-# installed adapter sets), asks lib/reconcile-plan.js (planReconciliation) for
-# the ordered actions, and EXECUTES them (iobroker setup first, iobroker install,
-# npm rebuild, ...). It mirrors how steps 6/7 delegate to ensure-npmrc.sh /
-# ensure-npmrc.sh. On an empty Data_Volume it initializes the default config
-# and bootstraps the admin adapter so a fresh container comes up with a setup UI.
-#
-# Reconciliation never fails startup when persisted modules are usable offline
-# or when an ABI rebuild cannot be done (Req 8.11, 8.13); it exits non-zero only
-# if a required install/rebuild command genuinely fails. We surface that as a
-# hard error so we do not exec a half-provisioned runtime.
+# On an empty Data_Volume this runs `iobroker setup first`, creating the local
+# objects/states DB and iobroker.json. It MUST precede DB configuration (step 8)
+# so there is an iobroker.json for configure-db to patch. On a populated
+# Data_Volume there is nothing to init and this pass is a no-op.
 # ---------------------------------------------------------------------------
-log "running reconciliation"
-if ! IOB_ROOT="${IOBROKER_DIR}" \
-  IOB_DATA_DIR="${IOBROKER_DIR}/iobroker-data" \
-  IOB_NODE_MODULES_DIR="${IOBROKER_DIR}/node_modules" \
+stage "Step 2 of 5: Initializing configuration"
+log "running reconciliation (init phase)"
+if ! env "${RECONCILE_ENV[@]}" IOB_RECONCILE_PHASE=init \
   "${SCRIPT_DIR}/reconcile.sh"; then
-  die "reconciliation failed; refusing to start js-controller"
+  die "configuration initialization failed; refusing to start js-controller"
 fi
 
 # ---------------------------------------------------------------------------
@@ -232,10 +315,13 @@ fi
 # untouched (Req 12.3) — this is why patching-only-what-was-asked matters. It
 # validates type/port/role and exits non-zero naming an invalid value (Req 12.9).
 #
-# Runs AFTER reconciliation so iobroker.json created by `iobroker setup first`
-# exists to read/patch. The operator's IOB_* DB variables are passed through
-# from the entrypoint environment (they are opt-in and NOT defaulted).
+# Runs AFTER the reconcile init phase so iobroker.json created by `iobroker
+# setup first` exists to read/patch, and BEFORE the reconcile install phase so
+# the desired-adapter query reads the correctly targeted DB. The operator's
+# IOB_* DB variables are passed through from the entrypoint environment (they
+# are opt-in and NOT defaulted).
 # ---------------------------------------------------------------------------
+stage "Step 3 of 5: Configuring database / multihost"
 log "configuring database backends / multihost"
 if ! IOB_ROOT="${IOBROKER_DIR}" \
   IOB_MULTIHOST="${IOB_MULTIHOST:-}" \
@@ -254,7 +340,30 @@ if ! IOB_ROOT="${IOBROKER_DIR}" \
 fi
 
 # ---------------------------------------------------------------------------
-# 9. exec js-controller under tini.
+# 9. Reconcile INSTALL phase via scripts/reconcile.sh
+#    (IOB_RECONCILE_PHASE=install).
+#
+# reconcile.sh OBSERVES the environment (registry reachability, ABI mismatch,
+# desired vs. installed adapter sets) and EXECUTES the install actions
+# (iobroker install, npm rebuild, ...). Because step 8 has already pointed the
+# DB at the master when configured, the desired-adapter query here reads the
+# correct objects DB. On an empty Data_Volume the desired set is just the
+# bootstrapped `admin`, so a fresh container comes up with a setup UI.
+#
+# Reconciliation never fails startup when persisted modules are usable offline
+# or when an ABI rebuild cannot be done (Req 8.11, 8.13); it exits non-zero only
+# if a required install/rebuild command genuinely fails. We surface that as a
+# hard error so we do not exec a half-provisioned runtime.
+# ---------------------------------------------------------------------------
+stage "Step 4 of 5: Reconciling adapters"
+log "running reconciliation (install phase)"
+if ! env "${RECONCILE_ENV[@]}" IOB_RECONCILE_PHASE=install \
+  "${SCRIPT_DIR}/reconcile.sh"; then
+  die "reconciliation failed; refusing to start js-controller"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. exec js-controller under tini.
 #
 # We hand the current process image over to js-controller so tini (PID 1)
 # supervises it directly for signal forwarding and exit-code propagation. No
@@ -286,5 +395,6 @@ seeded from the image on first start) rather than an empty host bind mount, or \
 omit the node_modules mount entirely. See docs/volumes-and-multihost.md."
 fi
 
+stage "Step 5 of 5: Starting ioBroker"
 log "starting js-controller"
 exec node "${JS_CONTROLLER}" "$@"

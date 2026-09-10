@@ -148,10 +148,11 @@ flowchart TD
     VAL -->|valid| TZ["Apply TZ / LANG, timezone"]
     TZ --> UIDSETUP["Resolve runtime UID/GID;\nif UID not in /etc/passwd ->\njoin GID 0, ensure group-writable dirs"]
     UIDSETUP --> NPM["Ensure .npmrc: audit=false,\nupdate-notifier=false, engine-strict=true;\nblock if corrupt/inaccessible"]
-    NPM --> MH["DB backend config\n(patch only operator-specified IOB_* fields)"]
+    NPM --> RINIT["Reconcile INIT phase\n(iobroker setup first on empty Data_Volume;\ncreates iobroker.json)"]
+    RINIT --> MH["DB backend config\n(patch only operator-specified IOB_* fields;\npoints objects/states at master when set)"]
     MH -->|invalid| ERRV
-    MH --> RECON["Reconciliation"]
-    RECON --> EXEC["exec js-controller (under tini)"]
+    MH --> RINSTALL["Reconcile INSTALL phase\n(query DB for this host's adapters,\ninstall code, npm rebuild on ABI mismatch)"]
+    RINSTALL --> EXEC["exec js-controller (under tini)"]
     EXEC --> RUN["Running: healthcheck + signal handling active"]
 ```
 
@@ -210,9 +211,10 @@ Ordered startup sequence (see flow diagram). No user startup scripts exist in th
 3. **Timezone / locale** — apply `TZ`/`LANG`; set timezone when `TZ` is valid. (Req 10.2, 10.5)
 4. **Arbitrary-UID handling** — run as whatever UID/GID the runtime assigned (`--user`/`runAsUser`); if that UID is absent from `/etc/passwd`, the process is in GID 0 and the writable data dirs are already GID-0 group-writable, so it has access (OpenShift-style). No in-image UID/GID variable is consulted. (Req 4.1–4.6)
 5. **npm settings** — ensure `.npmrc`; block if corrupt/inaccessible. (Req 11)
-6. **Database backends** — configure objects/states DB (type/host/port) + multihost role; patch only operator-specified fields; no-op if none set. (Req 12)
-7. **Reconciliation** — align `node_modules` with `Data_Volume`. (Req 8.9–8.13)
-8. **`exec` js-controller** under tini. (Req 14)
+6. **Reconciliation — init phase** — on an empty `Data_Volume`, run `iobroker setup first` to create the default config + local DB + `iobroker.json`. This precedes DB configuration so there is an `iobroker.json` to patch. No-op on a populated `Data_Volume`. (Req 8.6)
+7. **Database backends** — configure objects/states DB (type/host/port) + multihost role; patch only operator-specified fields; no-op if none set. Runs after the init phase (so `iobroker.json` exists) and before the install phase (so the desired-adapter query targets the master's shared DB when configured). (Req 12)
+8. **Reconciliation — install phase** — query the (now correctly targeted) DB for this host's adapters, align `node_modules` by installing missing adapter code, and rebuild native modules on an ABI mismatch. (Req 8.9–8.13)
+9. **`exec` js-controller** under tini. (Req 14)
 
 - **Interface:** environment variables (see Data Model); files under `/opt/iobroker`.
 
