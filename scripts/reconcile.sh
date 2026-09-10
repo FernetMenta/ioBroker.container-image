@@ -19,9 +19,10 @@
 # `lib/npmrc.js` the same way (observe -> plan -> act).
 #
 # The actions map to the reconciliation flow diagram / pseudocode in design §5:
-#   init-default-config  -> `iobroker setup first`      (empty Data_Volume; Req 8.6)
-#   install-missing      -> `iobroker add <adapter>...` (install desired adapters
-#                                                        not present; Req 8.9/8.10)
+#   init-default-config  -> `iobroker setup first`          (empty Data_Volume; Req 8.6)
+#   install-missing      -> `iobroker install <adapter>...` (install desired adapter
+#                                                            CODE not present, without
+#                                                            creating instances; Req 8.9/8.10)
 #   npm-rebuild          -> `npm rebuild <module>...`   (ABI mismatch;        Req 8.12)
 #   warn-and-start       -> log a clear warning and still start               (Req 8.11/8.13)
 #
@@ -38,6 +39,9 @@
 #   IOB_ROOT                ioBroker install root (default /opt/iobroker)
 #   IOB_DATA_DIR            Data_Volume dir       (default $IOB_ROOT/iobroker-data)
 #   IOB_NODE_MODULES_DIR    node_modules dir      (default $IOB_ROOT/node_modules)
+#   IOB_HOSTNAME            this host's ioBroker name used to filter which
+#                           adapters (by instance host assignment) are installed
+#                           here (default: the container hostname)
 #   IOB_RECONCILE_DRY_RUN   when "true", log the actions instead of running
 #                           iobroker/npm (used by tests and diagnostics)
 #
@@ -153,24 +157,52 @@ abi_mismatch() {
 }
 
 # desired_adapters: the adapter set RECORDED in the Data_Volume (the source of
-# truth; Req 8.5) — i.e. the adapters the Data_Volume says SHOULD be installed,
-# regardless of what is physically present in node_modules.
+# truth; Req 8.5) that must have CODE present ON THIS HOST — i.e. the adapters
+# the Data_Volume says SHOULD be installed here, regardless of what is
+# physically present in node_modules.
 #
 # This is derived from the configured adapter INSTANCES in the objects DB
 # (`system.adapter.<name>.<n>`), NOT from `iobroker list adapters` (which lists
 # what is currently INSTALLED in node_modules — the wrong source, and empty on a
-# stripped/fresh image). We list instances and reduce them to the unique set of
-# adapter names. Missing data yields an empty set, which the planner handles
-# gracefully. The fresh-install bootstrap (installing `admin`) is handled
-# separately in the init-default-config action, not here.
+# stripped/fresh image).
+#
+# MULTIHOST HOST FILTER: `iobroker list instances` lists instances for EVERY
+# host in the cluster, and prints the host each instance is assigned to. Adapter
+# CODE only needs to be present on the host that actually RUNS the instance, so
+# on a multihost slave we install only the adapters whose instances are assigned
+# to THIS host — not the whole cluster's adapter set. Without this filter a
+# slave would pointlessly install code for every adapter running on the master.
+# In a standalone install every instance is assigned to this host, so the filter
+# is a no-op there.
+#
+# This host's ioBroker name is its hostname (ioBroker registers the host under
+# the container hostname; e.g. `iobroker-sml`). Overridable via IOB_HOSTNAME for
+# testing / non-default layouts.
+#
+# Output format of `iobroker list instances` (columns separated by " : "):
+#   <flag> system.adapter.<name>.<n> : <name> : <host>  -  <status...>
+# The <status> tail (after " - ") can itself contain colons (e.g. "port: 8081"),
+# so we split on " : " for the three stable columns and strip the " - <status>"
+# tail off the host column. Missing data yields an empty set, which the planner
+# handles gracefully. The fresh-install bootstrap (installing `admin`) is handled
+# separately by the shell glue, not here.
 desired_adapters() {
   command -v iobroker >/dev/null 2>&1 || return 0
-  # `iobroker list instances` prints lines like
-  # "system.adapter.admin.0 : ... - enabled". Extract the adapter name that
-  # sits between "system.adapter." and the trailing ".<instance>".
+  local this_host="${IOB_HOSTNAME:-$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)}"
+  # If we somehow cannot determine our host name, fall back to the unfiltered
+  # set rather than installing nothing.
   iobroker list instances 2>/dev/null \
-    | grep -oE 'system\.adapter\.[a-z0-9_-]+\.[0-9]+' \
-    | sed -E 's/^system\.adapter\.([a-z0-9_-]+)\.[0-9]+$/\1/' \
+    | awk -F' : ' -v this_host="${this_host}" '
+        /system\.adapter\./ {
+          name = $2; gsub(/^[ \t]+|[ \t]+$/, "", name)
+          host = $3; sub(/[ \t]+-.*$/, "", host); gsub(/^[ \t]+|[ \t]+$/, "", host)
+          if (name == "") next
+          # No host column parsed, or no known host to match against: do not
+          # drop the adapter (keeps standalone / unexpected formats working).
+          if (host == "" || this_host == "") { print name; next }
+          if (host == this_host) print name
+        }
+      ' \
     | sort -u || true
 }
 
@@ -315,7 +347,17 @@ while IFS=$'\t' read -r action args_rest; do
       else
         log "installing missing adapters (${#args[@]}): ${args[*]}"
         for adapter in "${args[@]}"; do
-          run iobroker add "${adapter}"
+          # `iobroker install` installs ONLY the adapter code; it does NOT
+          # create an instance. This is what reconciliation needs: the desired
+          # set is derived from the instances already recorded in the
+          # Data_Volume (the source of truth), so those instances exist already
+          # — our job is purely to converge node_modules to match. Using
+          # `iobroker add` here would instead try to CREATE a new instance,
+          # which (a) spuriously adds duplicate instances and (b) hard-fails for
+          # singleton adapters ("this adapter does not allow multiple
+          # instances"), e.g. on a multihost slave sharing the master's objects
+          # DB where the instance was created on the master.
+          run iobroker install "${adapter}"
         done
       fi
       ;;

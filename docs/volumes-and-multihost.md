@@ -104,7 +104,7 @@ start if that file is missing. So:
 - An **empty host bind mount** over `node_modules` shadows the image's
   js-controller with nothing. The container fails to start (`js-controller not
 found`), and reconciliation **cannot** recover it: reconciliation only runs
-  `iobroker add <adapter>` for adapters and `npm rebuild` for native modules —
+  `iobroker install <adapter>` for adapters and `npm rebuild` for native modules —
   it never reconstructs js-controller or its dependencies, and the `iobroker`
   CLI it would need is itself missing. **Do not bind-mount an empty host
   directory over `node_modules`.**

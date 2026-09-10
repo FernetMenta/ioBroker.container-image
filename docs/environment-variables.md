@@ -84,6 +84,22 @@ Only the fields you set are applied; the container patches exactly those and
 leaves everything else as ioBroker configured it. Invalid type/port/role values
 stop startup with an error naming the value.
 
+### Per-host adapter installation in a multihost cluster
+
+In a multihost cluster the objects DB records adapter **instances** for every
+host, and each instance is assigned to a specific host (visible in the host
+column of `iobroker list instances`). Adapter **code** only needs to be present
+on the host that actually runs an instance, so on startup this container
+installs only the adapters whose instances are assigned to **this** host — not
+the entire cluster's adapter set. A slave therefore stays slim, installing code
+just for the instances it runs rather than everything the master runs.
+
+This host's ioBroker name is its container hostname (for example, set
+`hostname: iobroker-sml` in Compose). The reconciler matches that name against
+the instance host assignments; you can override it with `IOB_HOSTNAME` if
+needed. In a standalone install every instance is assigned to the single host,
+so this filtering is a no-op.
+
 ## Removed variables
 
 The following variables are **no longer part of the environment variable set**

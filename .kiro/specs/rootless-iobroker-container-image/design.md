@@ -163,7 +163,7 @@ flowchart TD
     INIT --> DIFF{"Desired adapters missing\nfrom node_modules content?"}
     DIFF -->|none missing| ABI
     DIFF -->|some missing| REG{"Registry reachable?"}
-    REG -->|yes| INSTALLMISS["install-missing: iobroker add\nthe missing desired adapters"]
+    REG -->|yes| INSTALLMISS["install-missing: iobroker install\nthe missing desired adapters (code only,\nno instance creation)"]
     REG -->|no| WARNSTART1["warn-and-start: log warning;\nstart with adapters present"]
     INSTALLMISS --> ABI
     WARNSTART1 --> ABI{"Node ABI mismatch vs\npresent native modules?"}
@@ -236,7 +236,7 @@ reconcile() {
   if [ -z "$missing" ]; then
     : # already converged; nothing to install
   elif registry_reachable; then                       # npm ping (npm's own CA)
-    install_missing "$missing"                        # iobroker add (Req 8.9, 8.10)
+    install_missing "$missing"                        # iobroker install (code only; Req 8.9, 8.10)
   else
     log_warn "registry unreachable; missing: $missing"  # start anyway (Req 8.11)
   fi

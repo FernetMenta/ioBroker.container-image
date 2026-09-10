@@ -199,7 +199,7 @@ fi
 # reconcile.sh is the thin glue that OBSERVES the environment (empty Data_Volume,
 # node_modules mount state, registry reachability, ABI mismatch, recorded vs.
 # installed adapter sets), asks lib/reconcile-plan.js (planReconciliation) for
-# the ordered actions, and EXECUTES them (iobroker setup first, iobroker add,
+# the ordered actions, and EXECUTES them (iobroker setup first, iobroker install,
 # npm rebuild, ...). It mirrors how steps 6/7 delegate to ensure-npmrc.sh /
 # ensure-npmrc.sh. On an empty Data_Volume it initializes the default config
 # and bootstraps the admin adapter so a fresh container comes up with a setup UI.
