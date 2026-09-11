@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Startup reconciliation now installs each adapter from the source it was
+  originally installed from (`common.installedFrom`): repository adapters via
+  `iobroker install <name>`, and non-repository adapters (GitHub tarball, custom
+  URL, npm spec, or a package not in the active repo) via `iobroker url
+  <source>`. Previously every adapter was installed by name against the default
+  repository, so a non-repository adapter failed with "Unknown packet name" and
+  aborted the whole startup. A single adapter that still cannot be installed is
+  now skipped with a warning instead of preventing the host from starting.
+- Multihost role is applied by patching `iobroker.json`
+  (`multihostService.enabled`) instead of running `iobroker multihost
+  enable/disable` during early startup. That CLI connects to the objects/states
+  database, which is not serving yet at that point (js-controller starts later),
+  so `IOB_MULTIHOST=master` failed with `ECONNREFUSED` on the database port.
+
 ## [0.1.0] - Work in progress
 
 Initial release of the rootless, multi-architecture ioBroker container image — a

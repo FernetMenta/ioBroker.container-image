@@ -232,6 +232,85 @@ desired_adapters() {
     | sort -u || true
 }
 
+# adapter_install_source: the recorded install SOURCE for an adapter, i.e. the
+# exact npm-url / package spec js-controller installed it from. ioBroker writes
+# this into each adapter's io-package.json as `common.installedFrom` when it
+# installs (see js-controller setupInstall), and it is mirrored on the adapter
+# object `system.adapter.<name>` in the objects DB. We need it because an
+# adapter may have been installed from OUTSIDE the standard repository (a GitHub
+# tarball, a custom URL, an npm spec, a beta/latest repo). For those,
+# `iobroker install <name>` fails with "Unknown packet name <name>" — they must
+# be (re)installed via `iobroker url <source>`. The desired set is derived from
+# the objects DB, so we read the source from the DB object (present even when
+# the adapter code is NOT yet in node_modules — exactly the case we install for)
+# and fall back to a locally-present io-package.json.
+#
+# Prints the raw installedFrom string (may be empty) for one adapter name.
+adapter_install_source() {
+  local name="$1"
+  [[ -n "${name}" ]] || return 0
+
+  # Preferred: the objects DB, which knows the source even for not-yet-installed
+  # adapters. `iobroker object get` prints the object JSON on stdout.
+  if command -v iobroker >/dev/null 2>&1; then
+    local obj
+    obj="$(iobroker object get "system.adapter.${name}" 2>/dev/null || true)"
+    if [[ -n "${obj}" ]]; then
+      local from
+      from="$(printf '%s' "${obj}" | IOB_ADAPTER_NAME="${name}" node --input-type=module -e '
+        let s = "";
+        process.stdin.on("data", (d) => (s += d)).on("end", () => {
+          try {
+            const o = JSON.parse(s);
+            const v = o && o.common && o.common.installedFrom;
+            process.stdout.write(typeof v === "string" ? v : "");
+          } catch { process.stdout.write(""); }
+        });
+      ' 2>/dev/null || true)"
+      if [[ -n "${from}" ]]; then
+        printf '%s' "${from}"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback: a locally-present io-package.json (adapter already in node_modules).
+  local iopack="${IOB_NODE_MODULES_DIR}/iobroker.${name}/io-package.json"
+  if [[ -r "${iopack}" ]]; then
+    IOB_IOPACK_PATH="${iopack}" node --input-type=module -e '
+      import { readFileSync } from "node:fs";
+      try {
+        const o = JSON.parse(readFileSync(process.env.IOB_IOPACK_PATH, "utf8"));
+        const v = o && o.common && o.common.installedFrom;
+        process.stdout.write(typeof v === "string" ? v : "");
+      } catch { process.stdout.write(""); }
+    ' 2>/dev/null || true
+  fi
+}
+
+# source_is_url: decide whether an install source must go through `iobroker url`
+# (non-repo source) rather than `iobroker install <name>` (repo by name).
+#
+# `common.installedFrom` is the npm install spec js-controller used. For a plain
+# repo install it is either absent or a bare/registry form like
+# `iobroker.<name>` or `iobroker.<name>@1.2.3`. For a non-repo install it is a
+# URL or a spec npm would fetch from outside the configured repository:
+#   * http(s):// or git+... or git://       (tarball / git)
+#   * contains "/tarball/" or looks like "owner/repo" or "owner/repo#ref" (GitHub)
+#   * a filesystem path (/... or file:)      (local install)
+# Anything else (empty, or a bare iobroker.<name>[@version]) is treated as a
+# normal repo adapter and installed by name.
+source_is_url() {
+  local src="$1"
+  [[ -n "${src}" ]] || return 1
+  case "${src}" in
+    http://* | https://* | git+* | git://* | file:* | /*) return 0 ;;
+    *iobroker.*@* | iobroker.* ) return 1 ;; # bare repo spec (with/without @ver)
+    */*) return 0 ;;                          # owner/repo (GitHub shorthand)
+    *) return 1 ;;
+  esac
+}
+
 # installed_adapters: adapter names currently PRESENT under node_modules,
 # observed from directory content (independent of mount state). ioBroker adapter
 # packages are published as `iobroker.<name>` directories.
@@ -390,19 +469,54 @@ while IFS=$'\t' read -r action args_rest; do
         log "install-missing: node_modules already has the desired adapter set"
       else
         log "installing missing adapters (${#args[@]}): ${args[*]}"
+        install_failures=()
         for adapter in "${args[@]}"; do
-          # `iobroker install` installs ONLY the adapter code; it does NOT
-          # create an instance. This is what reconciliation needs: the desired
-          # set is derived from the instances already recorded in the
-          # Data_Volume (the source of truth), so those instances exist already
-          # — our job is purely to converge node_modules to match. Using
-          # `iobroker add` here would instead try to CREATE a new instance,
-          # which (a) spuriously adds duplicate instances and (b) hard-fails for
-          # singleton adapters ("this adapter does not allow multiple
-          # instances"), e.g. on a multihost slave sharing the master's objects
-          # DB where the instance was created on the master.
-          run iobroker install "${adapter}"
+          # Choose the install COMMAND based on where the adapter was originally
+          # installed FROM (common.installedFrom, recorded in the objects DB):
+          #
+          #   * repo adapter (bare/empty source) -> `iobroker install <name>`
+          #     installs ONLY the adapter code from the configured repository; it
+          #     does NOT create an instance. That is exactly what reconciliation
+          #     needs: the desired set is derived from the instances already
+          #     recorded in the Data_Volume (the source of truth), so the
+          #     instances exist already and our job is purely to converge
+          #     node_modules to match. (Using `iobroker add` would instead try to
+          #     CREATE an instance, duplicating it and hard-failing for singleton
+          #     adapters, e.g. on a multihost slave sharing the master's DB.)
+          #
+          #   * non-repo adapter (GitHub tarball, custom URL, npm spec, a package
+          #     not in the active repo) -> `iobroker url <source>`. These CANNOT
+          #     be installed by name: `iobroker install <name>` fails with
+          #     "Unknown packet name <name>. Please install ... using iobroker
+          #     url". We reinstall the code from the SAME source the operator
+          #     originally used, so a container recreate faithfully rebuilds the
+          #     recorded adapter set regardless of where each adapter came from.
+          #     `iobroker url` likewise installs code without creating instances.
+          src="$(adapter_install_source "${adapter}")"
+          if source_is_url "${src}"; then
+            log "  ${adapter}: installing from recorded source: ${src}"
+            if ! run iobroker url "${src}"; then
+              install_failures+=("${adapter} (url: ${src})")
+            fi
+          else
+            [[ -n "${src}" ]] && log "  ${adapter}: repo install (source: ${src})" \
+              || log "  ${adapter}: repo install"
+            if ! run iobroker install "${adapter}"; then
+              install_failures+=("${adapter}")
+            fi
+          fi
         done
+
+        # A single adapter that cannot be (re)installed MUST NOT abort startup.
+        # The recorded source may be transiently unreachable (a GitHub outage), a
+        # deleted/renamed package, or a private repo. Warn, name the offenders,
+        # and start with the adapters that DID install — js-controller simply
+        # reports the missing ones as failing instances, which is far better than
+        # refusing to start the whole host over one adapter. (Consistent with the
+        # warn-and-start policy for offline reconciliation, Req 8.11/8.13.)
+        if [[ ${#install_failures[@]} -gt 0 ]]; then
+          log "WARNING: ${#install_failures[@]} adapter(s) could not be installed and will be skipped: ${install_failures[*]}"
+        fi
       fi
       ;;
 
