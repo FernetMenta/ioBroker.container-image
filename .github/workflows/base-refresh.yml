@@ -88,8 +88,12 @@ jobs:
 
       - name: Determine the latest 2 versions
         id: versions
-        # Collect every `<version>-r<n>` tag, reduce to distinct `<version>`s,
-        # sort newest-first (semver-aware via `sort -V`), and keep the top 2.
+        # Collect every `<version>-r<n>` RELEASE tag, reduce to distinct
+        # `<version>`s, sort newest-first (semver-aware via `sort -V`), and keep
+        # the top 2. Dev tags (`<version>-dev-r<n>`) are deliberately EXCLUDED:
+        # the anchored `-r[0-9]+$` requires `-r` immediately after the version,
+        # which `-dev-r<n>` does not satisfy. So a version that only has dev
+        # tags is not refreshed until release-promote.yml first cuts its `-r1`.
         run: |
           set -euo pipefail
           mapfile -t versions < <(

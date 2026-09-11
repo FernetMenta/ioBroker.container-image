@@ -1,0 +1,119 @@
+# Release promotion.
+#
+# Pushing a plain `<version>` tag is how a maintainer SIGNALS "cut a release":
+#   - `<version>`            3 components, e.g. `7.2.2` — release that
+#                            js-controller version.
+#   - `<version>.<build>`    4 components, e.g. `7.2.2.1` — an image-only
+#                            re-release of an already-released js-controller
+#                            version (the 4th component is just a nudge and is
+#                            NOT part of the 3-component `<version>`).
+#
+# On such a signal this workflow decides which `<version>-r<n>` RELEASE tags to
+# create (via scripts/plan-release-tags.sh) and pushes them. Those pushes
+# trigger build-publish.yml, which does the actual multi-arch build + publish.
+# This workflow only DECIDES and TAGS; it never builds or publishes images.
+#
+# What it creates (see the script + docs/building.md): the LATEST 2 distinct
+# 3-component js-controller versions across ALL tags (dev and release), each
+# advanced to its next release revision:
+#   - `<version>-r<highest+1>` if a release tag already exists;
+#   - `<version>-r1` if only `<version>-dev-r<n>` tags exist.
+# Re-cutting the previous release too is intentional: image/script changes made
+# during the new version's dev cycle then flow to the prior release as well.
+#
+# Example: testing 7.2.2 up to 7.2.2-dev-r7 with prior release 7.1.3-r3; push
+# `7.2.2` (or `7.2.2.1`) -> creates `7.2.2-r1` AND `7.1.3-r4`.
+#
+# TOKEN: like base-refresh.yml, the created tags are pushed with the RELEASE_PAT
+# secret so build-publish IS triggered (a tag pushed with the default
+# GITHUB_TOKEN does not trigger other workflows). Without RELEASE_PAT the tags
+# are still created but the job warns that build-publish will not fire
+# automatically.
+
+name: release-promote
+
+on:
+  push:
+    tags:
+      # Plain release-signal tags ONLY: 3 or 4 numeric components, NO `-r` /
+      # `-dev-r` suffix (those are built by build-publish.yml, not signals).
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report which release tags would be created; do not push.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Promote latest 2 versions to a new release revision
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Push the created tags as the PAT so build-publish is triggered;
+          # fall back to the default token (tags created, build-publish NOT
+          # triggered -> warning below).
+          token: ${{ secrets.RELEASE_PAT || github.token }}
+
+      - name: Plan and create release tags
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          HAS_PAT: ${{ secrets.RELEASE_PAT != '' }}
+          SIGNAL_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # The signal tag itself (7.2.2 / 7.2.2.1) is a lightweight marker; it
+          # is NOT a buildable image tag and plan-release-tags.sh ignores it
+          # (it only reads `<version>-r<n>` / `<version>-dev-r<n>` tags). Log it
+          # for traceability.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Release signal tag pushed: '${SIGNAL_TAG}'."
+          else
+            echo "Manual release-promote run."
+          fi
+
+          mapfile -t all_tags < <(git tag --list)
+          mapfile -t planned < <(scripts/plan-release-tags.sh "${all_tags[@]}")
+
+          if [[ ${#planned[@]} -eq 0 ]]; then
+            echo "No versions to release (no '<version>-r<n>' or '<version>-dev-r<n>' tags found)."
+            exit 0
+          fi
+
+          echo "Planned release tags: ${planned[*]}"
+
+          created_any=0
+          for tag in "${planned[@]}"; do
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              # plan-release-tags.sh computes highest+1, so this should not
+              # happen; never clobber an existing tag if it does.
+              echo "::warning title=Tag exists::'${tag}' already exists; skipping."
+              continue
+            fi
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "DRY RUN: would create and push tag '${tag}'."
+              continue
+            fi
+            echo "Creating release tag '${tag}'."
+            git tag "${tag}"
+            git push origin "refs/tags/${tag}"
+            created_any=1
+            if [[ "${HAS_PAT}" != "true" ]]; then
+              echo "::warning title=build-publish not triggered::Tag '${tag}' was pushed with the default GITHUB_TOKEN, which does NOT trigger build-publish. Configure a RELEASE_PAT secret (contents:write) so the release publishes automatically, or re-push the tag / run build-publish manually."
+            fi
+          done
+
+          if [[ "${DRY_RUN}" != "true" && "${created_any}" -eq 0 ]]; then
+            echo "No new release tags were created."
+          fi

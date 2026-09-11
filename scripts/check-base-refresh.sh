@@ -62,7 +62,10 @@ log() { echo "check-base-refresh: $*" >&2; }
 # ---------------------------------------------------------------------------
 
 # highest_revision <version> <tag>...
-# Print "<n> <tag>" for the highest `<version>-r<n>` among the tags, or nothing.
+# Print "<n> <tag>" for the highest `<version>-r<n>` RELEASE tag among the tags,
+# or nothing. Dev tags (`<version>-dev-r<n>`) are EXCLUDED: the pattern requires
+# a literal `-r` immediately after the version, which `-dev-r<n>` does not
+# satisfy, so base-refresh never acts on dev revisions.
 highest_revision() {
   local version="$1"; shift
   local esc re t rev best=-1 best_tag=""

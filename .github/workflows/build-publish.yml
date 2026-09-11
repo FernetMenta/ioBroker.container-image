@@ -42,8 +42,13 @@ on:
     branches:
       - main
     tags:
-      # Release tags are `<version>-r<n>` with NO leading `v`, e.g. `7.2.2-r2`.
+      # Release tags are `<version>-r<n>` with NO leading `v`, e.g. `7.2.2-r3`.
       - '[0-9]+.[0-9]+.[0-9]+-r[0-9]+'
+      # Dev/test tags are `<version>-dev-r<n>`, e.g. `7.2.2-dev-r2`. They build
+      # and publish to GHCR under their immutable tag ONLY (no `latest`, no
+      # moving `<version>` alias — a dev build must never move the release
+      # pointers). base-refresh ignores them.
+      - '[0-9]+.[0-9]+.[0-9]+-dev-r[0-9]+'
   pull_request:
     branches:
       - main
@@ -81,10 +86,15 @@ jobs:
       # (PRs, main, dispatch) it is `stable` — the normal shipped default — since
       # there is no version to pin. (see `parse-tag` step)
       js_controller_version: ${{ steps.parse-tag.outputs.js_controller_version }}
-      # The immutable `<version>-r<n>` release tag on a tag push, else empty.
+      # The immutable tag (`<version>-r<n>` or `<version>-dev-r<n>`) on a tag
+      # push, else empty.
       release_tag: ${{ steps.parse-tag.outputs.release_tag }}
-      # The moving `<version>` alias on a tag push, else empty.
+      # The moving `<version>` alias on a RELEASE tag push, else empty (empty for
+      # dev tags, which must not move the alias).
       release_version: ${{ steps.parse-tag.outputs.release_version }}
+      # "true" when the pushed tag is a dev/test tag (`<version>-dev-r<n>`), so
+      # the publish job can suppress `latest`. "false" otherwise.
+      is_dev: ${{ steps.parse-tag.outputs.is_dev }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -159,18 +169,39 @@ jobs:
           ref="${{ github.ref }}"
           name="${{ github.ref_name }}"
           if [[ "$ref" == refs/tags/* ]]; then
-            if [[ ! "$name" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-r[0-9]+$ ]]; then
-              echo "::error title=Bad release tag::Tag '$name' is not of the form <version>-r<n> (e.g. 7.2.2-r2)."
+            # Two publishable tag shapes, both carrying the same 3-component
+            # js-controller `<version>` to pin:
+            #   - release:  <version>-r<n>       (e.g. 7.2.2-r3)
+            #   - dev/test: <version>-dev-r<n>   (e.g. 7.2.2-dev-r2)
+            # A dev tag publishes ONLY its immutable tag: it must NOT move the
+            # `latest` or `<version>` release pointers, so `release_version`
+            # (the moving alias) is left empty for dev and `is_dev=true` gates
+            # `latest` in the publish job. The plain `<version>` release-SIGNAL
+            # tag (7.2.2 / 7.2.2.1) is handled by release-promote.yml, never
+            # here — it is not a buildable image tag, so reject it explicitly.
+            if [[ "$name" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev-r[0-9]+$ ]]; then
+              version="${BASH_REMATCH[1]}"
+              echo "release_tag=${name}" >> "$GITHUB_OUTPUT"
+              # No moving alias for dev builds.
+              echo "release_version=" >> "$GITHUB_OUTPUT"
+              echo "is_dev=true" >> "$GITHUB_OUTPUT"
+              echo "js_controller_version=${version}" >> "$GITHUB_OUTPUT"
+              echo "Dev tag '${name}' -> pin js-controller '${version}', immutable tag only (no latest/alias)."
+            elif [[ "$name" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-r[0-9]+$ ]]; then
+              version="${BASH_REMATCH[1]}"
+              echo "release_tag=${name}" >> "$GITHUB_OUTPUT"
+              echo "release_version=${version}" >> "$GITHUB_OUTPUT"
+              echo "is_dev=false" >> "$GITHUB_OUTPUT"
+              echo "js_controller_version=${version}" >> "$GITHUB_OUTPUT"
+              echo "Release tag '${name}' -> pin js-controller '${version}', alias '${version}', latest."
+            else
+              echo "::error title=Bad tag::Tag '$name' is not a buildable image tag. Expected <version>-r<n> (e.g. 7.2.2-r3) or <version>-dev-r<n> (e.g. 7.2.2-dev-r2). Plain <version> tags are release SIGNALS handled by release-promote.yml, not built here."
               exit 1
             fi
-            version="${BASH_REMATCH[1]}"
-            echo "release_tag=${name}" >> "$GITHUB_OUTPUT"
-            echo "release_version=${version}" >> "$GITHUB_OUTPUT"
-            echo "js_controller_version=${version}" >> "$GITHUB_OUTPUT"
-            echo "Release tag '${name}' -> pin js-controller '${version}', alias '${version}'."
           else
             echo "release_tag=" >> "$GITHUB_OUTPUT"
             echo "release_version=" >> "$GITHUB_OUTPUT"
+            echo "is_dev=false" >> "$GITHUB_OUTPUT"
             echo "js_controller_version=stable" >> "$GITHUB_OUTPUT"
             echo "Non-tag build -> js-controller 'stable' (no pin)."
           fi
@@ -274,15 +305,19 @@ jobs:
           # Explicit image name (NOT github.repository). (Req 1.3)
           images: ${{ needs.read-build-config.outputs.image }}
           tags: |
-            # Immutable tag: the exact git tag `<version>-r<n>` (e.g. 7.2.2-r2)
-            # applied to the single multi-arch manifest. Parsed once in the
-            # read-build-config job.
+            # Immutable tag: the exact git tag (`<version>-r<n>` e.g. 7.2.2-r3,
+            # or `<version>-dev-r<n>` e.g. 7.2.2-dev-r2) applied to the single
+            # multi-arch manifest. Parsed once in the read-build-config job.
             type=raw,value=${{ needs.read-build-config.outputs.release_tag }}
             # Moving alias: `<version>` (e.g. 7.2.2) -> newest revision for that
-            # js-controller version.
+            # js-controller version. EMPTY for dev tags (release_version is
+            # empty), which metadata-action skips, so a dev build never moves
+            # the `<version>` pointer.
             type=raw,value=${{ needs.read-build-config.outputs.release_version }}
-            # latest applied to the same manifest on release-tag pushes.
-            type=raw,value=latest
+            # `latest` applied only on RELEASE-tag pushes. For dev tags this is
+            # empty (is_dev == true) and metadata-action skips it, so a dev
+            # build never moves `latest`.
+            type=raw,value=${{ needs.read-build-config.outputs.is_dev == 'true' && '' || 'latest' }}
           labels: |
             # Link the GHCR package (name `iobroker`) back to its source repo.
             org.opencontainers.image.source=https://github.com/${{ github.repository }}

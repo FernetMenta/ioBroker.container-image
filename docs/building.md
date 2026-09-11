@@ -123,28 +123,90 @@ The local path is deliberately kept equivalent to the CI build (task 16.1):
 | Architectures           | host (single) or amd64+arm64 (multi)       | `linux/amd64,linux/arm64`                                |
 | Debian base             | `debianCodename` (default `trixie`)        | same default (`trixie`)                                  |
 | js-controller version   | `JS_CONTROLLER_VERSION` (default `stable`) | pinned from the release tag on tag pushes, else `stable` |
-| Push                    | never                                      | only on `<version>-r<n>` tag pushes                      |
+| Push                    | never                                      | on `<version>-r<n>` and `<version>-dev-r<n>` tag pushes  |
 
 Because the build-knob source, the Dockerfile, and the gate stage are identical,
 a successful local build reproduces what CI builds.
 
 ## Versioning and release tags
 
-The image version is driven entirely by the **git tag**, which is identical to
-the immutable image tag:
+The image version is driven entirely by the **git tag**. There are three tag
+shapes, and each plays a distinct role:
 
-```
-<version>-r<n>      e.g.  7.2.2-r2
-```
+| Git tag                           | Role               | Pushed by      | Builds & publishes?                      |
+| --------------------------------- | ------------------ | -------------- | ---------------------------------------- |
+| `<version>-dev-r<n>`              | dev/test build     | you (manually) | yes — immutable dev tag only             |
+| `<version>-r<n>`                  | release build      | automation     | yes — immutable + `<version>` + `latest` |
+| `<version>` / `<version>.<build>` | release **signal** | you (manually) | no — triggers promotion                  |
 
-- `<version>` (`7.2.2`) is the bundled **iobroker.js-controller** version — the
-  thing users track. It bumps when js-controller is bumped.
+- `<version>` is the bundled **iobroker.js-controller** version, always **3
+  numeric components** (`7.2.2`) — the thing users track.
 - `-r<n>` is the **image revision**. It bumps on a rebuild of the _same_
-  controller version (base-image security patch, `Dockerfile` change, dependency
-  bump) and resets to `-r1` whenever `<version>` changes.
+  controller version (base-image security patch, `Dockerfile`/script change,
+  dependency bump) and starts at `-r1` for each `<version>`.
+- `-dev-r<n>` marks a **dev/test** build. It is the only tag you push by hand
+  during development.
 
-There is **no `v` prefix**, so the git tag and the image tag are byte-for-byte
-identical.
+There is **no `v` prefix**, so the release git tag (`7.2.2-r3`) and the image tag
+are byte-for-byte identical.
+
+You **never hand-push `<version>-r<n>` release tags anymore** — automation
+creates them (see [How to release](#how-to-release) and
+[Automatic revision bumps](#automatic-revision-bumps-on-a-newer-base-image)).
+
+### Dev/test builds
+
+During development, push a `-dev-r<n>` tag to build and publish a throwaway
+image to GHCR without touching the release pointers:
+
+```sh
+git tag 7.2.2-dev-r1 && git push origin 7.2.2-dev-r1
+# -> ghcr.io/<owner>/iobroker:7.2.2-dev-r1   (NO `latest`, NO `7.2.2` alias)
+```
+
+A dev build pins js-controller to the tag's `<version>` (here `7.2.2`) exactly
+like a release build, but it publishes **only** its immutable
+`7.2.2-dev-r<n>` tag. It deliberately does **not** move the moving `7.2.2`
+alias or `latest`, so consumers of the released image never accidentally pull a
+dev build. Dev tags are also ignored by the base-refresh job.
+
+### How to release
+
+You do not create release revisions directly. Instead push a plain `<version>`
+**release-signal** tag; the `release-promote.yml` workflow reacts to it:
+
+```sh
+# release js-controller 7.2.2 (or re-release after image/script changes):
+git tag 7.2.2   && git push origin 7.2.2
+# image-only re-release of an already-released version (4th component = a nudge):
+git tag 7.2.2.1 && git push origin 7.2.2.1
+```
+
+On that signal, `release-promote.yml` (via `scripts/plan-release-tags.sh`):
+
+1. Takes the **latest 2 distinct** 3-component `<version>`s across **all** tags
+   (both `-dev-r<n>` and `-r<n>` reveal a version). Older versions stay frozen.
+2. For each, creates the next release revision and pushes it:
+   - `<version>-r<highest+1>` if a `<version>-r<n>` release tag already exists;
+   - `<version>-r1` if only `<version>-dev-r<n>` tags exist (first release of
+     that version).
+
+Re-cutting the **previous** release too is intentional: image/script changes
+made during the new version's dev cycle then flow to the prior release as well.
+
+> **Example.** You are testing `7.2.2` (tags up to `7.2.2-dev-r7`) and the
+> previous release is `7.1.3-r3`. Pushing `7.2.2` (or `7.2.2.1`) creates
+> **`7.2.2-r1`** (first release of 7.2.2) **and** **`7.1.3-r4`** (the prior
+> release picks up the shared changes). Each pushed release tag then triggers
+> `build-publish.yml`.
+
+The 4th numeric component in a `<version>.<build>` signal (e.g. the `.1` in
+`7.2.2.1`) is just a way to push a fresh signal tag when `7.2.2` already exists;
+it is **not** part of the js-controller `<version>` and never appears in an
+image tag.
+
+Before signalling a release, bump `containerImage` in `package.json` if the Node
+major or Debian codename changed.
 
 Node major and Debian codename are **not** in the tag. They are recorded as OCI
 image labels (`org.iobroker.node.major`, `org.iobroker.debian.codename`,
@@ -165,16 +227,22 @@ On non-tag builds (PRs, pushes to `main`, `workflow_dispatch`) there is nothing
 to pin, so `JS_CONTROLLER_VERSION` stays `stable` (the normal shipped default)
 and the exact-version check is skipped.
 
-### On a release, CI publishes
+### What CI publishes
+
+On a **release** tag (`<version>-r<n>`):
 
 | Image tag  | Kind      | Points at                                   |
 | ---------- | --------- | ------------------------------------------- |
-| `7.2.2-r2` | immutable | this exact build                            |
+| `7.2.2-r3` | immutable | this exact build                            |
 | `7.2.2`    | moving    | newest revision for that controller version |
 | `latest`   | moving    | newest release overall                      |
 
-To cut a release: bump `containerImage` in `package.json` if node/os changed,
-then push the tag, e.g. `git tag 7.2.2-r1 && git push origin 7.2.2-r1`.
+On a **dev** tag (`<version>-dev-r<n>`) only the immutable tag is published;
+`latest` and the `<version>` alias are left untouched:
+
+| Image tag      | Kind      | Points at        |
+| -------------- | --------- | ---------------- |
+| `7.2.2-dev-r2` | immutable | this exact build |
 
 ### Automatic revision bumps on a newer base image
 
@@ -185,8 +253,10 @@ workflow (`.github/workflows/base-refresh.yml`) keeps the **latest 2**
 js-controller versions current:
 
 1. It collects the latest two distinct `<version>`s from the existing
-   `<version>-r<n>` tags (e.g. `7.2.2` and `7.1.3`). Older versions are left
-   frozen.
+   `<version>-r<n>` **release** tags (e.g. `7.2.2` and `7.1.3`). Dev-only
+   versions (those with just `<version>-dev-r<n>` tags) and older versions are
+   left frozen — a version is refreshed only after `release-promote.yml` has
+   cut its first `-r1`.
 2. For each, `scripts/check-base-refresh.sh` finds the highest revision (e.g.
    `7.2.2-r5`), reads the base image from that published image's own
    `org.opencontainers.image.base.name` label, and compares the base image's
@@ -207,18 +277,20 @@ always present for both images and answers exactly the question asked — "is
 there a base image newer than the one we shipped?" — with no extra state to
 maintain.
 
-> **`RELEASE_PAT` is required for the rebuild to publish automatically.** A tag
-> pushed with the default `GITHUB_TOKEN` does **not** trigger other workflows
-> (GitHub prevents recursive workflow runs), so `build-publish` would not fire.
-> Configure a `RELEASE_PAT` repository secret — a fine-grained PAT with
-> `contents: write`, or a classic PAT with `repo` — and the refresh job pushes
-> the new tag as that identity so `build-publish` runs. Without it, the tag is
-> still created (using `GITHUB_TOKEN`) but the job **warns** that publishing did
-> not start; a maintainer must then re-push the tag or run `build-publish`
-> manually.
+> **`RELEASE_PAT` is required for automation-created tags to publish
+> automatically.** This applies to **both** `release-promote.yml` and
+> `base-refresh.yml`: a tag pushed with the default `GITHUB_TOKEN` does **not**
+> trigger other workflows (GitHub prevents recursive workflow runs), so
+> `build-publish` would not fire. Configure a `RELEASE_PAT` repository secret —
+> a fine-grained PAT with `contents: write`, or a classic PAT with `repo` — and
+> the job pushes the new tag as that identity so `build-publish` runs. Without
+> it, the tag is still created (using `GITHUB_TOKEN`) but the job **warns** that
+> publishing did not start; a maintainer must then re-push the tag or run
+> `build-publish` manually.
 
-The workflow also supports `workflow_dispatch` with a `dry_run` input to report
-what it _would_ tag without creating anything.
+Both `release-promote.yml` and `base-refresh.yml` also support
+`workflow_dispatch` with a `dry_run` input to report what they _would_ tag
+without creating anything.
 
 ## Configuration (environment overrides)
 
