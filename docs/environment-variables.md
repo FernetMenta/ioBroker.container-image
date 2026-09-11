@@ -42,6 +42,41 @@ captured — are ignored for default resolution.
 | `IOB_STARTUP_GRACE_PERIOD` | `300` | `0`–`3600` (seconds) | Healthcheck startup grace period. During this window after start, the healthcheck does not report unhealthy. |
 | `IOB_UPGRADE_TOLERANCE_WINDOW` | `600` | `0`–`3600` (seconds) | Healthcheck upgrade tolerance window. While an upgrade is in progress, the healthcheck does not report unhealthy within this window. |
 | `IOB_RECONCILE_STALL_TOLERANCE` | `120` | `0`–`3600` (seconds) | Healthcheck reconcile stall tolerance. While first-boot/post-upgrade reconciliation (adapter installs, native rebuilds) is in progress, the healthcheck tolerates a failing status check for **any** total duration as long as reconcile keeps advancing its heartbeat. This value bounds only how long the heartbeat may go **stale** before reconcile is treated as stuck and unhealthy is reported. Raise it if a single reconcile step (e.g. one large adapter install on a very slow link) can pause longer than the default. |
+| `IOB_ADAPTER_INSTALL_FAILURE_POLICY` | `tolerate-no-instance` | `strict` \| `tolerate-no-instance` \| `tolerate-all` | What to do when an adapter's code cannot be (re)installed during startup reconciliation. See [Adapter install failure policy](#adapter-install-failure-policy) below. Validated. |
+
+### Adapter install failure policy
+
+On startup the container reconciles installed adapter **code** to match the
+adapter set recorded in the Data_Volume, installing each adapter from the source
+it was originally installed from (`common.installedFrom`: the repository, or a
+GitHub / URL / npm spec). An install can fail — most often because a non-repository
+source is currently unavailable, was renamed, made private, or removed.
+`IOB_ADAPTER_INSTALL_FAILURE_POLICY` controls how such a failure is handled:
+
+| Value | Behavior on a failed adapter install |
+|---|---|
+| `strict` | Any failed install is treated as fatal. |
+| `tolerate-no-instance` _(default)_ | Tolerate a failed install **only** when the adapter has no **enabled** instance on this host; a failure for an adapter that **does** have an enabled instance here is fatal. The reasoning: an adapter whose instances are all disabled (or which has no instance on this host) is not actually running, so missing code is harmless; an adapter with a running instance but no code is a real problem you should notice. |
+| `tolerate-all` | Never fatal. Every failed install is logged as a warning and startup continues. |
+
+An adapter counts as having an "enabled instance on this host" when
+`iobroker list instances` shows at least one of its instances assigned to this
+host with an **enabled** status (a `disabled` instance does not count).
+
+Tolerated failures are logged as a warning and startup continues; js-controller
+then reports the missing adapters as failing instances until you fix them.
+
+**What "fatal" does — it blocks, it does not crash-loop.** A fatal failure does
+**not** exit the container. Exiting would let the runtime's restart policy
+restart it straight back into the same failure (a crash loop that also
+re-installs the working adapters every cycle). Instead the container is held
+running in an **unhealthy** state: reconciliation stops, a clear `FATAL` message
+naming the offending adapter(s) is logged, and the healthcheck reports unhealthy
+(the reconcile liveness markers are cleared, so a Docker `HEALTHCHECK` /
+Kubernetes probe fails once past the startup grace window). Signals still work
+(tini forwards `SIGTERM`), so `docker stop` / pod deletion terminates it
+cleanly. To recover, fix the adapter source (or remove the offending
+adapter/instance) — or relax the policy — and recreate the container.
 
 ### Notes on UID/GID
 

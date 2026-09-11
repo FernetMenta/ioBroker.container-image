@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `IOB_ADAPTER_INSTALL_FAILURE_POLICY` to control what happens when an adapter's
+  code cannot be (re)installed during startup reconciliation: `strict` (any
+  failure fatal), `tolerate-no-instance` (default — fatal only if the adapter
+  has an enabled instance on this host), or `tolerate-all` (never fatal). A
+  fatal failure does not exit the container (which the restart policy would turn
+  into a crash loop); instead the container is held running in an unhealthy
+  state with a clear `FATAL` log naming the offending adapter(s), so the
+  healthcheck reports unhealthy while `SIGTERM` still stops it cleanly. See
+  [docs/environment-variables.md](docs/environment-variables.md#adapter-install-failure-policy).
+
 ### Fixed
 
 - Startup reconciliation retries an adapter install when it hits the jsonl

@@ -78,6 +78,25 @@ IOB_RECONCILE_DRY_RUN="${IOB_RECONCILE_DRY_RUN:-false}"
 #               unchanged, and what tests exercise unless they override it.
 IOB_RECONCILE_PHASE="${IOB_RECONCILE_PHASE:-all}"
 
+# IOB_ADAPTER_INSTALL_FAILURE_POLICY controls what happens when an adapter's
+# code cannot be (re)installed during the install phase (e.g. its recorded
+# install source is a GitHub/URL/npm spec that is currently unavailable, renamed,
+# or private). The desired set is derived from the instances recorded in the
+# Data_Volume, so a failed install means "an adapter the config expects is
+# missing its code". Policies:
+#   * strict               Any failed install is fatal.
+#   * tolerate-no-instance (default) Tolerate a failed install ONLY when the
+#                          adapter has no ENABLED instance on this host; a failed
+#                          install for an adapter that DOES have an enabled
+#                          instance here is fatal (a running instance with no
+#                          code is something the operator should notice).
+#   * tolerate-all         Never fatal; warn and continue for every failure.
+# "Fatal" here does NOT mean exit-and-crash-loop: the entrypoint's restart policy
+# would just restart us into the same failure. Instead we BLOCK (hold the
+# container up) after clearing the reconcile liveness markers so the healthcheck
+# reports unhealthy — the problem is visible and actionable without thrashing.
+IOB_ADAPTER_INSTALL_FAILURE_POLICY="${IOB_ADAPTER_INSTALL_FAILURE_POLICY:-tolerate-no-instance}"
+
 # Reconcile liveness markers consumed by scripts/healthcheck.sh + lib/health-state.js.
 # The entrypoint runs reconciliation BEFORE js-controller starts, so `iobroker
 # status` fails for the whole reconcile phase. That phase has no meaningful upper
@@ -121,9 +140,46 @@ begin_reconcile() {
 end_reconcile() {
   rm -f -- "${IOB_RECONCILE_MARKER}" "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
 }
+# block_unhealthy: hold the container up in a clearly-unhealthy state instead of
+# exiting. Exiting on a fatal reconcile error would let the container's restart
+# policy restart us straight back into the same failure (a crash loop that also
+# re-installs the working adapters every cycle). Blocking avoids that while
+# keeping the failure visible: we FIRST remove the reconcile liveness markers so
+# the healthcheck no longer tolerates the failing `iobroker status` (a live
+# reconcile is the only reason it would), which makes it report UNHEALTHY once
+# past the startup grace window; then we sleep forever. tini (PID 1) still
+# forwards SIGTERM, so `docker stop` / pod deletion terminates us cleanly.
+block_unhealthy() {
+  local reason="$1"
+  # Drop the EXIT trap's job explicitly and now, up front: with the markers gone
+  # the healthcheck stops treating us as an in-progress (tolerated) reconcile.
+  rm -f -- "${IOB_RECONCILE_MARKER}" "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
+  trap - EXIT
+  log "FATAL: ${reason}"
+  log "FATAL: not starting js-controller. Holding the container in an unhealthy"
+  log "FATAL: state (healthcheck will report unhealthy) instead of exiting, to"
+  log "FATAL: avoid a restart loop. Fix the adapter source or set"
+  log "FATAL: IOB_ADAPTER_INSTALL_FAILURE_POLICY=tolerate-all (or remove the"
+  log "FATAL: offending adapter/instance), then recreate the container."
+  # Sleep in a way that stays responsive to signals under tini.
+  while :; do sleep 3600 & wait $! || break; done
+  # If the sleep loop is ever interrupted, exit non-zero as a last resort.
+  exit 1
+}
+
 trap end_reconcile EXIT
 
 begin_reconcile
+
+# --- Validate the install-failure policy (fail fast on a typo) ---------------
+case "${IOB_ADAPTER_INSTALL_FAILURE_POLICY}" in
+  strict | tolerate-no-instance | tolerate-all) : ;;
+  *)
+    log "invalid IOB_ADAPTER_INSTALL_FAILURE_POLICY='${IOB_ADAPTER_INSTALL_FAILURE_POLICY}'" \
+      "(expected: strict | tolerate-no-instance | tolerate-all)"
+    exit 1
+    ;;
+esac
 
 # -- Observations (thin, side-effect-free where possible) --------------------
 
@@ -227,6 +283,54 @@ desired_adapters() {
           # drop the adapter (keeps standalone / unexpected formats working).
           if (host == "" || this_host == "") { print name; next }
           if (host == this_host) print name
+        }
+      ' \
+    | sort -u || true
+}
+
+# enabled_instance_adapters: adapter names that have at least one ENABLED
+# instance assigned to THIS host. Used by the install-failure policy to decide
+# whether a failed install is tolerable: an adapter with a running (enabled)
+# instance but no code is a real problem the operator should notice, whereas an
+# adapter whose instances are all disabled (or which has no instance here) can
+# be skipped.
+#
+# Same source and host filter as desired_adapters(), but additionally inspects
+# the STATUS tail. `iobroker list instances` prints, after the " - " separator,
+# a status that begins with "enabled" or "disabled" (e.g.
+#   "... system.adapter.admin.0 : admin : host  -  enabled, port: 8081"
+#   "... system.adapter.foo.0   : foo   : host  -  disabled").
+# We split the raw line on " - " to isolate that status tail and emit the
+# adapter name only when the tail starts with "enabled". A disabled-only adapter
+# is therefore NOT reported (treated as no active instance here).
+enabled_instance_adapters() {
+  command -v iobroker >/dev/null 2>&1 || return 0
+  local this_host="${IOB_HOSTNAME:-$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)}"
+  iobroker list instances 2>/dev/null \
+    | awk -v this_host="${this_host}" '
+        /system\.adapter\./ {
+          # Columns (name/host) are split on " : "; the status tail is after " - ".
+          line = $0
+          # status tail: everything after the FIRST " - "
+          status = ""
+          si = index(line, " - ")
+          if (si > 0) status = substr(line, si + 3)
+          # trim leading space and lowercase the first word of the status
+          sub(/^[ \t]+/, "", status)
+
+          # parse name and host from the " : "-separated columns
+          n = split(line, col, " : ")
+          if (n < 2) next
+          name = col[2]; gsub(/^[ \t]+|[ \t]+$/, "", name)
+          host = (n >= 3 ? col[3] : "")
+          sub(/[ \t]+-.*$/, "", host); gsub(/^[ \t]+|[ \t]+$/, "", host)
+          if (name == "") next
+
+          # host filter (same rule as desired_adapters)
+          if (!(host == "" || this_host == "" || host == this_host)) next
+
+          # only ENABLED instances count as an active instance here
+          if (status ~ /^enabled([, \t]|$)/) print name
         }
       ' \
     | sort -u || true
@@ -344,6 +448,9 @@ if abi_mismatch; then abi_bad=true; fi
 desired_list="$(desired_adapters)"
 installed_list="$(installed_adapters)"
 native_list="$(native_modules)"
+# Adapters that have an ENABLED instance on this host — consulted by the
+# install-failure policy (tolerate-no-instance) to classify a failed install.
+enabled_instance_list="$(enabled_instance_adapters)"
 
 # Fresh-install bootstrap: on an empty Data_Volume there are no recorded adapter
 # instances yet, so seed the desired set with `admin` (only admin) so a brand-new
@@ -528,7 +635,14 @@ while IFS=$'\t' read -r action args_rest; do
         log "install-missing: node_modules already has the desired adapter set"
       else
         log "installing missing adapters (${#args[@]}): ${args[*]}"
-        install_failures=()
+        # has_enabled_instance: is <adapter> in the enabled-instance set (newline
+        # list captured in the observation snapshot)?
+        has_enabled_instance() {
+          local a="$1"
+          printf '%s\n' "${enabled_instance_list}" | grep -qxF "${a}"
+        }
+        install_failures=()          # human-readable "<adapter> (...)" for logging
+        install_failures_fatal=()    # subset that violates the active policy
         for adapter in "${args[@]}"; do
           # Choose the install COMMAND based on where the adapter was originally
           # installed FROM (common.installedFrom, recorded in the objects DB):
@@ -551,30 +665,59 @@ while IFS=$'\t' read -r action args_rest; do
           #     originally used, so a container recreate faithfully rebuilds the
           #     recorded adapter set regardless of where each adapter came from.
           #     `iobroker url` likewise installs code without creating instances.
+          # record_failure: note a failed install and decide, per the active
+          # IOB_ADAPTER_INSTALL_FAILURE_POLICY, whether THIS failure is fatal.
+          #   strict               -> always fatal
+          #   tolerate-no-instance -> fatal only if the adapter has an enabled
+          #                           instance on this host
+          #   tolerate-all         -> never fatal
+          record_failure() {
+            local a="$1" detail="$2"
+            install_failures+=("${detail}")
+            case "${IOB_ADAPTER_INSTALL_FAILURE_POLICY}" in
+              strict)
+                install_failures_fatal+=("${detail}")
+                ;;
+              tolerate-no-instance)
+                if has_enabled_instance "${a}"; then
+                  install_failures_fatal+=("${detail} [has enabled instance]")
+                fi
+                ;;
+              tolerate-all) : ;;
+            esac
+          }
+
           src="$(adapter_install_source "${adapter}")"
           if source_is_url "${src}"; then
             log "  ${adapter}: installing from recorded source: ${src}"
             if ! run_install iobroker url "${src}"; then
-              install_failures+=("${adapter} (url: ${src})")
+              record_failure "${adapter}" "${adapter} (url: ${src})"
             fi
           else
             [[ -n "${src}" ]] && log "  ${adapter}: repo install (source: ${src})" \
               || log "  ${adapter}: repo install"
             if ! run_install iobroker install "${adapter}"; then
-              install_failures+=("${adapter}")
+              record_failure "${adapter}" "${adapter}"
             fi
           fi
         done
 
-        # A single adapter that cannot be (re)installed MUST NOT abort startup.
-        # The recorded source may be transiently unreachable (a GitHub outage), a
-        # deleted/renamed package, or a private repo. Warn, name the offenders,
-        # and start with the adapters that DID install — js-controller simply
-        # reports the missing ones as failing instances, which is far better than
-        # refusing to start the whole host over one adapter. (Consistent with the
-        # warn-and-start policy for offline reconciliation, Req 8.11/8.13.)
+        # Apply the install-failure policy. Tolerated failures are logged as a
+        # warning and we continue (js-controller will simply report the missing
+        # adapters as failing instances). A failure that VIOLATES the policy is
+        # not tolerated: rather than exit (which the restart policy would turn
+        # into a crash loop, re-installing the working adapters every cycle) we
+        # BLOCK the container in an unhealthy state so the problem is visible and
+        # actionable without thrashing (see block_unhealthy).
         if [[ ${#install_failures[@]} -gt 0 ]]; then
-          log "WARNING: ${#install_failures[@]} adapter(s) could not be installed and will be skipped: ${install_failures[*]}"
+          log "WARNING: ${#install_failures[@]} adapter(s) could not be installed: ${install_failures[*]}"
+          log "install-failure policy: ${IOB_ADAPTER_INSTALL_FAILURE_POLICY}"
+        fi
+        if [[ ${#install_failures_fatal[@]} -gt 0 ]]; then
+          block_unhealthy "adapter install failed and is not tolerated by policy '${IOB_ADAPTER_INSTALL_FAILURE_POLICY}': ${install_failures_fatal[*]}"
+        fi
+        if [[ ${#install_failures[@]} -gt 0 ]]; then
+          log "continuing despite ${#install_failures[@]} tolerated install failure(s)"
         fi
       fi
       ;;
