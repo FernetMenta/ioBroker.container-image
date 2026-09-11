@@ -37,37 +37,51 @@
 
 services:
   iobroker:
-    image: iobroker:local
+    restart: unless-stopped
     image: ghcr.io/fernetmenta/iobroker:7.2.2
-    # First start needs the adapter registry reachable so reconciliation can
-    # install the recorded adapter set (including admin).
+    container_name: iobroker
+    # UID/GID are now set by the runtime (SETUID/SETGID were removed).
+    user: "1000:1000"
+    # Host's dialout group (gid 20) so uid 1000 can open /dev/ttyAMA0.
+    group_add:
+      - "20"
+    hostname: iobroker-sml
     ports:
-      - "8081:8081" # admin UI  (IOB_ADMIN_PORT)
-      - "8082:8082" # web       (IOB_WEB_PORT)
-    environment:
-      TZ: Europe/Berlin
+      - "8081:8081" # iobroker admin (IOB_ADMIN_PORT)
+      - "8082:8082" # web adapter (IOB_WEB_PORT)
+    devices:
+      - "/dev/ttyAMA0:/dev/ttyAMA0"
     volumes:
       - iobroker-data:/opt/iobroker/iobroker-data
       - iobroker-log:/opt/iobroker/log
       - iobroker-node:/opt/iobroker/node_modules
-    restart: unless-stopped
+    environment:
+      - IOB_MULTIHOST=slave
+      - IOB_OBJECTSDB_HOST=iob
+      - IOB_OBJECTSDB_TYPE=jsonl
+      - IOB_OBJECTSDB_PORT=9001
+      - IOB_STATESDB_HOST=iob
+      - IOB_STATESDB_TYPE=jsonl
+      - IOB_STATESDB_PORT=9000
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
 
 volumes:
   iobroker-data:
     driver: local
     driver_opts:
-      type: none
       o: bind
+      type: none
       device: ./iobroker-data
   iobroker-log:
     driver: local
     driver_opts:
-      type: none
       o: bind
+      type: none
       device: ./log
   iobroker-node:
     driver: local
     driver_opts:
-      type: none
       o: bind
+      type: none
       device: ./node_modules
