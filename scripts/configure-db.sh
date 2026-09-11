@@ -88,9 +88,21 @@ read_current() {
     catch { process.exit(0); }
     const o = cfg.objects ?? {};
     const s = cfg.states ?? {};
-    const role =
-      cfg.multihostService && typeof cfg.multihostService.role === 'string'
-        ? cfg.multihostService.role : '';
+    // ioBroker expresses master via multihostService.enabled (the master runs
+    // the multihost service; a slave/standalone does not). We ALSO write a
+    // 'role' marker when we apply a role, so the idempotency diff can tell a
+    // configured 'slave' (enabled=false, role='slave') apart from a plain
+    // standalone (enabled=false, no role). Read the explicit marker first; fall
+    // back to enabled=true => 'master' for configs written before the marker
+    // existed. Absent/disabled with no marker reads as '' (standalone).
+    let role = '';
+    if (cfg.multihostService && typeof cfg.multihostService === 'object') {
+      if (typeof cfg.multihostService.role === 'string' && cfg.multihostService.role !== '') {
+        role = cfg.multihostService.role;
+      } else if (cfg.multihostService.enabled === true) {
+        role = 'master';
+      }
+    }
     const emit = (k, v) => process.stdout.write('CUR_' + k + '=' + JSON.stringify(String(v ?? '')) + '\n');
     emit('O_TYPE', o.type); emit('O_HOST', o.host); emit('O_PORT', o.port);
     emit('S_TYPE', s.type); emit('S_HOST', s.host); emit('S_PORT', s.port);
@@ -113,6 +125,9 @@ log "current: role='${CUR_ROLE}' objects{type='${CUR_O_TYPE}' host='${CUR_O_HOST
 #   noop
 #   apply\t<json plan>
 plan="$(
+  CUR_O_TYPE="${CUR_O_TYPE}" CUR_O_HOST="${CUR_O_HOST}" CUR_O_PORT="${CUR_O_PORT}" \
+  CUR_S_TYPE="${CUR_S_TYPE}" CUR_S_HOST="${CUR_S_HOST}" CUR_S_PORT="${CUR_S_PORT}" \
+  CUR_ROLE="${CUR_ROLE}" \
   node --input-type=module -e "
     import { planDbConfig } from '${DB_MODULE}';
     const env = process.env;
@@ -183,7 +198,25 @@ case "${action}" in
         };
         applySection('objects', plan.objects);
         applySection('states', plan.states);
-        if (plan.role) { cfg.multihostService = cfg.multihostService ?? {}; cfg.multihostService.role = plan.role; }
+        // Multihost role is expressed purely in iobroker.json: ioBroker's
+        // multihost 'master' is the host that RUNS the multihost service, i.e.
+        // multihostService.enabled = true; a 'slave' does not run the service
+        // (enabled = false) and instead points its objects/states host at the
+        // master (handled by the objects/states patch above). We set this by
+        // FILE here rather than via `iobroker multihost enable/disable`, because
+        // that CLI opens a live connection to the objects/states DB — and at
+        // this point in startup js-controller (which hosts the local jsonl DB
+        // server) is not running yet, so the CLI would fail with
+        // ECONNREFUSED against the not-yet-listening DB. Patching the file is
+        // equivalent, side-effect-free, and idempotent.
+        if (plan.role) {
+          cfg.multihostService = cfg.multihostService ?? {};
+          // enabled drives ioBroker's actual multihost behavior (master runs
+          // the service); role is our own marker so the idempotency diff can
+          // tell 'slave' apart from 'standalone' (both have enabled=false).
+          cfg.multihostService.enabled = plan.role === 'master';
+          cfg.multihostService.role = plan.role;
+        }
         const tmp = path + '.tmp';
         writeFileSync(tmp, JSON.stringify(cfg, null, 2) + '\n');
         renameSync(tmp, path);
@@ -194,17 +227,13 @@ case "${action}" in
       fi
     fi
 
-    # Multihost role via the iobroker CLI (only when a role was specified).
-    role="$(printf '%s' "${plan_json}" | node --input-type=module -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).role||"")}catch{process.stdout.write("")}})' 2>/dev/null || true)"
-    if [[ -n "${role}" ]]; then
-      if [[ "${IOB_DB_DRY_RUN}" != "true" ]] && ! command -v iobroker >/dev/null 2>&1; then
-        log "iobroker CLI not found; skipping multihost role step (DB config already patched)"
-      elif [[ "${role}" == "master" ]]; then
-        log "configuring multihost role: master"; run iobroker multihost enable
-      elif [[ "${role}" == "slave" ]]; then
-        log "configuring multihost role: slave"; run iobroker multihost disable
-      fi
-    fi
+    # The multihost role is applied entirely by the iobroker.json patch above
+    # (multihostService.enabled). We intentionally do NOT run `iobroker
+    # multihost enable/disable` here: that CLI connects to the live
+    # objects/states DB, which is not serving yet at this startup stage (the
+    # local jsonl server is hosted by js-controller, started later), so it would
+    # fail with ECONNREFUSED. The file patch is the equivalent, connectionless
+    # way to select the role and stays idempotent across restarts.
     log "database/multihost configuration applied"
     exit 0
     ;;
