@@ -1,0 +1,106 @@
+# Real-world master node for the ioBroker container image.
+#
+# This is the multihost MASTER: it runs ioBroker normally (IOB_MULTIHOST=master)
+# and owns the objects/states databases that slaves connect to. Pair it with
+# docker-compose-slave.yml, which points its databases at this host.
+#
+# All three persistence dirs are host-visible AND image-seeded, using local
+# volumes with bind driver_opts (o: bind / type: none / device: <host path>).
+#
+# Why this form rather than a plain `-v /host:/container` bind mount:
+#   A local/bind driver_opts volume is still a NAMED Docker volume, so Docker's
+#   volume-seeding applies: when the backing host directory is empty at first
+#   mount, Docker seeds it from the image's content. A plain short-syntax bind
+#   mount is NOT seeded. Seeding is what makes the node_modules dir work — that
+#   is where js-controller ITSELF and its dependency tree live, and an unseeded
+#   empty node_modules would leave the container with no runtime to start
+#   ("js-controller not found"). With this form, the empty ./node_modules is
+#   populated from the image on first run, and you still get a host folder you
+#   can inspect. See docs/volumes-and-multihost.md.
+#
+# The device paths point at the folder this file lives in. Adjust if you move it.
+#
+# Ownership note: these host dirs should be owned by uid 1000, matching the
+# container's `user: "1000:1000"`, so writes line up without extra steps.
+#
+# Networking: this example attaches two networks.
+#   - bridge-net: a normal bridge for container-to-container traffic.
+#   - macvlan-net: gives the container its own IP on the physical LAN
+#     (192.168.170.221) so it is directly reachable from other hosts. Set
+#     `parent` to your host's real interface (here eth0) and align the
+#     subnet/gateway/ip_range with your LAN. macvlan is what makes the static
+#     ipv4_address behave like a real device on the network.
+#
+# Start (from this folder):
+#   docker compose up            # add -d to detach
+#
+# RESET / re-seed: seeding happens whenever the backing host dir is EMPTY at
+# mount time, so you just empty the dir you want re-seeded — no `docker volume
+# rm` needed. To re-seed node_modules from the image (e.g. after an image
+# upgrade or Node major change) while keeping your data + logs:
+#   docker compose down
+#   rm -rf node_modules && mkdir node_modules
+#   docker compose up -d
+# The container and ioBroker start again: Docker re-seeds the empty node_modules
+# from the image, so js-controller is present. Apply the same pattern to
+# ./iobroker-data only if you deliberately want a fresh config/state.
+
+services:
+  iobroker:
+    restart: unless-stopped
+    image: ghcr.io/fernetmenta/iobroker:7.2.2
+    container_name: iobroker
+    hostname: iobroker
+    # UID/GID are set by the runtime (SETUID/SETGID were removed in this image).
+    user: "1000:1000"
+    volumes:
+      - iobroker-data:/opt/iobroker/iobroker-data
+      - iobroker-log:/opt/iobroker/log
+      - iobroker-node:/opt/iobroker/node_modules
+    environment:
+      - IOB_MULTIHOST=master
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    networks:
+      bridge-net:
+      macvlan-net:
+        ipv4_address: 192.168.170.221
+
+volumes:
+  iobroker-data:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: ./iobroker-data
+  iobroker-log:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: ./log
+  iobroker-node:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: ./node_modules
+
+networks:
+  bridge-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+          ip_range: 172.30.0.0/24
+  macvlan-net:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 192.168.170.0/24
+          gateway: 192.168.170.1
+          ip_range: 192.168.170.216/29
+

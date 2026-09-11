@@ -82,6 +82,14 @@ The image persists only the folders that hold configuration, state, logs, and
 | `/opt/iobroker/log`           | ioBroker logs                                     | Recommended |
 | `/opt/iobroker/node_modules`  | Installed adapter code, persisted across upgrades | Optional    |
 
+> **Tip:** Although optional, persisting the `node_modules` volume noticeably
+> speeds up container recreates when the js-controller version is unchanged —
+> for example when you pull a new image revision to pick up base-image CVE fixes
+> between the (relatively infrequent) js-controller releases. Reconciliation
+> then reuses the installed code instead of reinstalling it. See
+> [docs/volumes-and-multihost.md](docs/volumes-and-multihost.md) for details and
+> the one extra step needed when js-controller itself changes.
+
 See [docs/volumes-and-multihost.md](docs/volumes-and-multihost.md) for
 persistence behavior, startup reconciliation, multihost clusters (networked
 jsonl or Redis), and Kubernetes probe examples.

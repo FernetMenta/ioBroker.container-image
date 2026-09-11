@@ -29,11 +29,26 @@ The image persists only the folders that hold configuration, state, logs, and
 | ----------------------------- | -------------- | ----------- | ------------------------------------------------------------------------------------------------------------------- |
 | `/opt/iobroker/iobroker-data` | Data_Volume    | Recommended | ioBroker configuration + state. **Source of truth** for the set of installed adapters and their versions. (Req 8.2) |
 | `/opt/iobroker/log`           | Log_Volume     | Recommended | ioBroker logs. (Req 8.3)                                                                                            |
-| `/opt/iobroker/node_modules`  | Modules_Volume | Optional    | Installed adapter code, persisted across container upgrades. (Req 8.4)                                              |
+| `/opt/iobroker/node_modules`  | Modules_Volume | Optional    | Installed adapter code, persisted across container upgrades. Persisting it also speeds up recreates when js-controller is unchanged (see note below). (Req 8.4) |
 
 Key point: the **Data_Volume is authoritative**. It records which adapters (and
 which versions) are installed. Installed adapter code in `node_modules` is
 reconciled to match what the Data_Volume records — never the other way around.
+
+**Why persist the Modules_Volume even though it is optional.** Mounting
+`node_modules` significantly reduces startup time when the container is
+recreated and the js-controller version has not changed. Without it, every
+recreate reinstalls the full adapter set (and js-controller) from the registry
+before ioBroker can start; with it, reconciliation only installs what is
+missing, so an unchanged setup comes back up quickly. This matters because
+js-controller releases are relatively infrequent, but you may want to pull a new
+**revision of the image** in between — for example to pick up CVE fixes in the
+base image — and recreate the container against the same volumes. In that case
+the js-controller version is unchanged, so a persisted Modules_Volume lets the
+container reuse the already-installed code instead of reinstalling it on every
+image refresh. When js-controller (or the Node.js major) *does* change, see
+[Node.js major upgrades and the Modules_Volume](#nodejs-major-upgrades-and-the-modules_volume)
+and the [upgrade guide](upgrading.md) for the one extra step involved.
 
 ### Persistence behavior
 
@@ -305,6 +320,13 @@ volumes:
   iobroker-modules:
 ```
 
+> **Runnable examples:** ready-to-use Compose files are provided in
+> [examples/](./examples/) — see
+> [`docker-compose-master.yml`](./examples/docker-compose-master.yml) (published
+> image, host-seeded bind volumes, bridge + macvlan networking) and
+> [`docker-compose-slave.yml`](./examples/docker-compose-slave.yml) (local test
+> setup with detailed re-seeding notes).
+
 ### Kubernetes (PVCs)
 
 Declare a PersistentVolumeClaim per volume and mount them into the container.
@@ -436,7 +458,9 @@ master.
 
 The **master** runs normally (standalone-style) and serves its `jsonl`
 databases on the network. A **slave** points its objects/states databases at the
-master:
+master. For complete, runnable Compose files see
+[`examples/docker-compose-master.yml`](./examples/docker-compose-master.yml) and
+[`examples/docker-compose-slave.yml`](./examples/docker-compose-slave.yml):
 
 ```bash
 # Slave, connecting to the master host "iob"
@@ -537,6 +561,10 @@ Notes:
 
 ## See also
 
+- [Example Compose files](./examples/) — runnable
+  [master](./examples/docker-compose-master.yml) and
+  [slave](./examples/docker-compose-slave.yml) `docker-compose` examples that
+  apply the volume, networking, and multihost guidance from this document.
 - [Environment variable reference](./environment-variables.md) — all `IOB_`
   variables including the objects/states database backends and healthcheck tuning.
 - [Rootless capabilities and limitations](./rootless-capabilities.md) — port

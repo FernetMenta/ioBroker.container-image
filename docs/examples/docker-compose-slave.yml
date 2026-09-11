@@ -1,0 +1,73 @@
+# Real-world local test for the ioBroker container image.
+#
+# All three persistence dirs are host-visible AND image-seeded, using local
+# volumes with bind driver_opts (o: bind / type: none / device: <host path>).
+#
+# Why this form rather than a plain `-v /host:/container` bind mount:
+#   A local/bind driver_opts volume is still a NAMED Docker volume, so Docker's
+#   volume-seeding applies: when the backing host directory is empty at first
+#   mount, Docker seeds it from the image's content. A plain short-syntax bind
+#   mount is NOT seeded. Seeding is what makes the node_modules dir work — that
+#   is where js-controller ITSELF and its dependency tree live, and an unseeded
+#   empty node_modules would leave the container with no runtime to start
+#   ("js-controller not found"). With this form, the empty ./node_modules is
+#   populated from the image on first run, and you still get a host folder you
+#   can inspect. See docs/volumes-and-multihost.md.
+#
+# The device paths point at this testing/ folder. Adjust if you move it.
+#
+# Ownership note: these host dirs are owned by uid 1000 (rainer) on the host,
+# and the image runs as uid 1000, so writes line up without extra steps.
+#
+# Build the image first (from the repo root):
+#   scripts/build-local.sh single      # produces iobroker:local
+# Then, from this testing/ folder:
+#   docker compose up            # add -d to detach
+#
+# RESET / re-seed: seeding happens whenever the backing host dir is EMPTY at
+# mount time, so you just empty the dir you want re-seeded — no `docker volume
+# rm` needed. To re-seed node_modules from the image (e.g. after an image
+# rebuild or Node major change) while keeping your data + logs:
+#   docker compose down
+#   rm -rf node_modules && mkdir node_modules
+#   docker compose up -d
+# The container and ioBroker start again: Docker re-seeds the empty node_modules
+# from the image, so js-controller is present. Apply the same pattern to ./data
+# only if you deliberately want a fresh config/state.
+
+services:
+  iobroker:
+    image: iobroker:local
+    image: ghcr.io/fernetmenta/iobroker:7.2.2
+    # First start needs the adapter registry reachable so reconciliation can
+    # install the recorded adapter set (including admin).
+    ports:
+      - "8081:8081" # admin UI  (IOB_ADMIN_PORT)
+      - "8082:8082" # web       (IOB_WEB_PORT)
+    environment:
+      TZ: Europe/Berlin
+    volumes:
+      - iobroker-data:/opt/iobroker/iobroker-data
+      - iobroker-log:/opt/iobroker/log
+      - iobroker-node:/opt/iobroker/node_modules
+    restart: unless-stopped
+
+volumes:
+  iobroker-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./iobroker-data
+  iobroker-log:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./log
+  iobroker-node:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./node_modules
