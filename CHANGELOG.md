@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Startup reconciliation retries an adapter install when it hits the jsonl
+  "Failed to lock DB file" race. During the pre-controller install phase each
+  `iobroker install`/`iobroker url` call briefly file-locks the objects/states
+  database; on a multihost master (network-mode DB), a not-yet-released lock
+  from the previous install could make the next one fail and abort startup —
+  typically only after several adapters had already installed. The install now
+  retries with a short backoff on that specific lock error (and only that
+  error); genuine failures still surface immediately.
 - Startup reconciliation now installs each adapter from the source it was
   originally installed from (`common.installedFrom`): repository adapters via
   `iobroker install <name>`, and non-repository adapters (GitHub tarball, custom

@@ -419,6 +419,65 @@ run() {
   return "${rc}"
 }
 
+# run_install: like `run`, but retries specifically on the jsonl DB-file LOCK
+# race that occurs during the pre-controller install phase.
+#
+# Why this is needed: on a multihost master the objects/states DB host is
+# 0.0.0.0 (network mode). js-controller is NOT running yet during reconcile, so
+# every `iobroker install`/`iobroker url` invocation stands up its OWN transient
+# in-memory jsonl server that opens and file-LOCKS objects.jsonl / states.jsonl
+# for the duration of that one CLI call, then releases the lock as the process
+# exits. Because that release is not perfectly synchronous with process exit
+# (the server shuts down slightly after the CLI returns), the NEXT sequential
+# install can start and try to lock the same file while the previous server is
+# still tearing down, and fail with:
+#     Server Cannot start inMem-objects on port 9001: Failed to lock DB file "...objects.jsonl"!
+# This is a timing race, not a genuine failure — the file is simply held for a
+# few more milliseconds. A remote slave that continuously reconnects to the
+# master's DB port keeps those transient servers alive a little longer, widening
+# the window (which is why it tends to strike only after several successful
+# installs). We absorb it by retrying the SAME command a few times with a short
+# backoff when — and only when — the output shows the lock error. Any other
+# failure returns immediately so real errors still surface to the caller.
+#
+# Captures combined output so it can both inspect it AND surface it to the log.
+IOB_INSTALL_LOCK_RETRIES="${IOB_INSTALL_LOCK_RETRIES:-6}"
+IOB_INSTALL_LOCK_BACKOFF="${IOB_INSTALL_LOCK_BACKOFF:-2}"
+run_install() {
+  if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
+    heartbeat
+    log "[dry-run] $*"
+    heartbeat
+    return 0
+  fi
+
+  local attempt=1 rc=0 out
+  while :; do
+    heartbeat
+    rc=0
+    out="$("$@" 2>&1)" || rc=$?
+    # Always echo the tool's own output so `docker logs` keeps its detail.
+    [[ -n "${out}" ]] && printf '%s\n' "${out}" >&2
+    heartbeat
+
+    if [[ "${rc}" -eq 0 ]]; then
+      return 0
+    fi
+
+    # Retry ONLY the DB-file lock race; everything else is a real failure.
+    if printf '%s' "${out}" | grep -qiE 'Failed to lock DB file|Cannot start inMem-(objects|states)'; then
+      if [[ "${attempt}" -lt "${IOB_INSTALL_LOCK_RETRIES}" ]]; then
+        log "  DB file lock busy (attempt ${attempt}/${IOB_INSTALL_LOCK_RETRIES}); retrying in ${IOB_INSTALL_LOCK_BACKOFF}s"
+        sleep "${IOB_INSTALL_LOCK_BACKOFF}"
+        attempt=$((attempt + 1))
+        continue
+      fi
+      log "  DB file lock still busy after ${IOB_INSTALL_LOCK_RETRIES} attempts; giving up on this command"
+    fi
+    return "${rc}"
+  done
+}
+
 # Iterate over the plan lines. Empty plan (no steps) is valid and does nothing.
 while IFS=$'\t' read -r action args_rest; do
   [[ -n "${action}" ]] || continue
@@ -495,13 +554,13 @@ while IFS=$'\t' read -r action args_rest; do
           src="$(adapter_install_source "${adapter}")"
           if source_is_url "${src}"; then
             log "  ${adapter}: installing from recorded source: ${src}"
-            if ! run iobroker url "${src}"; then
+            if ! run_install iobroker url "${src}"; then
               install_failures+=("${adapter} (url: ${src})")
             fi
           else
             [[ -n "${src}" ]] && log "  ${adapter}: repo install (source: ${src})" \
               || log "  ${adapter}: repo install"
-            if ! run iobroker install "${adapter}"; then
+            if ! run_install iobroker install "${adapter}"; then
               install_failures+=("${adapter}")
             fi
           fi
