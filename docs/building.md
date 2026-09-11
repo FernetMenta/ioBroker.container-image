@@ -113,17 +113,17 @@ To make the change permanent, edit `containerImage.debianCodename` in
 
 The local path is deliberately kept equivalent to the CI build (task 16.1):
 
-| Aspect                  | Local build                              | CI build                                 |
-| ----------------------- | ---------------------------------------- | ---------------------------------------- |
-| Dockerfile              | `-f Dockerfile`                          | same `Dockerfile`                        |
-| Build knob source       | `package.json` `containerImage` (lib/)   | same `package.json` `containerImage`     |
-| Build args              | `--build-arg NODE_MAJOR/DEBIAN_CODENAME` | `--build-arg NODE_MAJOR/DEBIAN_CODENAME` |
-| Loaded/shipped stage    | `runtime` (rootless `USER 1000`)         | `runtime` (rootless `USER 1000`)         |
-| Runtime-dependency gate | separate `--target verify` build         | same gate stage per architecture         |
-| Architectures           | host (single) or amd64+arm64 (multi)     | `linux/amd64,linux/arm64`                |
-| Debian base             | `debianCodename` (default `trixie`)      | same default (`trixie`)                  |
+| Aspect                  | Local build                                | CI build                                                 |
+| ----------------------- | ------------------------------------------ | -------------------------------------------------------- |
+| Dockerfile              | `-f Dockerfile`                            | same `Dockerfile`                                        |
+| Build knob source       | `package.json` `containerImage` (lib/)     | same `package.json` `containerImage`                     |
+| Build args              | `--build-arg NODE_MAJOR/DEBIAN_CODENAME`   | `--build-arg NODE_MAJOR/DEBIAN_CODENAME`                 |
+| Loaded/shipped stage    | `runtime` (rootless `USER 1000`)           | `runtime` (rootless `USER 1000`)                         |
+| Runtime-dependency gate | separate `--target verify` build           | same gate stage per architecture                         |
+| Architectures           | host (single) or amd64+arm64 (multi)       | `linux/amd64,linux/arm64`                                |
+| Debian base             | `debianCodename` (default `trixie`)        | same default (`trixie`)                                  |
 | js-controller version   | `JS_CONTROLLER_VERSION` (default `stable`) | pinned from the release tag on tag pushes, else `stable` |
-| Push                    | never                                    | only on `<version>-r<n>` tag pushes      |
+| Push                    | never                                      | only on `<version>-r<n>` tag pushes                      |
 
 Because the build-knob source, the Dockerfile, and the gate stage are identical,
 a successful local build reproduces what CI builds.
@@ -139,7 +139,7 @@ the immutable image tag:
 
 - `<version>` (`7.2.2`) is the bundled **iobroker.js-controller** version — the
   thing users track. It bumps when js-controller is bumped.
-- `-r<n>` is the **image revision**. It bumps on a rebuild of the *same*
+- `-r<n>` is the **image revision**. It bumps on a rebuild of the _same_
   controller version (base-image security patch, `Dockerfile` change, dependency
   bump) and resets to `-r1` whenever `<version>` changes.
 
@@ -167,14 +167,58 @@ and the exact-version check is skipped.
 
 ### On a release, CI publishes
 
-| Image tag        | Kind      | Points at                                   |
-| ---------------- | --------- | ------------------------------------------- |
-| `7.2.2-r2`       | immutable | this exact build                            |
-| `7.2.2`          | moving    | newest revision for that controller version |
-| `latest`         | moving    | newest release overall                      |
+| Image tag  | Kind      | Points at                                   |
+| ---------- | --------- | ------------------------------------------- |
+| `7.2.2-r2` | immutable | this exact build                            |
+| `7.2.2`    | moving    | newest revision for that controller version |
+| `latest`   | moving    | newest release overall                      |
 
 To cut a release: bump `containerImage` in `package.json` if node/os changed,
 then push the tag, e.g. `git tag 7.2.2-r1 && git push origin 7.2.2-r1`.
+
+### Automatic revision bumps on a newer base image
+
+The base image (`node:<major>-<codename>-slim`) is rebuilt upstream for security
+patches **without** the js-controller version changing. When that happens, a
+published `<version>-r<n>` silently falls behind its own base. A scheduled
+workflow (`.github/workflows/base-refresh.yml`) keeps the **latest 2**
+js-controller versions current:
+
+1. It collects the latest two distinct `<version>`s from the existing
+   `<version>-r<n>` tags (e.g. `7.2.2` and `7.1.3`). Older versions are left
+   frozen.
+2. For each, `scripts/check-base-refresh.sh` finds the highest revision (e.g.
+   `7.2.2-r5`), reads the base image from that published image's own
+   `org.opencontainers.image.base.name` label, and compares the base image's
+   `created` timestamp against the published image's `created` timestamp.
+3. If the base is **newer** than the published image, it creates and pushes the
+   next revision (`7.2.2-r6`). That tag push triggers `build-publish.yml`, which
+   does the actual multi-arch rebuild and publish.
+
+The refresh workflow only **decides and tags** — it never builds or pushes
+images itself. It reads everything from the registry (no image pull) via
+`docker buildx imagetools inspect --format '{{json .Image}}'`, so it needs a
+recent Buildx (provided on the runner) and `jq`.
+
+Comparing `created` timestamps (rather than base digests) is deliberate: the
+shipped image records the base image **name**, not the digest it was built
+against, so there is no recorded base digest to diff. The `created` timestamp is
+always present for both images and answers exactly the question asked — "is
+there a base image newer than the one we shipped?" — with no extra state to
+maintain.
+
+> **`RELEASE_PAT` is required for the rebuild to publish automatically.** A tag
+> pushed with the default `GITHUB_TOKEN` does **not** trigger other workflows
+> (GitHub prevents recursive workflow runs), so `build-publish` would not fire.
+> Configure a `RELEASE_PAT` repository secret — a fine-grained PAT with
+> `contents: write`, or a classic PAT with `repo` — and the refresh job pushes
+> the new tag as that identity so `build-publish` runs. Without it, the tag is
+> still created (using `GITHUB_TOKEN`) but the job **warns** that publishing did
+> not start; a maintainer must then re-push the tag or run `build-publish`
+> manually.
+
+The workflow also supports `workflow_dispatch` with a `dry_run` input to report
+what it _would_ tag without creating anything.
 
 ## Configuration (environment overrides)
 

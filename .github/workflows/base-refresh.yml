@@ -1,0 +1,162 @@
+# Scheduled auto base-image refresh.
+#
+# This workflow keeps the most recently shipped images current with their base
+# image (`node:<major>-<codename>-slim`). Node/Debian base images are rebuilt
+# upstream for security patches WITHOUT the js-controller version changing, so a
+# published `<version>-r<n>` can silently fall behind its own base. This job
+# detects that and cuts a fresh REVISION so the normal build-publish pipeline
+# rebuilds and republishes.
+#
+# What it does, on a cron schedule (and on demand via workflow_dispatch):
+#   1. Take the LATEST 2 distinct js-controller `<version>`s across all existing
+#      `<version>-r<n>` git tags (e.g. 7.2.2 and 7.1.3). Only the two newest are
+#      maintained; older versions are left frozen.
+#   2. For each, find the highest existing revision (e.g. 7.2.2-r5) and ask
+#      scripts/check-base-refresh.sh whether the base image that revision was
+#      built on is now NEWER than the published image. The base image is read
+#      from the published image's own OCI label, so there is no second source of
+#      truth.
+#   3. If the base is newer, create and push the next revision tag (7.2.2-r6).
+#      Pushing that tag triggers .github/workflows/build-publish.yml, which
+#      does the actual multi-arch build + publish. This workflow itself never
+#      builds or pushes images — it only decides and tags.
+#
+# IMPORTANT — token choice and the "workflows don't trigger workflows" rule:
+# a tag pushed using the default GITHUB_TOKEN does NOT trigger other workflows
+# (GitHub deliberately prevents recursive workflow runs). So for the new tag to
+# actually kick off build-publish, this job pushes with a Personal Access Token
+# (PAT) provided as the `RELEASE_PAT` secret (a fine-grained PAT with
+# `contents: write`, or a classic PAT with `repo`). If `RELEASE_PAT` is not
+# configured, the job still creates the tag using GITHUB_TOKEN but WARNS that
+# build-publish will not fire automatically — a maintainer would then have to
+# re-push the tag (or run build-publish manually) to publish.
+
+name: base-refresh
+
+on:
+  schedule:
+    # 03:17 UTC daily. Odd minute to avoid the top-of-hour scheduling surge on
+    # GitHub's shared runners (cron is best-effort and can be delayed at :00).
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report what would be tagged; do not create/push tags.'
+        type: boolean
+        default: false
+
+# Read the repo everywhere; the refresh job additionally needs contents:write to
+# push a new tag (used only when falling back to GITHUB_TOKEN; the PAT path
+# authenticates as the PAT).
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: iobroker
+
+jobs:
+  base-refresh:
+    name: Refresh latest 2 versions on newer base image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          # Need all tags to find the latest versions and their revisions.
+          fetch-depth: 0
+          # Use the PAT (if provided) as the checkout token so the later
+          # `git push` of the new tag is authenticated as the PAT and therefore
+          # DOES trigger build-publish. Falls back to the default token.
+          token: ${{ secrets.RELEASE_PAT || github.token }}
+
+      - name: Set up Docker Buildx
+        # Provides a recent buildx whose `imagetools inspect --format` the
+        # refresh script relies on to read image configs from the registry.
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve lowercase image reference
+        id: image
+        # Same explicit, lowercased GHCR name build-publish.yml publishes to:
+        # ghcr.io/<owner>/iobroker (NOT github.repository).
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine the latest 2 versions
+        id: versions
+        # Collect every `<version>-r<n>` tag, reduce to distinct `<version>`s,
+        # sort newest-first (semver-aware via `sort -V`), and keep the top 2.
+        run: |
+          set -euo pipefail
+          mapfile -t versions < <(
+            git tag --list \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$' \
+              | sed -E 's/-r[0-9]+$//' \
+              | sort -u -V \
+              | tail -n 2
+          )
+          if [[ ${#versions[@]} -eq 0 ]]; then
+            echo "No '<version>-r<n>' tags found; nothing to refresh."
+            echo "list=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Emit newest-first for readability; order does not affect the result.
+          printf 'Latest versions to check: %s\n' "${versions[*]}"
+          # Space-separated list for the next step.
+          echo "list=${versions[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Check base freshness and create revision tags
+        if: steps.versions.outputs.list != ''
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          VERSIONS: ${{ steps.versions.outputs.list }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          HAS_PAT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          set -euo pipefail
+
+          # All candidate tags, passed to the helper so it can find the highest
+          # revision per version.
+          mapfile -t all_tags < <(git tag --list)
+
+          created_any=0
+          for version in ${VERSIONS}; do
+            echo "::group::Checking ${version}"
+            next_tag="$(scripts/check-base-refresh.sh "${IMAGE}" "${version}" "${all_tags[@]}")"
+            if [[ -z "${next_tag}" ]]; then
+              echo "No refresh needed for ${version}."
+              echo "::endgroup::"
+              continue
+            fi
+
+            if git rev-parse -q --verify "refs/tags/${next_tag}" >/dev/null; then
+              # Should not happen (the helper computes highest+1), but never
+              # clobber an existing tag.
+              echo "::warning title=Tag exists::'${next_tag}' already exists; skipping."
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "DRY RUN: would create and push tag '${next_tag}'."
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "Creating tag '${next_tag}' (base image is newer than the published revision)."
+            git tag "${next_tag}"
+            git push origin "refs/tags/${next_tag}"
+            created_any=1
+
+            if [[ "${HAS_PAT}" != "true" ]]; then
+              echo "::warning title=build-publish not triggered::Tag '${next_tag}' was pushed with the default GITHUB_TOKEN, which does NOT trigger the build-publish workflow. Configure a RELEASE_PAT secret (contents:write) so the rebuild publishes automatically, or re-push the tag / run build-publish manually."
+            fi
+            echo "::endgroup::"
+          done
+
+          if [[ "${created_any}" -eq 0 ]]; then
+            echo "No new revision tags were created."
+          fi
