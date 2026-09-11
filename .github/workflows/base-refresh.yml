@@ -35,9 +35,10 @@ name: base-refresh
 
 on:
   schedule:
-    # 03:17 UTC daily. Odd minute to avoid the top-of-hour scheduling surge on
-    # GitHub's shared runners (cron is best-effort and can be delayed at :00).
-    - cron: '17 3 * * *'
+    # 03:17 UTC every Monday. Odd minute to avoid the top-of-hour scheduling
+    # surge on GitHub's shared runners (cron is best-effort and can be delayed
+    # at :00).
+    - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
       dry_run:
