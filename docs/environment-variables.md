@@ -43,6 +43,46 @@ captured — are ignored for default resolution.
 | `IOB_UPGRADE_TOLERANCE_WINDOW` | `600` | `0`–`3600` (seconds) | Healthcheck upgrade tolerance window. While an upgrade is in progress, the healthcheck does not report unhealthy within this window. |
 | `IOB_RECONCILE_STALL_TOLERANCE` | `120` | `0`–`3600` (seconds) | Healthcheck reconcile stall tolerance. While first-boot/post-upgrade reconciliation (adapter installs, native rebuilds) is in progress, the healthcheck tolerates a failing status check for **any** total duration as long as reconcile keeps advancing its heartbeat. This value bounds only how long the heartbeat may go **stale** before reconcile is treated as stuck and unhealthy is reported. Raise it if a single reconcile step (e.g. one large adapter install on a very slow link) can pause longer than the default. |
 | `IOB_ADAPTER_INSTALL_FAILURE_POLICY` | `tolerate-no-instance` | `strict` \| `tolerate-no-instance` \| `tolerate-all` | What to do when an adapter's code cannot be (re)installed during startup reconciliation. See [Adapter install failure policy](#adapter-install-failure-policy) below. Validated. |
+| `IOB_RECONCILE_LOG` | `<log>/reconcile.log` | path | Where startup reconciliation writes its persistent log and end-of-run summary. Mirrors everything reconcile prints to the container log, plus a summary block (phase, outcome, elapsed, observations, per-action results, install tallies). Lives in the Log_Volume (`/opt/iobroker/log`) so it survives container recreation and can be read after a start that hung or failed. See [Reconcile log](#reconcile-log) below. |
+
+### Reconcile log
+
+Startup reconciliation runs **before** js-controller, so `iobroker status` fails
+for its whole duration and a stuck or interrupted reconcile can be hard to
+diagnose from `docker logs` alone. Reconciliation therefore also writes a
+persistent `reconcile.log` in the Log_Volume, next to ioBroker's other logs
+(override with `IOB_RECONCILE_LOG`).
+
+Every line reconcile prints to the container log is mirrored there with a
+timestamp, and each run ends with a summary block, for example:
+
+```
+reconcile: ==================== reconcile summary ====================
+reconcile: phase:    install
+reconcile: outcome:  ok
+reconcile: elapsed:  42s
+reconcile: policy:   tolerate-no-instance
+reconcile: observations:
+reconcile:   dataVolumeEmpty=false
+reconcile:   registryReachable=true
+reconcile:   abiMismatch=false
+reconcile:   desiredAdapters=7
+reconcile:   installedAdapters=7
+reconcile:   nativeModules=2
+reconcile: actions:
+reconcile:   install-missing: 7 installed, 0 failures
+reconcile: ===========================================================
+```
+
+The entrypoint runs reconciliation in two passes per start (an `init` pass before
+database configuration and an `install` pass after). Both passes are written to
+the **same** `reconcile.log` in order, each with its own header and summary, so
+the file is a single chronological record of the whole start. The log is
+truncated at the first pass of each start. `outcome` is `ok` on success,
+`blocked` when a fatal install failure holds the container unhealthy, `failed`
+on an aborting error, or `incomplete` if the run was killed mid-reconcile (e.g. a
+hang followed by `docker stop`) — the last case is exactly what makes the
+persisted log useful.
 
 ### Adapter install failure policy
 

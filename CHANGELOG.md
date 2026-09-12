@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent reconcile log with an end-of-run summary. Startup reconciliation
+  now mirrors its output to `reconcile.log` in the Data_Volume (override with
+  `IOB_RECONCILE_LOG`) and appends a summary block naming the phase, outcome,
+  elapsed time, the observation snapshot, each executed action's result, and the
+  install tallies. The log lives in the Log_Volume (`/opt/iobroker/log`) next to
+  ioBroker's other logs. Both reconcile passes of a start (init and install) are
+  written to the same file in order. Because reconciliation runs before
+  js-controller and can hang or be killed mid-run, the log is written on
+  success, on a fatal block, and on interruption (`outcome: incomplete`), making
+  a stuck or failed start diagnosable after the fact. See
+  [docs/environment-variables.md](docs/environment-variables.md#reconcile-log).
 - `IOB_ADAPTER_INSTALL_FAILURE_POLICY` to control what happens when an adapter's
   code cannot be (re)installed during startup reconciliation: `strict` (any
   failure fatal), `tolerate-no-instance` (default — fatal only if the adapter
@@ -42,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable/disable` during early startup. That CLI connects to the objects/states
   database, which is not serving yet at that point (js-controller starts later),
   so `IOB_MULTIHOST=master` failed with `ECONNREFUSED` on the database port.
+- Startup no longer hangs in the reconcile init phase. The init pass gathered
+  every observation up front, including `iobroker list instances` (which needs
+  the objects/states database) and `npm ping`, before running its only action
+  (`iobroker setup first` on an empty volume). Because the database is not
+  configured or served yet at that point, `iobroker list instances` could block
+  indefinitely, hanging the whole start right after "running reconciliation
+  (init phase)". The init pass now computes only the filesystem emptiness check
+  it actually needs; the database/registry observations run only in the install
+  pass, where they are used and the database is available.
 
 ## [0.1.0] - Work in progress
 

@@ -60,6 +60,7 @@ RECONCILE_MODULE="${REPO_ROOT}/lib/reconcile-plan.js"
 
 IOB_ROOT="${IOB_ROOT:-/opt/iobroker}"
 IOB_DATA_DIR="${IOB_DATA_DIR:-${IOB_ROOT}/iobroker-data}"
+IOB_LOG_DIR="${IOB_LOG_DIR:-${IOB_ROOT}/log}"
 IOB_NODE_MODULES_DIR="${IOB_NODE_MODULES_DIR:-${IOB_ROOT}/node_modules}"
 IOB_RECONCILE_DRY_RUN="${IOB_RECONCILE_DRY_RUN:-false}"
 
@@ -113,7 +114,145 @@ IOB_ADAPTER_INSTALL_FAILURE_POLICY="${IOB_ADAPTER_INSTALL_FAILURE_POLICY:-tolera
 IOB_RECONCILE_MARKER="${IOB_RECONCILE_MARKER:-${IOB_DATA_DIR}/.iob-reconciling}"
 IOB_RECONCILE_HEARTBEAT="${IOB_RECONCILE_HEARTBEAT:-${IOB_DATA_DIR}/.iob-reconcile-heartbeat}"
 
-log() { echo "reconcile: $*" >&2; }
+# Persistent reconcile log + end-of-run summary. Everything the run logs to the
+# container's stderr (visible via `docker logs`) is ALSO appended here with a
+# timestamp, and the EXIT trap writes a summary block naming the phase, the
+# observations, and each action's outcome. Because reconcile runs BEFORE
+# js-controller and can hang or be killed mid-run, a persisted log is the only
+# way to see how far a stuck/interrupted start got after the fact. It lives in
+# the Log_Volume (a log belongs with the other logs, not among ioBroker's data),
+# so it survives across container recreations; best-effort, a non-writable volume
+# simply means we log to stderr only. Overridable for tests.
+IOB_RECONCILE_LOG="${IOB_RECONCILE_LOG:-${IOB_LOG_DIR}/reconcile.log}"
+
+# Wall-clock start of this run (epoch seconds) for the summary's elapsed line.
+RECONCILE_START_EPOCH="$(date +%s 2>/dev/null || echo 0)"
+
+# --- Summary accumulators ----------------------------------------------------
+# These are appended to as the run progresses and rendered by write_summary()
+# from the EXIT trap. Kept as newline-joined strings (bash 3-friendly, no
+# associative arrays needed) so the summary works on the slim image's bash.
+SUMMARY_OBSERVATIONS=""   # "key=value" observation facts
+SUMMARY_ACTIONS=""        # "<action>: <outcome>" one per executed plan step
+SUMMARY_INSTALL_OK=""     # adapter names installed successfully
+SUMMARY_INSTALL_FAIL=""   # adapter names that failed to install
+RECONCILE_OUTCOME="incomplete"  # set to ok/blocked/failed by the exit paths;
+                                # left "incomplete" if we are killed mid-run.
+
+# summary_add_observation / _action: append a line to the respective accumulator.
+summary_add_observation() { SUMMARY_OBSERVATIONS+="${1}"$'\n'; }
+summary_add_action()      { SUMMARY_ACTIONS+="${1}"$'\n'; }
+
+# log_init: prepare the persistent log file. The entrypoint invokes reconcile
+# TWICE per start (phase=init, then phase=install) around DB configuration, and
+# both passes should appear in ONE reconcile.log for the start. So we TRUNCATE
+# only at the first pass (phase init or all) and APPEND for the install pass,
+# giving a single chronological log of the whole start rather than the install
+# pass clobbering the init pass. A standalone `all` run truncates as before.
+# Best-effort: if the file/dir is not writable we silently fall back to
+# stderr-only logging (LOG_FILE_OK stays false) and never abort the run.
+LOG_FILE_OK=false
+log_init() {
+  # Ensure the containing directory exists (the Data_Volume normally does).
+  local dir
+  dir="$(dirname -- "${IOB_RECONCILE_LOG}")"
+  [[ -d "${dir}" ]] || mkdir -p -- "${dir}" 2>/dev/null || true
+
+  local opened=false
+  if [[ "${IOB_RECONCILE_PHASE}" == "install" ]]; then
+    # Second pass of a two-pass start: append to the init pass's log. Fall back
+    # to truncation if the file does not exist (install run without a prior init,
+    # e.g. some tests) so we still produce a log.
+    if [[ -f "${IOB_RECONCILE_LOG}" ]] && : >>"${IOB_RECONCILE_LOG}" 2>/dev/null; then
+      opened=true
+    elif : >"${IOB_RECONCILE_LOG}" 2>/dev/null; then
+      opened=true
+    fi
+  else
+    # First pass (init) or a standalone `all` run: start a fresh log.
+    if : >"${IOB_RECONCILE_LOG}" 2>/dev/null; then
+      opened=true
+    fi
+  fi
+  [[ "${opened}" == "true" ]] && LOG_FILE_OK=true
+}
+
+# A short banner at the top of each pass so the two passes are visually separable
+# in the single reconcile.log, and the reader can see which pass a summary
+# belongs to. Written after log_init so it lands in the file too.
+log_run_header() {
+  log "----- reconcile run: phase=${IOB_RECONCILE_PHASE} pid=$$ $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?') -----"
+}
+
+# log: emit to stderr (unchanged, for `docker logs`) AND append a timestamped
+# copy to the persistent log file when it is writable. The stderr line keeps its
+# familiar "reconcile: ..." prefix; the file line is prefixed with an ISO-ish
+# timestamp so a reader can reconstruct timing (and spot where a hang occurred).
+log() {
+  echo "reconcile: $*" >&2
+  if [[ "${LOG_FILE_OK}" == "true" ]]; then
+    printf '%s reconcile: %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')" "$*" \
+      >>"${IOB_RECONCILE_LOG}" 2>/dev/null || true
+  fi
+}
+
+# write_summary: render the end-of-run summary block to stderr and the log file.
+# Invoked from the EXIT trap (see end_reconcile / block_unhealthy) so it runs on
+# success, tolerated-failure, fatal-block, AND ordinary interruption. It reports
+# the phase, outcome, elapsed time, the observation snapshot, and each executed
+# action's outcome plus the install tallies, so a single glance at the tail of
+# reconcile.log explains what this start did or where it got stuck.
+write_summary() {
+  local now elapsed
+  now="$(date +%s 2>/dev/null || echo 0)"
+  elapsed=$(( now - RECONCILE_START_EPOCH ))
+  [[ "${elapsed}" -lt 0 ]] && elapsed=0
+
+  # emit: write a single summary line to BOTH sinks (stderr + log file), without
+  # the per-line timestamp the normal log() adds (the summary is a block).
+  emit() {
+    echo "reconcile: $*" >&2
+    if [[ "${LOG_FILE_OK}" == "true" ]]; then
+      printf 'reconcile: %s\n' "$*" >>"${IOB_RECONCILE_LOG}" 2>/dev/null || true
+    fi
+  }
+
+  emit "==================== reconcile summary ===================="
+  emit "phase:    ${IOB_RECONCILE_PHASE}"
+  emit "outcome:  ${RECONCILE_OUTCOME}"
+  emit "elapsed:  ${elapsed}s"
+  emit "policy:   ${IOB_ADAPTER_INSTALL_FAILURE_POLICY}"
+
+  emit "observations:"
+  if [[ -n "${SUMMARY_OBSERVATIONS}" ]]; then
+    while IFS= read -r line; do [[ -n "${line}" ]] && emit "  ${line}"; done \
+      <<<"${SUMMARY_OBSERVATIONS}"
+  else
+    emit "  (none recorded)"
+  fi
+
+  emit "actions:"
+  if [[ -n "${SUMMARY_ACTIONS}" ]]; then
+    while IFS= read -r line; do [[ -n "${line}" ]] && emit "  ${line}"; done \
+      <<<"${SUMMARY_ACTIONS}"
+  else
+    emit "  (no actions executed)"
+  fi
+
+  # Install tallies (only meaningful when an install-missing step ran).
+  local ok_count fail_count
+  ok_count="$(printf '%s' "${SUMMARY_INSTALL_OK}" | grep -c . || true)"
+  fail_count="$(printf '%s' "${SUMMARY_INSTALL_FAIL}" | grep -c . || true)"
+  if [[ "${ok_count}" -gt 0 || "${fail_count}" -gt 0 ]]; then
+    emit "adapters installed ok (${ok_count}): $(printf '%s' "${SUMMARY_INSTALL_OK}" | tr '\n' ' ')"
+    emit "adapters failed    (${fail_count}): $(printf '%s' "${SUMMARY_INSTALL_FAIL}" | tr '\n' ' ')"
+  fi
+
+  emit "==========================================================="
+}
+
+log_init
+log_run_header
 
 # -- Reconcile liveness signalling -------------------------------------------
 
@@ -133,11 +272,14 @@ begin_reconcile() {
   heartbeat
 }
 
-# end_reconcile: remove the in-progress marker and the heartbeat. Registered on
-# EXIT so the markers are cleared whether reconciliation succeeds, fails, or the
-# script is interrupted — a leftover marker must never make a dead reconcile
-# look alive.
+# end_reconcile: write the run summary, then remove the in-progress marker and
+# the heartbeat. Registered on EXIT so the markers are cleared AND the summary is
+# written whether reconciliation succeeds, fails, or the script is interrupted —
+# a leftover marker must never make a dead reconcile look alive, and a killed run
+# still leaves an "incomplete" summary showing how far it got. write_summary is
+# best-effort and must never itself abort the trap.
 end_reconcile() {
+  write_summary || true
   rm -f -- "${IOB_RECONCILE_MARKER}" "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
 }
 # block_unhealthy: hold the container up in a clearly-unhealthy state instead of
@@ -151,8 +293,13 @@ end_reconcile() {
 # forwards SIGTERM, so `docker stop` / pod deletion terminates us cleanly.
 block_unhealthy() {
   local reason="$1"
+  RECONCILE_OUTCOME="blocked"
+  summary_add_action "block-unhealthy: ${reason}"
   # Drop the EXIT trap's job explicitly and now, up front: with the markers gone
   # the healthcheck stops treating us as an in-progress (tolerated) reconcile.
+  # We write the summary here (the EXIT trap is being disarmed) so the blocked
+  # run is still explained in reconcile.log before we sleep forever.
+  write_summary || true
   rm -f -- "${IOB_RECONCILE_MARKER}" "${IOB_RECONCILE_HEARTBEAT}" 2>/dev/null || true
   trap - EXIT
   log "FATAL: ${reason}"
@@ -195,8 +342,9 @@ data_volume_empty() {
   # Exclude our OWN reconcile liveness markers (.iob-reconciling /
   # .iob-reconcile-heartbeat): begin_reconcile writes them into IOB_DATA_DIR
   # BEFORE this check runs, so counting them would make a genuinely fresh volume
-  # look non-empty and skip `iobroker setup first`. We match on the marker file
-  # names so the check reflects real ioBroker content only.
+  # look non-empty and skip `iobroker setup first`. (The reconcile log lives in
+  # the Log_Volume, not here, so it is not a concern for this check.) We match on
+  # the marker file names so the check reflects real ioBroker content only.
   local marker_name heartbeat_name
   marker_name="$(basename -- "${IOB_RECONCILE_MARKER}")"
   heartbeat_name="$(basename -- "${IOB_RECONCILE_HEARTBEAT}")"
@@ -435,22 +583,45 @@ native_modules() {
 }
 
 # -- Collect observations -----------------------------------------------------
+#
+# PHASE GATING OF OBSERVATIONS (important): the "init" phase runs ONLY the
+# init-default-config action, whose sole input is data_volume_empty (a pure
+# filesystem check). The remaining observations are consumed exclusively by the
+# install phase and several of them touch the network or the objects/states DB:
+#   * registry_reachable()          -> `npm ping`
+#   * desired_adapters()            -> `iobroker list instances`
+#   * enabled_instance_adapters()   -> `iobroker list instances`
+# During the init pass the DB has NOT been configured yet (configure-db runs
+# AFTER init in the entrypoint), so `iobroker.json` is missing or still points at
+# the throwaway local config. On a multihost slave whose configured DB host is
+# unreachable, `iobroker list instances` blocks on the connect with no timeout,
+# hanging the whole init phase before `iobroker setup first` even runs. We
+# therefore SKIP every DB/registry observation in the init phase and gather them
+# only when they will actually be used (install/all). Init needs data_empty only.
 
 data_empty=false
 registry_ok=false
 abi_bad=false
 
 if data_volume_empty; then data_empty=true; fi
-if registry_reachable; then registry_ok=true; fi
-if abi_mismatch; then abi_bad=true; fi
 
-# Newline-separated lists for the observation snapshot.
-desired_list="$(desired_adapters)"
-installed_list="$(installed_adapters)"
-native_list="$(native_modules)"
-# Adapters that have an ENABLED instance on this host — consulted by the
-# install-failure policy (tolerate-no-instance) to classify a failed install.
-enabled_instance_list="$(enabled_instance_adapters)"
+desired_list=""
+installed_list=""
+native_list=""
+enabled_instance_list=""
+
+if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
+  if registry_reachable; then registry_ok=true; fi
+  if abi_mismatch; then abi_bad=true; fi
+
+  # Newline-separated lists for the observation snapshot.
+  desired_list="$(desired_adapters)"
+  installed_list="$(installed_adapters)"
+  native_list="$(native_modules)"
+  # Adapters that have an ENABLED instance on this host — consulted by the
+  # install-failure policy (tolerate-no-instance) to classify a failed install.
+  enabled_instance_list="$(enabled_instance_adapters)"
+fi
 
 # Fresh-install bootstrap: on an empty Data_Volume there are no recorded adapter
 # instances yet, so seed the desired set with `admin` (only admin) so a brand-new
@@ -461,6 +632,18 @@ if [[ "${data_empty}" == "true" ]]; then
 fi
 
 log "observed: dataVolumeEmpty=${data_empty} registryReachable=${registry_ok} abiMismatch=${abi_bad}"
+
+# Record the observation snapshot for the end-of-run summary. Adapter counts are
+# more useful than the full lists here; the lists themselves are already in the
+# per-line log above if a reader needs them.
+summary_add_observation "dataVolumeEmpty=${data_empty}"
+summary_add_observation "registryReachable=${registry_ok}"
+summary_add_observation "abiMismatch=${abi_bad}"
+if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
+  summary_add_observation "desiredAdapters=$(printf '%s' "${desired_list}" | grep -c . || true)"
+  summary_add_observation "installedAdapters=$(printf '%s' "${installed_list}" | grep -c . || true)"
+  summary_add_observation "nativeModules=$(printf '%s' "${native_list}" | grep -c . || true)"
+fi
 
 # -- Ask the pure planner for the ordered actions -----------------------------
 #
@@ -623,7 +806,20 @@ while IFS=$'\t' read -r action args_rest; do
       # step below (when the registry is reachable) — a single install path for
       # both the fresh admin bootstrap and normal adapter convergence.
       log "initializing default ioBroker config and state (empty Data_Volume)"
-      run iobroker setup first
+      # `iobroker setup first` is required: if it fails, reconciliation cannot
+      # continue and the script must abort non-zero (the entrypoint then refuses
+      # to start js-controller). Capture the outcome for the summary WITHOUT
+      # letting the `if` swallow the failure — re-raise it via `exit` so the
+      # behavior matches the original bare invocation under `set -e`.
+      idc_rc=0
+      run iobroker setup first || idc_rc=$?
+      if [[ "${idc_rc}" -eq 0 ]]; then
+        summary_add_action "init-default-config: ok"
+      else
+        summary_add_action "init-default-config: FAILED (exit ${idc_rc})"
+        RECONCILE_OUTCOME="failed"
+        exit "${idc_rc}"
+      fi
       ;;
 
     install-missing)
@@ -633,6 +829,7 @@ while IFS=$'\t' read -r action args_rest; do
       # admin); on a populated one it is only the difference.
       if [[ ${#args[@]} -eq 0 ]]; then
         log "install-missing: node_modules already has the desired adapter set"
+        summary_add_action "install-missing: nothing to install (already converged)"
       else
         log "installing missing adapters (${#args[@]}): ${args[*]}"
         # has_enabled_instance: is <adapter> in the enabled-instance set (newline
@@ -690,14 +887,20 @@ while IFS=$'\t' read -r action args_rest; do
           src="$(adapter_install_source "${adapter}")"
           if source_is_url "${src}"; then
             log "  ${adapter}: installing from recorded source: ${src}"
-            if ! run_install iobroker url "${src}"; then
+            if run_install iobroker url "${src}"; then
+              SUMMARY_INSTALL_OK+="${adapter}"$'\n'
+            else
               record_failure "${adapter}" "${adapter} (url: ${src})"
+              SUMMARY_INSTALL_FAIL+="${adapter}"$'\n'
             fi
           else
             [[ -n "${src}" ]] && log "  ${adapter}: repo install (source: ${src})" \
               || log "  ${adapter}: repo install"
-            if ! run_install iobroker install "${adapter}"; then
+            if run_install iobroker install "${adapter}"; then
+              SUMMARY_INSTALL_OK+="${adapter}"$'\n'
+            else
               record_failure "${adapter}" "${adapter}"
+              SUMMARY_INSTALL_FAIL+="${adapter}"$'\n'
             fi
           fi
         done
@@ -719,18 +922,37 @@ while IFS=$'\t' read -r action args_rest; do
         if [[ ${#install_failures[@]} -gt 0 ]]; then
           log "continuing despite ${#install_failures[@]} tolerated install failure(s)"
         fi
+        # Record the install-missing outcome for the summary. If we reached here
+        # (block_unhealthy exits otherwise), any failures were tolerated.
+        installed_ok=$(( ${#args[@]} - ${#install_failures[@]} ))
+        if [[ ${#install_failures[@]} -gt 0 ]]; then
+          summary_add_action "install-missing: ${installed_ok} ok, ${#install_failures[@]} tolerated failure(s)"
+        else
+          summary_add_action "install-missing: ${installed_ok} installed, 0 failures"
+        fi
       fi
       ;;
 
     npm-rebuild)
       # Node ABI mismatch and rebuild resources reachable: rebuild the affected
       # native modules (Req 8.12).
+      nrb_rc=0
       if [[ ${#args[@]} -eq 0 ]]; then
         log "npm-rebuild: no native modules identified; running full npm rebuild"
-        run npm rebuild
+        run npm rebuild || nrb_rc=$?
       else
         log "npm rebuild of affected native modules (${#args[@]}): ${args[*]}"
-        run npm rebuild "${args[@]}"
+        run npm rebuild "${args[@]}" || nrb_rc=$?
+      fi
+      if [[ "${nrb_rc}" -eq 0 ]]; then
+        summary_add_action "npm-rebuild: ok (${#args[@]} module(s))"
+      else
+        # A required rebuild genuinely failed (the unrebuildable case is planned
+        # as warn-and-start, not npm-rebuild). Preserve the original abort under
+        # set -e: record it and re-raise so the entrypoint refuses to start.
+        summary_add_action "npm-rebuild: FAILED (exit ${nrb_rc}, ${#args[@]} module(s))"
+        RECONCILE_OUTCOME="failed"
+        exit "${nrb_rc}"
       fi
       # Refresh the ABI marker to the NOW-running Node ABI. The persisted volume
       # still carries the OLD marker (that is what triggered this rebuild); if we
@@ -754,14 +976,21 @@ while IFS=$'\t' read -r action args_rest; do
       # a failure -> do not exit non-zero.
       reason="${args[0]:-reconciliation incomplete}"
       log "WARNING: ${reason}"
+      summary_add_action "warn-and-start: ${reason}"
       ;;
 
     *)
       log "unexpected action from reconciliation planner: '${action}'"
+      summary_add_action "unexpected-action: '${action}'"
+      RECONCILE_OUTCOME="failed"
       exit 1
       ;;
   esac
 done <<<"${plan}"
 
+# Reached the end of the plan without a fatal error or a block: this run is a
+# success (the EXIT trap writes the summary with this outcome). A no-op init
+# pass on a populated volume also lands here, which is correct.
+RECONCILE_OUTCOME="ok"
 log "reconciliation complete; starting Iobroker_Runtime"
 exit 0
