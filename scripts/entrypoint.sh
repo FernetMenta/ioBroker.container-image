@@ -285,6 +285,119 @@ RECONCILE_ENV=(
   "IOB_NODE_MODULES_DIR=${IOBROKER_DIR}/node_modules"
 )
 
+# The controller config file (objects/states DB backend definition).
+IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
+
+# ---------------------------------------------------------------------------
+# Install-phase DB isolation (keep a multihost slave OUT during startup).
+#
+# On a multihost MASTER the objects/states jsonl DB binds `host: 0.0.0.0` so
+# slaves on the LAN can connect to it (ports 9001/9000). But adapter installs
+# run BEFORE js-controller: each `iobroker` CLI call stands up its OWN transient
+# jsonl server on those ports and file-locks objects.jsonl/states.jsonl for the
+# duration of that call. If a running slave is connected to `0.0.0.0:9001`, it
+# keeps latching onto those transient servers, holding the port/lock open so the
+# NEXT install cannot acquire it — producing "Failed to lock DB file" errors that
+# no retry can win, and the whole start hangs.
+#
+# The fix: for the install phase ONLY, bind the objects/states DB to loopback
+# (`127.0.0.1`) instead of `0.0.0.0`. The transient servers then listen only
+# inside the container, so a slave hitting the master's LAN address gets
+# connection-refused and cannot interfere. The real `0.0.0.0` binding is restored
+# right before we `exec` js-controller, so the master serves its slaves normally
+# once it is actually up. Ports are left unchanged; only the host is narrowed.
+#
+# This is a pure file patch (same mechanism configure-db.sh uses) and is made
+# crash-safe by a trap: if the install phase fails or the container is killed
+# mid-install, the original hosts are restored so a master is never left stuck on
+# loopback (which would silently cut off every slave after a bad start).
+DB_HOST_BACKUP=""          # "<objectsHost>\t<statesHost>" captured before isolation
+DB_HOSTS_ISOLATED=false    # whether we actually narrowed the hosts (needs restore)
+
+# read_db_hosts: print "<objectsHost>\t<statesHost>" from iobroker.json (empty
+# fields when absent). Best-effort; prints nothing if the file is unreadable.
+read_db_hosts() {
+  [[ -r "${IOB_JSON}" ]] || return 0
+  IOB_JSON_PATH="${IOB_JSON}" run_node "
+    import { readFileSync } from 'node:fs';
+    try {
+      const c = JSON.parse(readFileSync(process.env.IOB_JSON_PATH, 'utf8'));
+      const o = (c.objects && c.objects.host) ?? '';
+      const s = (c.states && c.states.host) ?? '';
+      process.stdout.write(String(o) + '\t' + String(s));
+    } catch { /* no output */ }
+  "
+}
+
+# set_db_hosts: patch objects.host and states.host in iobroker.json to the given
+# values (arg1 = objects host, arg2 = states host). Only touches the two host
+# fields; everything else in the file is preserved. Returns non-zero on failure.
+set_db_hosts() {
+  local obj_host="$1" states_host="$2"
+  IOB_JSON_PATH="${IOB_JSON}" IOB_OBJ_HOST="${obj_host}" IOB_STATES_HOST="${states_host}" run_node "
+    import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+    const path = process.env.IOB_JSON_PATH;
+    const c = JSON.parse(readFileSync(path, 'utf8'));
+    if (c.objects && typeof c.objects === 'object') c.objects.host = process.env.IOB_OBJ_HOST;
+    if (c.states && typeof c.states === 'object') c.states.host = process.env.IOB_STATES_HOST;
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, JSON.stringify(c, null, 2) + '\n');
+    renameSync(tmp, path);
+  "
+}
+
+# isolate_db_hosts_for_install: if either DB host is non-loopback (e.g. a master's
+# 0.0.0.0), back up both hosts and rewrite them to 127.0.0.1 for the install
+# phase. No-op (and no restore needed) when both hosts are already loopback/empty,
+# e.g. a standalone container whose local DB is not network-exposed.
+isolate_db_hosts_for_install() {
+  local hosts obj_host states_host
+  hosts="$(read_db_hosts)"
+  [[ -n "${hosts}" ]] || { log "install-phase DB isolation: cannot read ${IOB_JSON}; skipping"; return 0; }
+  obj_host="${hosts%%$'\t'*}"
+  states_host="${hosts#*$'\t'}"
+
+  local needs_isolation=false
+  case "${obj_host}" in ''|127.0.0.1|localhost|::1) : ;; *) needs_isolation=true ;; esac
+  case "${states_host}" in ''|127.0.0.1|localhost|::1) : ;; *) needs_isolation=true ;; esac
+
+  if [[ "${needs_isolation}" != "true" ]]; then
+    log "install-phase DB isolation: hosts already loopback (objects='${obj_host}' states='${states_host}'); no change"
+    return 0
+  fi
+
+  DB_HOST_BACKUP="${obj_host}"$'\t'"${states_host}"
+  if set_db_hosts "127.0.0.1" "127.0.0.1"; then
+    DB_HOSTS_ISOLATED=true
+    log "install-phase DB isolation: bound objects/states to 127.0.0.1 for the install phase" \
+      "(was objects='${obj_host}' states='${states_host}'); a slave cannot connect during startup"
+  else
+    # If we could not patch, leave the file as-is and continue. The install may
+    # then hit the lock race, but we must not proceed believing we isolated when
+    # we did not, so clear the backup marker.
+    DB_HOST_BACKUP=""
+    log "install-phase DB isolation: FAILED to patch ${IOB_JSON}; continuing without isolation"
+  fi
+}
+
+# restore_db_hosts: put the original objects/states hosts back. Registered on
+# EXIT (and called explicitly before exec) so the master's public binding is
+# always restored, even if the install phase fails or the container is killed
+# mid-install. Idempotent: only acts when we actually isolated.
+restore_db_hosts() {
+  [[ "${DB_HOSTS_ISOLATED}" == "true" ]] || return 0
+  local obj_host states_host
+  obj_host="${DB_HOST_BACKUP%%$'\t'*}"
+  states_host="${DB_HOST_BACKUP#*$'\t'}"
+  if set_db_hosts "${obj_host}" "${states_host}"; then
+    log "install-phase DB isolation: restored objects/states hosts (objects='${obj_host}' states='${states_host}')"
+  else
+    log "install-phase DB isolation: WARNING could not restore original DB hosts in ${IOB_JSON};" \
+      "expected objects='${obj_host}' states='${states_host}' — check the file before slaves reconnect"
+  fi
+  DB_HOSTS_ISOLATED=false
+}
+
 # ---------------------------------------------------------------------------
 # 7. Reconcile INIT phase via scripts/reconcile.sh (IOB_RECONCILE_PHASE=init).
 #
@@ -357,10 +470,21 @@ fi
 # ---------------------------------------------------------------------------
 stage "Step 4 of 5: Reconciling adapters"
 log "running reconciliation (install phase)"
+# Keep any running multihost slave OUT during the install phase by binding the
+# objects/states DB to loopback (see isolate_db_hosts_for_install above). Restore
+# is guaranteed by the EXIT trap so a failed/killed install never leaves a master
+# stuck on loopback; we also restore explicitly right after the phase.
+trap 'restore_db_hosts' EXIT
+isolate_db_hosts_for_install
 if ! env "${RECONCILE_ENV[@]}" IOB_RECONCILE_PHASE=install \
   "${SCRIPT_DIR}/reconcile.sh"; then
+  # restore_db_hosts runs via the EXIT trap before the process exits.
   die "reconciliation failed; refusing to start js-controller"
 fi
+# Success: restore the public DB binding now (before exec) and clear the trap so
+# the normal exec path is unaffected.
+restore_db_hosts
+trap - EXIT
 
 # ---------------------------------------------------------------------------
 # 10. exec js-controller under tini.

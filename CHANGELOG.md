@@ -9,12 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multihost master keeps a running slave OUT during startup. Adapter installs run
+  before js-controller, and on a master the objects/states jsonl DB binds
+  `0.0.0.0`; a connected slave holds the transient install-time DB servers open,
+  causing `Failed to lock DB file` errors that no retry can win (the start
+  hangs). The entrypoint now temporarily binds the objects/states DB to
+  `127.0.0.1` for the install phase and restores the original host before
+  starting js-controller, so a slave cannot interfere during startup. The
+  rewrite is restored even on failure or a mid-install kill, so a master is never
+  left stuck on loopback. See
+  [docs/environment-variables.md](docs/environment-variables.md#multihost-master-slave-isolation-during-startup).
+- `IOB_INSTALL_TIMEOUT` (default `900`s) bounds a single adapter install attempt
+  so a hung `iobroker install`/`iobroker url` is aborted and retried instead of
+  freezing the whole start; `0` disables it.
+- `IOB_LIST_TIMEOUT` (default `120`s) bounds the `iobroker list instances` query
+  used by the install-failure policy, so a stuck database cannot hang the
+  observation phase.
 - Persistent reconcile log with an end-of-run summary. Startup reconciliation
-  now mirrors its output to `reconcile.log` in the Data_Volume (override with
-  `IOB_RECONCILE_LOG`) and appends a summary block naming the phase, outcome,
-  elapsed time, the observation snapshot, each executed action's result, and the
-  install tallies. The log lives in the Log_Volume (`/opt/iobroker/log`) next to
-  ioBroker's other logs. Both reconcile passes of a start (init and install) are
+  now mirrors its output to `reconcile.log` and appends a summary block naming
+  the phase, outcome, elapsed time, the observation snapshot, each executed
+  action's result, and the install tallies. The log lives in the Log_Volume
+  (`/opt/iobroker/log`) next to ioBroker's other logs (override with
+  `IOB_RECONCILE_LOG`). Both reconcile passes of a start (init and install) are
   written to the same file in order. Because reconciliation runs before
   js-controller and can hang or be killed mid-run, the log is written on
   success, on a fatal block, and on interruption (`outcome: incomplete`), making
@@ -32,6 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Startup no longer hangs indefinitely when an adapter install stalls. Each
+  install attempt is now bounded by `IOB_INSTALL_TIMEOUT`; a stalled attempt is
+  aborted and retried (bounded by the existing lock-retry count) instead of
+  freezing the start until a manual container restart. This addresses the case
+  where a transient install-time DB server blocked forever waiting on a file
+  lock held by a connected slave.
+- The install-failure policy no longer silently tolerates a failure it cannot
+  classify. `tolerate-no-instance` decides based on whether an adapter has an
+  enabled instance on this host, read from `iobroker list instances`. If that
+  query fails or times out, the enabled set is now treated as **indeterminate**
+  and the failure is treated as fatal (fail safe) rather than tolerated — so a
+  contended database can no longer mask a real problem (e.g. an adapter with a
+  running instance whose install failed). Previously a failed query produced an
+  empty set indistinguishable from "no enabled instances," wrongly tolerating
+  such failures.
 - Startup reconciliation retries an adapter install when it hits the jsonl
   "Failed to lock DB file" race. During the pre-controller install phase each
   `iobroker install`/`iobroker url` call briefly file-locks the objects/states

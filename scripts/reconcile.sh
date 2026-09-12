@@ -451,10 +451,50 @@ desired_adapters() {
 # We split the raw line on " - " to isolate that status tail and emit the
 # adapter name only when the tail starts with "enabled". A disabled-only adapter
 # is therefore NOT reported (treated as no active instance here).
+#
+# QUERY RELIABILITY (fail-safe): the install-failure policy `tolerate-no-instance`
+# tolerates a failed install ONLY when the adapter has no enabled instance here.
+# That decision is only sound if we could actually DETERMINE the enabled set. If
+# `iobroker list instances` itself fails (DB contention, timeout, ...), a naive
+# implementation returns an EMPTY set, which looks identical to "no enabled
+# instances anywhere" and would wrongly tolerate a failed install for an adapter
+# that DOES have a running instance. So we track whether the query SUCCEEDED in
+# the global ENABLED_INSTANCE_QUERY_OK; when it did not, the policy treats every
+# adapter as if it had an enabled instance (fail safe -> block), rather than
+# silently tolerating. We also bound the query with `timeout` so it cannot hang.
+ENABLED_INSTANCE_QUERY_OK=false
+IOB_LIST_TIMEOUT="${IOB_LIST_TIMEOUT:-120}"
+
+# _iobroker_list_instances_raw: run `iobroker list instances`, printing its
+# stdout, and RETURN its exit status (0 on success). Bounded by IOB_LIST_TIMEOUT
+# so a stuck DB connection cannot hang the observation phase. Kept separate from
+# the awk parsing so callers can distinguish "query failed" from "empty result".
+_iobroker_list_instances_raw() {
+  local -a runner=()
+  if [[ "${IOB_LIST_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IOB_LIST_TIMEOUT}" -gt 0 ]] \
+    && command -v timeout >/dev/null 2>&1; then
+    runner=(timeout "${IOB_LIST_TIMEOUT}")
+  fi
+  "${runner[@]}" iobroker list instances 2>/dev/null
+}
+
 enabled_instance_adapters() {
+  ENABLED_INSTANCE_QUERY_OK=false
   command -v iobroker >/dev/null 2>&1 || return 0
   local this_host="${IOB_HOSTNAME:-$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)}"
-  iobroker list instances 2>/dev/null \
+
+  # Capture the raw output and its exit status separately so a failed query is
+  # not indistinguishable from an empty (no-enabled-instances) result.
+  local raw rc=0
+  raw="$(_iobroker_list_instances_raw)" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    # Query failed (non-zero or timeout). Leave ENABLED_INSTANCE_QUERY_OK=false
+    # so the caller fails safe; emit nothing.
+    return 0
+  fi
+  ENABLED_INSTANCE_QUERY_OK=true
+
+  printf '%s\n' "${raw}" \
     | awk -v this_host="${this_host}" '
         /system\.adapter\./ {
           # Columns (name/host) are split on " : "; the status tail is after " - ".
@@ -620,7 +660,17 @@ if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
   native_list="$(native_modules)"
   # Adapters that have an ENABLED instance on this host — consulted by the
   # install-failure policy (tolerate-no-instance) to classify a failed install.
-  enabled_instance_list="$(enabled_instance_adapters)"
+  #
+  # We must capture BOTH the list AND whether the query succeeded
+  # (ENABLED_INSTANCE_QUERY_OK), but command substitution runs in a subshell, so
+  # a flag set inside enabled_instance_adapters there would not survive. Run it
+  # directly into a temp file so the function executes in THIS shell and its
+  # ENABLED_INSTANCE_QUERY_OK global propagates; then read the list back.
+  _eia_tmp="$(mktemp 2>/dev/null || echo "${IOB_DATA_DIR}/.iob-eia.$$")"
+  enabled_instance_adapters >"${_eia_tmp}" 2>/dev/null
+  enabled_instance_list="$(cat "${_eia_tmp}" 2>/dev/null || true)"
+  rm -f -- "${_eia_tmp}" 2>/dev/null || true
+  log "enabled-instance query: ok=${ENABLED_INSTANCE_QUERY_OK} count=$(printf '%s' "${enabled_instance_list}" | grep -c . || true)"
 fi
 
 # Fresh-install bootstrap: on an empty Data_Volume there are no recorded adapter
@@ -733,6 +783,16 @@ run() {
 # Captures combined output so it can both inspect it AND surface it to the log.
 IOB_INSTALL_LOCK_RETRIES="${IOB_INSTALL_LOCK_RETRIES:-6}"
 IOB_INSTALL_LOCK_BACKOFF="${IOB_INSTALL_LOCK_BACKOFF:-2}"
+# IOB_INSTALL_TIMEOUT bounds how long a SINGLE install attempt may run before it
+# is aborted and treated as a failed (lock-like) attempt. Without this, a
+# `iobroker install`/`iobroker url` that HANGS instead of exiting (e.g. its
+# transient jsonl server blocks forever waiting on a DB file lock held by another
+# process) freezes the whole start: the command-substitution below never returns,
+# no further attempt is logged, and only a manual container restart recovers.
+# This is the real-world hang we observed. The default is generous (a large
+# adapter install on a slow link is legitimately slow), but finite. Set to 0 to
+# disable the timeout entirely (revert to the old unbounded behavior).
+IOB_INSTALL_TIMEOUT="${IOB_INSTALL_TIMEOUT:-900}"
 run_install() {
   if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
     heartbeat
@@ -741,17 +801,44 @@ run_install() {
     return 0
   fi
 
+  # Prefix the command with `timeout` when it is available and a positive limit
+  # is configured, so a single hung attempt is aborted (exit 124) rather than
+  # blocking forever. `timeout` forwards the command's own exit code otherwise.
+  # If `timeout` is missing (unexpected on the runtime image) we run bare.
+  local -a runner=()
+  if [[ "${IOB_INSTALL_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IOB_INSTALL_TIMEOUT}" -gt 0 ]] \
+    && command -v timeout >/dev/null 2>&1; then
+    runner=(timeout "${IOB_INSTALL_TIMEOUT}")
+  fi
+
   local attempt=1 rc=0 out
   while :; do
     heartbeat
     rc=0
-    out="$("$@" 2>&1)" || rc=$?
+    out="$("${runner[@]}" "$@" 2>&1)" || rc=$?
     # Always echo the tool's own output so `docker logs` keeps its detail.
     [[ -n "${out}" ]] && printf '%s\n' "${out}" >&2
     heartbeat
 
     if [[ "${rc}" -eq 0 ]]; then
       return 0
+    fi
+
+    # A timeout (exit 124) means the attempt hung — most likely on the same DB
+    # file-lock contention the lock retry handles, just manifesting as a stall
+    # rather than a clean error. Treat it as a retryable lock-like failure so a
+    # single stuck attempt does not doom the whole install, but keep it bounded
+    # by the SAME retry count so we can never loop forever.
+    if [[ "${rc}" -eq 124 ]]; then
+      log "  attempt timed out after ${IOB_INSTALL_TIMEOUT}s (treating as busy/stalled)"
+      if [[ "${attempt}" -lt "${IOB_INSTALL_LOCK_RETRIES}" ]]; then
+        log "  retrying (attempt $((attempt + 1))/${IOB_INSTALL_LOCK_RETRIES}) in ${IOB_INSTALL_LOCK_BACKOFF}s"
+        sleep "${IOB_INSTALL_LOCK_BACKOFF}"
+        attempt=$((attempt + 1))
+        continue
+      fi
+      log "  still timing out after ${IOB_INSTALL_LOCK_RETRIES} attempts; giving up on this command"
+      return "${rc}"
     fi
 
     # Retry ONLY the DB-file lock race; everything else is a real failure.
@@ -834,8 +921,19 @@ while IFS=$'\t' read -r action args_rest; do
         log "installing missing adapters (${#args[@]}): ${args[*]}"
         # has_enabled_instance: is <adapter> in the enabled-instance set (newline
         # list captured in the observation snapshot)?
+        #
+        # FAIL SAFE: if the enabled-instance query could NOT be determined
+        # (ENABLED_INSTANCE_QUERY_OK=false — e.g. `iobroker list instances`
+        # failed or timed out), we CANNOT prove the adapter has no enabled
+        # instance, so we must not tolerate a failed install for it. Return true
+        # in that case so `tolerate-no-instance` treats the failure as fatal
+        # (block) rather than silently continuing. When the query succeeded we
+        # answer precisely from the captured set.
         has_enabled_instance() {
           local a="$1"
+          if [[ "${ENABLED_INSTANCE_QUERY_OK}" != "true" ]]; then
+            return 0  # indeterminate -> assume it has one (fail safe)
+          fi
           printf '%s\n' "${enabled_instance_list}" | grep -qxF "${a}"
         }
         install_failures=()          # human-readable "<adapter> (...)" for logging
@@ -877,7 +975,11 @@ while IFS=$'\t' read -r action args_rest; do
                 ;;
               tolerate-no-instance)
                 if has_enabled_instance "${a}"; then
-                  install_failures_fatal+=("${detail} [has enabled instance]")
+                  if [[ "${ENABLED_INSTANCE_QUERY_OK}" == "true" ]]; then
+                    install_failures_fatal+=("${detail} [has enabled instance]")
+                  else
+                    install_failures_fatal+=("${detail} [enabled-instance state unknown; failing safe]")
+                  fi
                 fi
                 ;;
               tolerate-all) : ;;

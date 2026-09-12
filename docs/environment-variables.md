@@ -44,6 +44,28 @@ captured — are ignored for default resolution.
 | `IOB_RECONCILE_STALL_TOLERANCE` | `120` | `0`–`3600` (seconds) | Healthcheck reconcile stall tolerance. While first-boot/post-upgrade reconciliation (adapter installs, native rebuilds) is in progress, the healthcheck tolerates a failing status check for **any** total duration as long as reconcile keeps advancing its heartbeat. This value bounds only how long the heartbeat may go **stale** before reconcile is treated as stuck and unhealthy is reported. Raise it if a single reconcile step (e.g. one large adapter install on a very slow link) can pause longer than the default. |
 | `IOB_ADAPTER_INSTALL_FAILURE_POLICY` | `tolerate-no-instance` | `strict` \| `tolerate-no-instance` \| `tolerate-all` | What to do when an adapter's code cannot be (re)installed during startup reconciliation. See [Adapter install failure policy](#adapter-install-failure-policy) below. Validated. |
 | `IOB_RECONCILE_LOG` | `<log>/reconcile.log` | path | Where startup reconciliation writes its persistent log and end-of-run summary. Mirrors everything reconcile prints to the container log, plus a summary block (phase, outcome, elapsed, observations, per-action results, install tallies). Lives in the Log_Volume (`/opt/iobroker/log`) so it survives container recreation and can be read after a start that hung or failed. See [Reconcile log](#reconcile-log) below. |
+| `IOB_INSTALL_TIMEOUT` | `900` | `0`–… (seconds) | Maximum time a single adapter install/`iobroker url` attempt may run before it is aborted and retried (bounded by `IOB_INSTALL_LOCK_RETRIES`). Prevents a hung install from freezing the whole start. `0` disables the timeout (unbounded, legacy behavior). Raise it if one legitimately large adapter install on a very slow link can exceed the default. |
+| `IOB_LIST_TIMEOUT` | `120` | `0`–… (seconds) | Maximum time the `iobroker list instances` query (used to determine which adapters have enabled instances on this host) may run before it is aborted. If the query fails or times out, the install-failure policy fails safe — see [Adapter install failure policy](#adapter-install-failure-policy). `0` disables the timeout. |
+
+### Multihost master: slave isolation during startup
+
+Adapter installs run **before** js-controller starts. On a multihost **master**
+the objects/states jsonl database binds `host: 0.0.0.0` so slaves on the LAN can
+reach it (ports 9001/9000). During the install phase, every `iobroker` CLI call
+stands up its own transient jsonl server on those ports and briefly file-locks
+`objects.jsonl`/`states.jsonl`. If a slave is running and connected, it keeps
+those transient servers alive, holding the lock so the next install cannot
+acquire it — producing `Failed to lock DB file` errors that no retry can win, and
+the start can hang.
+
+To prevent this, the entrypoint temporarily binds the objects/states DB to
+`127.0.0.1` for the install phase only, then restores the original host
+(`0.0.0.0`) right before starting js-controller. While installs run, a slave
+hitting the master's LAN address is refused, so it cannot interfere; once the
+master is actually up it serves slaves normally. The rewrite is a pure
+`iobroker.json` patch (ports unchanged) and is restored even if the install phase
+fails or the container is killed mid-install, so a master is never left stuck on
+loopback. Standalone containers whose DB host is already loopback are unaffected.
 
 ### Reconcile log
 
@@ -102,6 +124,16 @@ source is currently unavailable, was renamed, made private, or removed.
 An adapter counts as having an "enabled instance on this host" when
 `iobroker list instances` shows at least one of its instances assigned to this
 host with an **enabled** status (a `disabled` instance does not count).
+
+**Fail-safe when the instance state is unknown.** The `tolerate-no-instance`
+decision is only sound if the enabled-instance set could actually be determined.
+If the `iobroker list instances` query itself fails or times out (see
+`IOB_LIST_TIMEOUT`), the container **cannot prove** an adapter has no enabled
+instance, so it does **not** tolerate a failed install for it: an indeterminate
+instance state is treated as "has an enabled instance" (fatal). This prevents a
+contended or unavailable database from silently masking a real problem. `strict`
+still blocks on everything and `tolerate-all` still tolerates everything;
+only `tolerate-no-instance` consults the (now fail-safe) query.
 
 Tolerated failures are logged as a warning and startup continues; js-controller
 then reports the missing adapters as failing instances until you fix them.
