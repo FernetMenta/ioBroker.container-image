@@ -20,9 +20,12 @@
 #
 # The actions map to the reconciliation flow diagram / pseudocode in design §5:
 #   init-default-config  -> `iobroker setup first`          (empty Data_Volume; Req 8.6)
-#   install-missing      -> `iobroker install <adapter>...` (install desired adapter
-#                                                            CODE not present, without
-#                                                            creating instances; Req 8.9/8.10)
+#   install-missing      -> `iobroker install <adapter>` for bare repo adapters,
+#                            or `iobroker url <source>` for adapters recorded with
+#                            a non-repo / pinned source (GitHub, URL, or a
+#                            beta/"latest"-repo spec like iobroker.nut2@latest)
+#                            (install desired adapter CODE not present, without
+#                            creating instances; Req 8.9/8.10)
 #   npm-rebuild          -> `npm rebuild <module>...`   (ABI mismatch;        Req 8.12)
 #   warn-and-start       -> log a clear warning and still start               (Req 8.11/8.13)
 #
@@ -583,22 +586,38 @@ adapter_install_source() {
 # source_is_url: decide whether an install source must go through `iobroker url`
 # (non-repo source) rather than `iobroker install <name>` (repo by name).
 #
-# `common.installedFrom` is the npm install spec js-controller used. For a plain
-# repo install it is either absent or a bare/registry form like
-# `iobroker.<name>` or `iobroker.<name>@1.2.3`. For a non-repo install it is a
-# URL or a spec npm would fetch from outside the configured repository:
+# `common.installedFrom` is the npm install spec js-controller used. We install
+# via `iobroker url <source>` (a direct `npm install <source>`, no repository
+# name lookup) whenever the source is anything OTHER than a bare, unversioned
+# `iobroker.<name>`, because only a bare name is guaranteed to resolve in the
+# active repository. Cases that MUST go through `iobroker url`:
 #   * http(s):// or git+... or git://       (tarball / git)
-#   * contains "/tarball/" or looks like "owner/repo" or "owner/repo#ref" (GitHub)
 #   * a filesystem path (/... or file:)      (local install)
-# Anything else (empty, or a bare iobroker.<name>[@version]) is treated as a
-# normal repo adapter and installed by name.
+#   * "owner/repo" or "owner/repo#ref"       (GitHub shorthand)
+#   * a PINNED registry spec `iobroker.<name>@<version-or-tag>` (e.g.
+#     `iobroker.nut2@latest`, `iobroker.foo@1.2.3`). This is the beta/latest-repo
+#     (and pinned-version) case: js-controller records the version/tag it
+#     installed into `installedFrom`, but `iobroker install <name>` resolves the
+#     name ONLY in the currently-active repository. An adapter installed from the
+#     beta ("latest") repo — or pinned to a version no longer offered by the
+#     active (e.g. stable) repo — is therefore NOT found by name and fails with
+#     "Unknown packet name <name>". `iobroker url iobroker.<name>@<version>` runs
+#     `npm install iobroker.<name>@<version>` straight against the npm registry,
+#     bypassing the repo-name lookup, and js-controller still derives the correct
+#     adapter folder from the spec. This faithfully reproduces the recorded
+#     source regardless of which repository is active.
+# Only an EMPTY source or a bare, unversioned `iobroker.<name>` is treated as a
+# normal repo adapter and installed by name via `iobroker install <name>` (which
+# also lets the active repo pick the current version rather than pinning a stale
+# one).
 source_is_url() {
   local src="$1"
   [[ -n "${src}" ]] || return 1
   case "${src}" in
     http://* | https://* | git+* | git://* | file:* | /*) return 0 ;;
-    *iobroker.*@* | iobroker.* ) return 1 ;; # bare repo spec (with/without @ver)
-    */*) return 0 ;;                          # owner/repo (GitHub shorthand)
+    iobroker.*@* | *iobroker.*@*) return 0 ;; # pinned registry spec -> use `iobroker url`
+    iobroker.*) return 1 ;;                    # bare repo spec (no version) -> install by name
+    */*) return 0 ;;                           # owner/repo (GitHub shorthand)
     *) return 1 ;;
   esac
 }
@@ -942,24 +961,31 @@ while IFS=$'\t' read -r action args_rest; do
           # Choose the install COMMAND based on where the adapter was originally
           # installed FROM (common.installedFrom, recorded in the objects DB):
           #
-          #   * repo adapter (bare/empty source) -> `iobroker install <name>`
-          #     installs ONLY the adapter code from the configured repository; it
-          #     does NOT create an instance. That is exactly what reconciliation
-          #     needs: the desired set is derived from the instances already
-          #     recorded in the Data_Volume (the source of truth), so the
-          #     instances exist already and our job is purely to converge
-          #     node_modules to match. (Using `iobroker add` would instead try to
-          #     CREATE an instance, duplicating it and hard-failing for singleton
-          #     adapters, e.g. on a multihost slave sharing the master's DB.)
+          #   * repo adapter (empty source, or a bare unversioned
+          #     `iobroker.<name>`) -> `iobroker install <name>` installs ONLY the
+          #     adapter code from the configured repository; it does NOT create an
+          #     instance. That is exactly what reconciliation needs: the desired
+          #     set is derived from the instances already recorded in the
+          #     Data_Volume (the source of truth), so the instances exist already
+          #     and our job is purely to converge node_modules to match. (Using
+          #     `iobroker add` would instead try to CREATE an instance,
+          #     duplicating it and hard-failing for singleton adapters, e.g. on a
+          #     multihost slave sharing the master's DB.)
           #
-          #   * non-repo adapter (GitHub tarball, custom URL, npm spec, a package
-          #     not in the active repo) -> `iobroker url <source>`. These CANNOT
-          #     be installed by name: `iobroker install <name>` fails with
-          #     "Unknown packet name <name>. Please install ... using iobroker
-          #     url". We reinstall the code from the SAME source the operator
-          #     originally used, so a container recreate faithfully rebuilds the
-          #     recorded adapter set regardless of where each adapter came from.
-          #     `iobroker url` likewise installs code without creating instances.
+          #   * non-repo OR pinned adapter (GitHub tarball, custom URL, npm spec,
+          #     or a PINNED registry spec `iobroker.<name>@<version-or-tag>` such
+          #     as a beta/"latest"-repo install like `iobroker.nut2@latest`)
+          #     -> `iobroker url <source>`. These CANNOT reliably be installed by
+          #     name: `iobroker install <name>` resolves the name in the currently
+          #     ACTIVE repository only, so an adapter that came from the beta repo
+          #     (or is pinned to a version the active repo no longer offers) fails
+          #     with "Unknown packet name <name>. Please install ... using iobroker
+          #     url". `iobroker url` runs `npm install <source>` directly, so we
+          #     reinstall the code from the SAME source js-controller originally
+          #     recorded; a container recreate then faithfully rebuilds the
+          #     recorded adapter set regardless of where each adapter came from or
+          #     which repository is active. `iobroker url` likewise installs code
+          #     without creating instances.
           # record_failure: note a failed install and decide, per the active
           # IOB_ADAPTER_INSTALL_FAILURE_POLICY, whether THIS failure is fatal.
           #   strict               -> always fatal
