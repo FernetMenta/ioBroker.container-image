@@ -633,12 +633,14 @@ fi
 restore_db_hosts
 trap - EXIT
 
-# Capture any adapter (re)installs from this start into the persisted manifest so
-# a future recreate restores a package.json that matches the node_modules volume
-# (see the persist-package-json.sh restore call after Step 1). Best-effort.
-if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" save; then
-  log "package.json save reported a problem (continuing)"
-fi
+# NOTE: there is deliberately NO post-install "save" of package.json. The
+# persisted snapshot is refreshed by the START-TIME rebuild (persist-package-
+# json.sh restore, after Step 1), which reconstructs package.json as a superset
+# of what is actually on disk and writes both the live file and the snapshot.
+# Rebuilding from on-disk truth on every start is strictly more reliable than a
+# shutdown/post-install save: it always runs, it captures adapters a user
+# installed via admin at runtime (they are on disk), and it cannot persist a
+# half-written manifest.
 
 # ---------------------------------------------------------------------------
 # 10. exec js-controller under tini.
