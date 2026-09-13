@@ -79,13 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and could fail to acquire the lock or hang the whole start (observed on a
   master's first migration start). Successful installs are now paced by
   `IOB_INSTALL_SETTLE` (default `2`s) so each server fully releases before the
-  next call opens the file. The retry (now also covering transient Redis
-  connection drops: `Connection is closed` / `ECONNRESET` / `ECONNREFUSED` /
-  `ETIMEDOUT`) remains as a residual safety net; genuine failures (including
-  Redis `NOAUTH`/`WRONGPASS`) still surface immediately. The per-adapter
-  `object get` that reads `installedFrom` is now bounded by `IOB_LIST_TIMEOUT`
-  too, so a lock-stuck lookup can no longer hang the phase before the retry
-  logic is even reached.
+  next call opens the file. The retry (now also covering transient connection
+  drops seen on the jsonl backend when a sibling transient server is momentarily
+  not listening: `Connection is closed` / `ECONNRESET` / `ECONNREFUSED` /
+  `ETIMEDOUT`) remains as a residual safety net; genuine failures still surface
+  immediately (a Redis backend was not tested, but its `NOAUTH`/`WRONGPASS` auth
+  errors are deliberately excluded from the retry). The per-adapter `object get`
+  that reads `installedFrom` is now bounded by `IOB_LIST_TIMEOUT` too, so a
+  lock-stuck lookup can no longer hang the phase before the retry logic is even
+  reached.
 - Startup reconciliation now installs each adapter from the source it was
   originally installed from (`common.installedFrom`): repository adapters via
   `iobroker install <name>`, and non-repository adapters (GitHub tarball, custom

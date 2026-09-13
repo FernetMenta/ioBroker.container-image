@@ -813,21 +813,28 @@ run() {
 #    alive longer, widening the window — the entrypoint binds the DB to loopback
 #    for the install phase so a slave cannot reach it, see entrypoint.sh.)
 #
-# 2. redis backend — transient CONNECTION drop. With a Redis-backed
-#    objects/states DB, the CLI connects to Redis for the call; while
-#    js-controller is not yet up (or is itself just starting) that connection
-#    can be reset or closed mid-operation, surfacing as an ioredis error such as:
+# 2. transient CONNECTION drop while a sibling transient server is not (yet)
+#    listening. Between the per-call servers of case 1 there are brief windows
+#    where the CLI's client half tries to reach objects/states (ports 9001/9000)
+#    but no server is listening at that instant, so the connection is refused or
+#    closed mid-operation. ioBroker's client transport surfaces these as
+#    ioredis-style errors REGARDLESS of the configured backend (the jsonl client
+#    speaks the same protocol), e.g.:
+#        States database error: connect ECONNREFUSED 127.0.0.1:9000
 #        Error: Connection is closed.
-#    (also ECONNRESET / ECONNREFUSED / ETIMEDOUT). Observed in the wild: an
-#    `iobroker url` install of a single adapter failed on the first start with
-#    "Connection is closed." and then succeeded verbatim after a container
-#    restart — the hallmark of a startup timing race, not a real failure.
+#    (also ECONNRESET / ETIMEDOUT). OBSERVED on this project's jsonl setup: a
+#    master's first install phase produced a flood of these against 127.0.0.1:9000
+#    and a `Connection is closed.` on an `iobroker url` install that then
+#    succeeded after a restart — the hallmark of a startup timing race, not a real
+#    failure. The same messages would also apply to a genuine Redis backend, but
+#    that has NOT been tested here; the patterns are matched purely because they
+#    are what the jsonl transport emits during these gaps.
 #
 # Both are timing races, not genuine failures, so we absorb them by retrying the
 # SAME command a few times with a short backoff when — and only when — the output
 # matches one of these known-transient patterns. Any OTHER failure (including
-# real Redis auth errors like NOAUTH/WRONGPASS) returns immediately so genuine
-# problems still surface to the caller.
+# Redis auth errors like NOAUTH/WRONGPASS, if Redis is ever used) returns
+# immediately so genuine problems still surface to the caller.
 #
 # Captures combined output so it can both inspect it AND surface it to the log.
 IOB_INSTALL_LOCK_RETRIES="${IOB_INSTALL_LOCK_RETRIES:-6}"
@@ -908,11 +915,13 @@ run_install() {
     fi
 
     # Retry ONLY the known-transient pre-controller DB races; everything else is
-    # a real failure. Two backends, two patterns (see the header comment):
-    #   * jsonl file-lock race: "Failed to lock DB file" / "Cannot start inMem-*"
-    #   * redis connection race: "Connection is closed" / ECONNRESET /
-    #     ECONNREFUSED / ETIMEDOUT. Deliberately NOT matched: NOAUTH / WRONGPASS
-    #     (genuine auth/config errors, never transient).
+    # a real failure. Two patterns (see the header comment):
+    #   * file-lock race: "Failed to lock DB file" / "Cannot start inMem-*"
+    #   * connection-gap drop: "Connection is closed" / ECONNRESET /
+    #     ECONNREFUSED / ETIMEDOUT (emitted by the client transport when a sibling
+    #     transient server is not listening at that instant; seen on jsonl here).
+    #     Deliberately NOT matched: NOAUTH / WRONGPASS (genuine auth/config
+    #     errors, never transient — relevant only if Redis is ever used).
     if printf '%s' "${out}" | grep -qiE \
       'Failed to lock DB file|Cannot start inMem-(objects|states)|Connection is closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT'; then
       if [[ "${attempt}" -lt "${IOB_INSTALL_LOCK_RETRIES}" ]]; then
