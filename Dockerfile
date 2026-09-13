@@ -299,8 +299,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 # the native modules compiled in the Build_Stage resolve their shared-object
 # dependencies at runtime. (Req 2.3, 2.4, 5.2, 5.3, 5.6)
 #
+# cifs-utils + nfs-common are the OS-level dependencies declared by the
+# `backitup` adapter (`io-package.json` -> `osDependencies.linux`). ioBroker's
+# adapter installer tries to apt-install them at runtime, but the rootless
+# Container_User (uid 1000) cannot run apt (no dpkg lock / sudo password), so
+# that install fails with "Permission denied" and CIFS/SMB + NFS backup targets
+# would not mount. Baking them into the image at build time makes backitup's
+# network-share backup/restore work out of the box and removes the failing
+# runtime apt call. They are pure runtime packages (mount.cifs / mount.nfs +
+# helpers), so they belong in this runtime set, not the Build_Stage.
+#
 # Runtime OS packages:  acl, sudo, libcap2-bin, git, curl, ca-certificates,
-#                       unzip, distro-info, net-tools, polkitd, passwd, lsb-release
+#                       unzip, distro-info, net-tools, polkitd, passwd, lsb-release,
+#                       cifs-utils, nfs-common
 # Runtime shared libs:  libcairo2 (libcairo2-dev), libpango-1.0-0 (libpango1.0-dev),
 #                       librsvg2-2 (librsvg2-dev), libpixman-1-0 (libpixman-1-dev),
 #                       libjpeg62-turbo (libjpeg-dev), libgif7 (libgif-dev),
@@ -321,6 +332,8 @@ RUN set -eux; \
         polkitd \
         passwd \
         lsb-release \
+        cifs-utils \
+        nfs-common \
         libcairo2 \
         libpango-1.0-0 \
         librsvg2-2 \
@@ -584,7 +597,8 @@ echo "=== Runtime-dependency verification gate ==="
 echo "--- [1/4] asserting runtime packages are PRESENT (dpkg -s) ---"
 for pkg in \
     acl sudo libcap2-bin git curl unzip distro-info net-tools polkitd passwd \
-    lsb-release ca-certificates libcairo2 libpango-1.0-0 librsvg2-2 libpixman-1-0 \
+    lsb-release ca-certificates cifs-utils nfs-common libcairo2 libpango-1.0-0 \
+    librsvg2-2 libpixman-1-0 \
     libjpeg62-turbo libgif7 libudev1 libpam0g libavahi-compat-libdnssd1
 do
     if dpkg -s "$pkg" >/dev/null 2>&1; then
