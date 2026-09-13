@@ -18,6 +18,7 @@ message and exits 0**, so it never hard-fails in a build-less environment.
 | `runtime-deps.sh`  | Runtime-dependency + packaging checks (dpkg, ldd, smoke start, getcap)  | 2.3, 2.6, 5.2, 5.3, 7.1                     |
 | `rootless-uid.sh`  | Non-root default, arbitrary-UID volume access, container-env indicators | 3.3, 3.4, 3.5, 3.6, 4.5, 4.6, 6.1, 6.2, 6.3 |
 | `pid1-signals.sh`  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
+| `install-source-classify.sh` | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes | 8.9, 8.10 |
 
 ## `manifest-size.sh`
 
@@ -274,3 +275,42 @@ CONTAINER_CLI=podman IMAGE=iobroker:local ./test/smoke/pid1-signals.sh
 - `0` — all run checks passed, **or** skipped because a prerequisite was
   unavailable (no container CLI, or the image is not present).
 - `1` — at least one check failed.
+
+## `install-source-classify.sh`
+
+A **pure classification** check for reconcile's install-source router. Unlike
+the other scripts here it needs **no Docker and no image** — it sources only the
+`source_is_url` shell function out of `scripts/reconcile.sh` and asserts, for
+every recorded-source shape, whether reconcile routes the (re)install through
+`iobroker install <name>` (repo, by name) or `iobroker url <source>`.
+
+This mirrors js-controller's own boundary: its by-name installer resolves a name
+only in the **active** repository and throws `Unknown packet name <name>. Please
+install ... using url` for anything not found there (js-controller
+`setupInstall.ts`). So any source that is not a bare, unversioned
+`iobroker.<name>` must go through `iobroker url`.
+
+Cases asserted:
+
+1. **Repo by name** — empty `installedFrom`, and bare `iobroker.<name>`.
+2. **Pinned / beta / latest** — `iobroker.<name>@<version-or-tag>` → url.
+3. **Non-repo** — `http(s)://`, `git+`/`git://`, `file:`, absolute path,
+   `owner/repo`, `owner/repo#ref` → url.
+4. **Scoped / vendor** — the `iobroker.<name>@npm:<realPackage>` shape
+   js-controller uses for a package whose npm name differs, plus a bare scoped
+   npm spec (`@scope/pkg`). These were the open question from the js-controller
+   comparison; the test pins their verdicts so a future reordering of the router
+   arms that would misroute them (e.g. a scoped spec falling through to
+   by-name, which cannot resolve) fails loudly.
+
+### Usage
+
+```bash
+./test/smoke/install-source-classify.sh
+```
+
+### Exit codes
+
+- `0` — every source classified as expected.
+- `1` — at least one source was misrouted (routing regression). This script
+  **never skips**: it has no external prerequisites beyond bash.
