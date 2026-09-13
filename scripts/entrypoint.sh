@@ -312,6 +312,30 @@ if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" restore; 
   log "package.json restore reported a problem (continuing; reconcile will recover any prune)"
 fi
 
+# ---------------------------------------------------------------------------
+# Self-heal the node_modules dependency tree.
+#
+# Adapters depend on shared libraries npm HOISTS to the top of node_modules
+# (express, @iobroker/adapter-core, http-mitm-proxy, ...). If that tree was ever
+# left incomplete (e.g. an earlier npm prune removed hoisted packages and the
+# piecemeal reinstall did not restore them), adapters crash at runtime with
+# `Cannot find module '<dep>'` even though their own directory is present.
+# Restoring package.json above prevents FUTURE prunes but cannot rebuild an
+# ALREADY-incomplete tree, so we run one `npm install` against the now-complete
+# package.json to materialize any missing dependency. It prunes nothing (the
+# manifest is the full set) and is a fast no-op when the tree is already
+# consistent. Runs here, in the pre-controller window (no concurrent writer),
+# after the restore and before reconcile. Best-effort: never blocks startup.
+# Disable with IOB_HEAL_NODE_MODULES=false. See scripts/heal-node-modules.sh.
+# ---------------------------------------------------------------------------
+log "verifying adapter dependencies (self-heal); this may take several minutes on the first run"
+if ! env "${RECONCILE_ENV[@]}" \
+  IOB_HEAL_NODE_MODULES="${IOB_HEAL_NODE_MODULES:-true}" \
+  IOB_HEAL_TIMEOUT="${IOB_HEAL_TIMEOUT:-1800}" \
+  "${SCRIPT_DIR}/heal-node-modules.sh"; then
+  log "node_modules self-heal reported a problem (continuing)"
+fi
+
 # The controller config file (objects/states DB backend definition).
 IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
 

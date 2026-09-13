@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Startup now **self-heals the `node_modules` dependency tree**. Adapters depend
+  on shared libraries npm hoists to the top of `node_modules` (e.g. `express`,
+  `@iobroker/adapter-core`, `http-mitm-proxy`). A tree left incomplete by an
+  earlier prune — the adapter directory present but a hoisted dependency gone —
+  makes the adapter crash at runtime with `Cannot find module '<dep>'` even
+  though reconciliation sees the adapter as installed and does nothing. After
+  restoring `package.json` (and before the reconcile passes / js-controller
+  start, where there is no concurrent writer), the entrypoint now runs one
+  `npm install` against the complete manifest to materialize any missing
+  dependency. It prunes nothing (the manifest is the full set) and is a fast
+  no-op when the tree is already consistent; the first run after damage may take
+  several minutes and logs that it is in progress. Disable with
+  `IOB_HEAL_NODE_MODULES=false`; bound it with `IOB_HEAL_TIMEOUT` (default
+  1800s). See `scripts/heal-node-modules.sh`, covered by
+  `test/smoke/heal-node-modules.sh`.
+
 ### Fixed
 
 - Container **recreate** no longer prunes the persisted adapters out of
