@@ -94,7 +94,7 @@ set -u
 missing=""
 for pkg in \
     acl sudo libcap2-bin git curl unzip distro-info net-tools polkitd passwd \
-    lsb-release ca-certificates libcairo2 libpango-1.0-0 librsvg2-2 libpixman-1-0 \
+    lsb-release ca-certificates iputils-ping libcairo2 libpango-1.0-0 librsvg2-2 libpixman-1-0 \
     libjpeg62-turbo libgif7 libudev1 libpam0g libavahi-compat-libdnssd1
 do
     if dpkg -s "$pkg" >/dev/null 2>&1; then

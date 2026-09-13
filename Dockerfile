@@ -309,9 +309,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 # runtime apt call. They are pure runtime packages (mount.cifs / mount.nfs +
 # helpers), so they belong in this runtime set, not the Build_Stage.
 #
+# iputils-ping provides the /bin/ping binary the `ping` adapter shells out to.
+# The slim base image does NOT ship it, so without this package the adapter
+# fails with "missing binary". Shipping the binary is necessary but not
+# sufficient: ICMP needs a raw socket, so ping only becomes FUNCTIONAL when the
+# runtime grants NET_RAW (as an ambient capability) or the host enables the
+# net.ipv4.ping_group_range sysctl. Consistent with the rootless-first model,
+# we deliberately do NOT `setcap cap_net_raw+ep /bin/ping` here: the effective
+# bit would make the kernel refuse to exec ping in a fully-rootless container
+# with no permitted caps (the same reason node carries no file capability). The
+# raw-socket privilege is therefore left to the runtime layer. See
+# docs/rootless-capabilities.md. (Req 7.5)
+#
 # Runtime OS packages:  acl, sudo, libcap2-bin, git, curl, ca-certificates,
 #                       unzip, distro-info, net-tools, polkitd, passwd, lsb-release,
-#                       cifs-utils, nfs-common
+#                       cifs-utils, nfs-common, iputils-ping
 # Runtime shared libs:  libcairo2 (libcairo2-dev), libpango-1.0-0 (libpango1.0-dev),
 #                       librsvg2-2 (librsvg2-dev), libpixman-1-0 (libpixman-1-dev),
 #                       libjpeg62-turbo (libjpeg-dev), libgif7 (libgif-dev),
@@ -334,6 +346,7 @@ RUN set -eux; \
         lsb-release \
         cifs-utils \
         nfs-common \
+        iputils-ping \
         libcairo2 \
         libpango-1.0-0 \
         librsvg2-2 \
@@ -597,7 +610,7 @@ echo "=== Runtime-dependency verification gate ==="
 echo "--- [1/4] asserting runtime packages are PRESENT (dpkg -s) ---"
 for pkg in \
     acl sudo libcap2-bin git curl unzip distro-info net-tools polkitd passwd \
-    lsb-release ca-certificates cifs-utils nfs-common libcairo2 libpango-1.0-0 \
+    lsb-release ca-certificates cifs-utils nfs-common iputils-ping libcairo2 libpango-1.0-0 \
     librsvg2-2 libpixman-1-0 \
     libjpeg62-turbo libgif7 libudev1 libpam0g libavahi-compat-libdnssd1
 do

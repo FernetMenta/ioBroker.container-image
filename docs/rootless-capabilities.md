@@ -133,7 +133,7 @@ actually holds it.
 | Function / need | Required capability | How to enable |
 |---|---|---|
 | Binding a listener to a **privileged port < 1024** (e.g. an adapter serving directly on `80`/`443`) | `NET_BIND_SERVICE` (ambient) | Preferred: avoid the privileged port (reverse proxy / port mapping) or lower the threshold with the `net.ipv4.ip_unprivileged_port_start` sysctl. Otherwise: add `NET_BIND_SERVICE` **and** make it ambient (see examples). |
-| **Raw sockets / ICMP ping** (e.g. the `ping` adapter or any adapter using raw sockets) | `NET_RAW` (ambient) | Add `NET_RAW` **and** make it ambient. On many hosts ICMP also works via the `net.ipv4.ping_group_range` sysctl without any capability. |
+| **Raw sockets / ICMP ping** (e.g. the `ping` adapter or any adapter using raw sockets) | `NET_RAW` (ambient) | The `ping` binary (`iputils-ping`) **ships in the image**, so the adapter no longer fails with a missing binary. To make ICMP actually work: add `NET_RAW` **and** make it ambient, or (preferred, no capability) enable the `net.ipv4.ping_group_range` sysctl so the container's GID range may open unprivileged ICMP sockets. The image does **not** `setcap cap_net_raw+ep /bin/ping`, because the effective bit would make the kernel refuse to exec `ping` in a fully-rootless container — the same reason `node` carries no file capability. |
 | **Low-level network administration** (managing interfaces, routing, VPN/tunnel adapters, and similar) | `NET_ADMIN` | Add `NET_ADMIN`. Adapters using it typically invoke helper tools that raise the capability themselves, so ambient is usually not required. |
 
 ## Granting capabilities (Docker / Podman / Kubernetes)
@@ -165,10 +165,15 @@ docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 \
 # unprivileged CONTAINER port (ioBroker keeps listening on high ports).
 docker run -p 80:8082 ghcr.io/fernetmenta/iobroker
 
-# ICMP ping without any capability — allow the container's GID range to use
-# unprivileged ICMP sockets.
+# ICMP ping (the `ping` adapter) without any capability — allow the container's
+# GID range to use unprivileged ICMP sockets. The /bin/ping binary ships in the
+# image; this sysctl is what lets it open the socket rootless.
 docker run --sysctl 'net.ipv4.ping_group_range=0 2147483647' \
   ghcr.io/fernetmenta/iobroker
+
+# Alternatively, grant NET_RAW (must reach node's/ping's ambient set to be
+# effective in a rootless run):
+docker run --cap-add=NET_RAW ghcr.io/fernetmenta/iobroker
 
 # Low-level network administration (e.g. a VPN/tunnel adapter):
 docker run --cap-add=NET_ADMIN ghcr.io/fernetmenta/iobroker

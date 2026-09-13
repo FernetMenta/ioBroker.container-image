@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `ping` adapter's system `ping` binary now ships in the image
+  (`iputils-ping` added to the runtime package set). The slim base image does
+  not include it, so the adapter previously failed with a missing binary.
+  Consistent with the rootless-first design, the image does **not**
+  `setcap cap_net_raw+ep /bin/ping` (the effective bit would make the kernel
+  refuse to exec `ping` in a fully-rootless container). ICMP therefore still
+  requires the runtime to grant `NET_RAW` (ambient) or the host to enable the
+  `net.ipv4.ping_group_range` sysctl. See
+  [docs/rootless-capabilities.md](docs/rootless-capabilities.md#functions-that-require-explicitly-granted-runtime-capabilities-req-75).
 - Multihost master keeps a running slave OUT during startup. Adapter installs run
   before js-controller, and on a master the objects/states jsonl DB is served on
   the network; a connected slave holds the transient install-time DB servers
