@@ -10,21 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Multihost master keeps a running slave OUT during startup. Adapter installs run
-  before js-controller, and on a master the objects/states jsonl DB binds
-  `0.0.0.0`; a connected slave holds the transient install-time DB servers open,
-  causing `Failed to lock DB file` errors that no retry can win (the start
+  before js-controller, and on a master the objects/states jsonl DB is served on
+  the network; a connected slave holds the transient install-time DB servers
+  open, causing `Failed to lock DB file` errors that no retry can win (the start
   hangs). The entrypoint now temporarily binds the objects/states DB to
   `127.0.0.1` for the install phase and restores the original host before
-  starting js-controller, so a slave cannot interfere during startup. The
-  rewrite is restored even on failure or a mid-install kill, so a master is never
-  left stuck on loopback. See
+  starting js-controller, so a slave cannot interfere during startup. Isolation
+  is driven by the persisted multihost **role** (`multihostService.enabled`), not
+  by inspecting the current host: it applies unconditionally on a master (even if
+  the host already reads loopback) and is a no-op for a slave (whose DB points at
+  the remote master) or a standalone. The rewrite is restored even on failure or
+  a mid-install kill, so a master is never left stuck on loopback. See
   [docs/environment-variables.md](docs/environment-variables.md#multihost-master-slave-isolation-during-startup).
 - `IOB_INSTALL_TIMEOUT` (default `900`s) bounds a single adapter install attempt
   so a hung `iobroker install`/`iobroker url` is aborted and retried instead of
   freezing the whole start; `0` disables it.
-- `IOB_LIST_TIMEOUT` (default `120`s) bounds the `iobroker list instances` query
-  used by the install-failure policy, so a stuck database cannot hang the
-  observation phase.
+- `IOB_LIST_TIMEOUT` (default `120`s) bounds the `iobroker` observation queries
+  (`list instances` and the per-adapter `object get` that reads `installedFrom`),
+  so a stuck database cannot hang the observation phase.
+- `IOB_INSTALL_SETTLE` (default `2`s) paces the pre-controller install phase:
+  after each successful adapter install the next one waits briefly so the
+  transient jsonl database server the previous call started can release its
+  `objects.jsonl`/`states.jsonl` lock before the next call opens the file. `0`
+  disables it.
 - Persistent reconcile log with an end-of-run summary. Startup reconciliation
   now mirrors its output to `reconcile.log` and appends a summary block naming
   the phase, outcome, elapsed time, the observation snapshot, each executed
@@ -63,14 +71,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running instance whose install failed). Previously a failed query produced an
   empty set indistinguishable from "no enabled instances," wrongly tolerating
   such failures.
-- Startup reconciliation retries an adapter install when it hits the jsonl
-  "Failed to lock DB file" race. During the pre-controller install phase each
-  `iobroker install`/`iobroker url` call briefly file-locks the objects/states
-  database; on a multihost master (network-mode DB), a not-yet-released lock
-  from the previous install could make the next one fail and abort startup —
-  typically only after several adapters had already installed. The install now
-  retries with a short backoff on that specific lock error (and only that
-  error); genuine failures still surface immediately.
+- The pre-controller install phase no longer hangs on the jsonl "Failed to lock
+  DB file" race. With js-controller not yet running, each `iobroker install`/
+  `iobroker url` call runs its own transient jsonl database server that locks
+  `objects.jsonl`/`states.jsonl` and releases the lock slightly **after** the
+  process exits; running the next install immediately raced that lagging release
+  and could fail to acquire the lock or hang the whole start (observed on a
+  master's first migration start). Successful installs are now paced by
+  `IOB_INSTALL_SETTLE` (default `2`s) so each server fully releases before the
+  next call opens the file. The retry (now also covering transient Redis
+  connection drops: `Connection is closed` / `ECONNRESET` / `ECONNREFUSED` /
+  `ETIMEDOUT`) remains as a residual safety net; genuine failures (including
+  Redis `NOAUTH`/`WRONGPASS`) still surface immediately. The per-adapter
+  `object get` that reads `installedFrom` is now bounded by `IOB_LIST_TIMEOUT`
+  too, so a lock-stuck lookup can no longer hang the phase before the retry
+  logic is even reached.
 - Startup reconciliation now installs each adapter from the source it was
   originally installed from (`common.installedFrom`): repository adapters via
   `iobroker install <name>`, and non-repository adapters (GitHub tarball, custom

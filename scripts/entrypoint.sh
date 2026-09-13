@@ -291,21 +291,30 @@ IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
 # ---------------------------------------------------------------------------
 # Install-phase DB isolation (keep a multihost slave OUT during startup).
 #
-# On a multihost MASTER the objects/states jsonl DB binds `host: 0.0.0.0` so
-# slaves on the LAN can connect to it (ports 9001/9000). But adapter installs
-# run BEFORE js-controller: each `iobroker` CLI call stands up its OWN transient
-# jsonl server on those ports and file-locks objects.jsonl/states.jsonl for the
-# duration of that call. If a running slave is connected to `0.0.0.0:9001`, it
-# keeps latching onto those transient servers, holding the port/lock open so the
-# NEXT install cannot acquire it — producing "Failed to lock DB file" errors that
-# no retry can win, and the whole start hangs.
+# A multihost MASTER serves its objects/states jsonl DB on the network (e.g.
+# `host: 0.0.0.0`, ports 9001/9000) so slaves on the LAN can connect. But adapter
+# installs run BEFORE js-controller: each `iobroker` CLI call stands up its OWN
+# transient jsonl server on those ports and file-locks objects.jsonl/states.jsonl
+# for the duration of that call. If a running slave keeps connecting to the
+# master's network address, it latches onto those transient servers and holds the
+# port/lock open, so the NEXT install cannot acquire it — producing "Failed to
+# lock DB file" errors that no retry can win, and the whole start hangs.
 #
 # The fix: for the install phase ONLY, bind the objects/states DB to loopback
-# (`127.0.0.1`) instead of `0.0.0.0`. The transient servers then listen only
-# inside the container, so a slave hitting the master's LAN address gets
-# connection-refused and cannot interfere. The real `0.0.0.0` binding is restored
-# right before we `exec` js-controller, so the master serves its slaves normally
-# once it is actually up. Ports are left unchanged; only the host is narrowed.
+# (`127.0.0.1`). The transient servers then listen only inside the container, so a
+# slave hitting the master's LAN address is connection-refused and cannot
+# interfere. The original hosts are restored right before we `exec` js-controller,
+# so the master serves its slaves normally once it is actually up. Ports are left
+# unchanged; only the host is narrowed.
+#
+# ROLE-DRIVEN, not host-guessing: isolation is applied IFF this container is a
+# multihost MASTER (`multihostService.enabled === true` in iobroker.json — the
+# authoritative, persisted role written by configure-db.sh). We do this
+# unconditionally for a master, even if its host already reads `127.0.0.1`, so the
+# slave lockout does not depend on the current host value happening to be
+# non-loopback. For a SLAVE (its DB is the REMOTE master's address — rewriting it
+# to loopback would break the slave's own install queries) and for a STANDALONE
+# (no slave exists to lock out, no network exposure) isolation is a no-op.
 #
 # This is a pure file patch (same mechanism configure-db.sh uses) and is made
 # crash-safe by a trap: if the install phase fails or the container is killed
@@ -314,9 +323,11 @@ IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
 DB_HOST_BACKUP=""          # "<objectsHost>\t<statesHost>" captured before isolation
 DB_HOSTS_ISOLATED=false    # whether we actually narrowed the hosts (needs restore)
 
-# read_db_hosts: print "<objectsHost>\t<statesHost>" from iobroker.json (empty
-# fields when absent). Best-effort; prints nothing if the file is unreadable.
-read_db_hosts() {
+# read_db_state: print "<objectsHost>\t<statesHost>\t<isMaster>" from iobroker.json
+# (host fields empty when absent; isMaster is "true"/"false"). isMaster reflects
+# ioBroker's own multihostService.enabled flag — the master is the host that runs
+# the multihost service. Best-effort; prints nothing if the file is unreadable.
+read_db_state() {
   [[ -r "${IOB_JSON}" ]] || return 0
   IOB_JSON_PATH="${IOB_JSON}" run_node "
     import { readFileSync } from 'node:fs';
@@ -324,7 +335,8 @@ read_db_hosts() {
       const c = JSON.parse(readFileSync(process.env.IOB_JSON_PATH, 'utf8'));
       const o = (c.objects && c.objects.host) ?? '';
       const s = (c.states && c.states.host) ?? '';
-      process.stdout.write(String(o) + '\t' + String(s));
+      const master = !!(c.multihostService && c.multihostService.enabled === true);
+      process.stdout.write(String(o) + '\t' + String(s) + '\t' + (master ? 'true' : 'false'));
     } catch { /* no output */ }
   "
 }
@@ -346,30 +358,42 @@ set_db_hosts() {
   "
 }
 
-# isolate_db_hosts_for_install: if either DB host is non-loopback (e.g. a master's
-# 0.0.0.0), back up both hosts and rewrite them to 127.0.0.1 for the install
-# phase. No-op (and no restore needed) when both hosts are already loopback/empty,
-# e.g. a standalone container whose local DB is not network-exposed.
+# isolate_db_hosts_for_install: on a multihost MASTER, back up both DB hosts and
+# rewrite them to 127.0.0.1 for the install phase (unconditionally — see the
+# role-driven rationale above). No-op for slave/standalone. Idempotent restore is
+# guaranteed by restore_db_hosts via the EXIT trap.
 isolate_db_hosts_for_install() {
-  local hosts obj_host states_host
-  hosts="$(read_db_hosts)"
-  [[ -n "${hosts}" ]] || { log "install-phase DB isolation: cannot read ${IOB_JSON}; skipping"; return 0; }
-  obj_host="${hosts%%$'\t'*}"
-  states_host="${hosts#*$'\t'}"
+  local state obj_host states_host is_master
+  state="$(read_db_state)"
+  [[ -n "${state}" ]] || { log "install-phase DB isolation: cannot read ${IOB_JSON}; skipping"; return 0; }
+  obj_host="${state%%$'\t'*}"
+  local rest="${state#*$'\t'}"
+  states_host="${rest%%$'\t'*}"
+  is_master="${rest#*$'\t'}"
 
-  local needs_isolation=false
-  case "${obj_host}" in ''|127.0.0.1|localhost|::1) : ;; *) needs_isolation=true ;; esac
-  case "${states_host}" in ''|127.0.0.1|localhost|::1) : ;; *) needs_isolation=true ;; esac
+  # Only a master hosts a network DB that a slave can latch onto; slave/standalone
+  # have nothing to isolate (and a slave's host points at the REMOTE master, which
+  # must not be rewritten).
+  if [[ "${is_master}" != "true" ]]; then
+    log "install-phase DB isolation: not a multihost master (objects='${obj_host}' states='${states_host}'); no isolation needed"
+    return 0
+  fi
 
-  if [[ "${needs_isolation}" != "true" ]]; then
-    log "install-phase DB isolation: hosts already loopback (objects='${obj_host}' states='${states_host}'); no change"
+  # Already loopback on both? Then a slave cannot reach us regardless; nothing to
+  # narrow, and no restore needed. (A master persisted on loopback cannot serve
+  # slaves after startup, but that is a configuration choice, not ours to change.)
+  local already_loopback=true
+  case "${obj_host}" in ''|127.0.0.1|localhost|::1) : ;; *) already_loopback=false ;; esac
+  case "${states_host}" in ''|127.0.0.1|localhost|::1) : ;; *) already_loopback=false ;; esac
+  if [[ "${already_loopback}" == "true" ]]; then
+    log "install-phase DB isolation: master DB already loopback (objects='${obj_host}' states='${states_host}'); a slave cannot connect during startup"
     return 0
   fi
 
   DB_HOST_BACKUP="${obj_host}"$'\t'"${states_host}"
   if set_db_hosts "127.0.0.1" "127.0.0.1"; then
     DB_HOSTS_ISOLATED=true
-    log "install-phase DB isolation: bound objects/states to 127.0.0.1 for the install phase" \
+    log "install-phase DB isolation: master DB bound to 127.0.0.1 for the install phase" \
       "(was objects='${obj_host}' states='${states_host}'); a slave cannot connect during startup"
   else
     # If we could not patch, leave the file as-is and continue. The install may

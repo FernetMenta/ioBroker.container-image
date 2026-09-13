@@ -547,9 +547,23 @@ adapter_install_source() {
 
   # Preferred: the objects DB, which knows the source even for not-yet-installed
   # adapters. `iobroker object get` prints the object JSON on stdout.
+  #
+  # Bound it with `timeout` (IOB_LIST_TIMEOUT, shared with the other observation
+  # queries): like every pre-controller CLI call this stands up its own transient
+  # jsonl DB server, which can get stuck acquiring the objects.jsonl lock while a
+  # sibling server is still tearing down. Unbounded, that stall hangs the whole
+  # install phase BEFORE the retry harness (run_install) is ever reached, because
+  # this observation call runs outside it. A finite bound turns a stuck lookup
+  # into an empty result (we then fall back to the local io-package.json) instead
+  # of a hang.
   if command -v iobroker >/dev/null 2>&1; then
     local obj
-    obj="$(iobroker object get "system.adapter.${name}" 2>/dev/null || true)"
+    local -a _og_runner=()
+    if [[ "${IOB_LIST_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IOB_LIST_TIMEOUT}" -gt 0 ]] \
+      && command -v timeout >/dev/null 2>&1; then
+      _og_runner=(timeout "${IOB_LIST_TIMEOUT}")
+    fi
+    obj="$("${_og_runner[@]}" iobroker object get "system.adapter.${name}" 2>/dev/null || true)"
     if [[ -n "${obj}" ]]; then
       local from
       from="$(printf '%s' "${obj}" | IOB_ADAPTER_NAME="${name}" node --input-type=module -e '
@@ -778,23 +792,26 @@ run() {
   return "${rc}"
 }
 
-# run_install: like `run`, but retries the TRANSIENT pre-controller DB races that
-# an `iobroker install`/`iobroker url` invocation can hit while js-controller is
-# not yet running. Two flavours, depending on the configured DB backend:
+# run_install: like `run`, but (1) paces successful installs with IOB_INSTALL_SETTLE
+# and (2) retries the TRANSIENT pre-controller DB races an `iobroker install`/
+# `iobroker url` invocation can hit while js-controller is not yet running. Two
+# flavours, depending on the configured DB backend:
 #
-# 1. jsonl (file) backend — DB-file LOCK race. On a multihost master the
-#    objects/states DB host is 0.0.0.0 (network mode). js-controller is NOT
-#    running yet during reconcile, so every CLI invocation stands up its OWN
-#    transient in-memory jsonl server that opens and file-LOCKS objects.jsonl /
-#    states.jsonl for the duration of that one call, then releases the lock as
+# 1. jsonl (file) backend — DB-file LOCK race (the primary problem). js-controller
+#    is NOT running yet during reconcile, so every CLI invocation stands up its
+#    OWN transient in-memory jsonl server that opens and file-LOCKS objects.jsonl
+#    / states.jsonl for the duration of that one call, then releases the lock as
 #    the process exits. Because that release is not perfectly synchronous with
-#    process exit (the server shuts down slightly after the CLI returns), the
-#    NEXT sequential install can try to lock the same file while the previous
-#    server is still tearing down, and fail with:
+#    process exit (the server shuts down slightly after the CLI returns), running
+#    the NEXT sequential install IMMEDIATELY races the lagging release and can
+#    fail to acquire — or hang — with:
 #        Server Cannot start inMem-objects on port 9001: Failed to lock DB file "...objects.jsonl"!
-#    A remote slave that continuously reconnects to the master's DB port keeps
-#    those transient servers alive a little longer, widening the window (which
-#    is why it tends to strike only after several successful installs).
+#    The main fix is the IOB_INSTALL_SETTLE pause between successful installs (see
+#    below), which lets each transient server unlock before the next call opens
+#    the file; the retry here is the residual safety net. (A remote slave that
+#    keeps reconnecting to the master's DB port can also hold a transient server
+#    alive longer, widening the window — the entrypoint binds the DB to loopback
+#    for the install phase so a slave cannot reach it, see entrypoint.sh.)
 #
 # 2. redis backend — transient CONNECTION drop. With a Redis-backed
 #    objects/states DB, the CLI connects to Redis for the call; while
@@ -825,6 +842,17 @@ IOB_INSTALL_LOCK_BACKOFF="${IOB_INSTALL_LOCK_BACKOFF:-2}"
 # adapter install on a slow link is legitimately slow), but finite. Set to 0 to
 # disable the timeout entirely (revert to the old unbounded behavior).
 IOB_INSTALL_TIMEOUT="${IOB_INSTALL_TIMEOUT:-900}"
+# IOB_INSTALL_SETTLE is the short pause (seconds) after a SUCCESSFUL DB-touching
+# install call, before the next one starts. This is the primary fix for the
+# self-collision that caused the "Failed to lock DB file" hang on a master's
+# first start: with js-controller not yet running, each `iobroker install`/`url`
+# stands up its OWN transient jsonl DB server that file-locks objects.jsonl /
+# states.jsonl and releases the lock only slightly AFTER the CLI process exits.
+# Running the next install immediately then races that lagging release and can
+# fail to acquire the lock — or hang. A brief settle lets the previous server
+# fully tear down and unlock before the next call opens the file, so sequential
+# installs stop stepping on each other. Default 2s; set 0 to disable.
+IOB_INSTALL_SETTLE="${IOB_INSTALL_SETTLE:-2}"
 run_install() {
   if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
     heartbeat
@@ -853,6 +881,12 @@ run_install() {
     heartbeat
 
     if [[ "${rc}" -eq 0 ]]; then
+      # Let the transient DB server this call started fully tear down and release
+      # its objects.jsonl / states.jsonl lock before the next install opens the
+      # file, so sequential installs do not race the lagging lock release.
+      if [[ "${IOB_INSTALL_SETTLE}" =~ ^[0-9]+$ ]] && [[ "${IOB_INSTALL_SETTLE}" -gt 0 ]]; then
+        sleep "${IOB_INSTALL_SETTLE}"
+      fi
       return 0
     fi
 
