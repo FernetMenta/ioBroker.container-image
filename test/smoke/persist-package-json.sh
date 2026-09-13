@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
-# persist-package-json.sh (smoke) - verify the START-TIME rebuild of
-# package.json keeps it a SUPERSET of node_modules across a container recreate,
-# WITHOUT corrupting non-trivial dependency specs.
+# persist-package-json.sh (smoke) - verify package.json survives a container
+# RECREATE so the node_modules volume never gets pruned.
 #
-# scripts/persist-package-json.sh `restore` rebuilds /opt/iobroker/package.json
-# as a merge of: the persisted snapshot (.iob-package.json, authoritative specs)
-# + the current live package.json + every package present on disk under
-# node_modules (added with its own version only if not already a dependency).
-# The result is written to both the live file and the snapshot. This test drives
-# the real script against hand-built fixtures (no docker/npm/network), asserting:
+# WHY THIS TEST EXISTS
+# --------------------
+# node_modules is a persistent volume; package.json is not. A recreate resets
+# package.json to the image baseline (1 dependency) while node_modules still
+# holds every adapter, and the next `npm install` prunes the "extraneous"
+# adapters. scripts/persist-package-json.sh keeps an authoritative copy inside
+# the node_modules volume and restores it on start BEFORE anything prunes. This
+# test drives that script through the exact restart/recreate/first-start cases.
 #
-#   * first start (no snapshot) seeds the snapshot and lists on-disk packages,
-#   * a recreate (live reset to 1 dep) PRESERVES github:/npm-alias/range specs
-#     verbatim from the snapshot (never rewritten to a bare on-disk version),
-#   * an adapter present on disk but absent from both snapshot and live (the
-#     "installed via admin at runtime, then recreated" case) is ADDED so the
-#     next npm cannot prune it,
-#   * scoped packages (@scope/name) on disk are handled,
-#   * the snapshot is refreshed to match (no separate save step).
+# Drives the real scripts/persist-package-json.sh against temp dirs (no docker,
+# no npm, no network), so it never skips.
 #
 # Exit codes: 0 all cases held; 1 a regression.
 set -u
@@ -29,17 +24,14 @@ PERSIST_SH="${REPO_ROOT}/scripts/persist-package-json.sh"
 PASS_PREFIX="persist-package-json: PASS:"
 FAIL_PREFIX="persist-package-json: FAIL:"
 
-if [[ ! -r "${PERSIST_SH}" ]]; then
+if [[ ! -x "${PERSIST_SH}" ]] && [[ ! -r "${PERSIST_SH}" ]]; then
   echo "${FAIL_PREFIX} cannot find ${PERSIST_SH}" >&2
-  exit 1
-fi
-if ! command -v node >/dev/null 2>&1; then
-  echo "${FAIL_PREFIX} node required for this test but not found" >&2
   exit 1
 fi
 
 fail=""
 
+# Each case runs in its own fake IOB_ROOT with a node_modules subdir.
 new_root() {
   local root
   root="$(mktemp -d 2>/dev/null || echo "/tmp/iac-persist.$$.${RANDOM}")"
@@ -47,124 +39,87 @@ new_root() {
   printf '%s' "${root}"
 }
 
-run_restore() {
-  local root="$1"
+run_persist() {
+  local root="$1" action="$2"
   IOB_ROOT="${root}" \
   IOB_NODE_MODULES_DIR="${root}/node_modules" \
   IOB_PKG_JSON="${root}/package.json" \
   IOB_PKG_JSON_PERSIST="${root}/node_modules/.iob-package.json" \
-    bash "${PERSIST_SH}" restore >/dev/null 2>&1
+    bash "${PERSIST_SH}" "${action}" >/dev/null 2>&1
 }
 
-# mk_pkg_dir <root> <pkgname> <version> : a node_modules package dir with a
-# package.json carrying <version>. Handles @scope/name.
-mk_pkg_dir() {
-  local root="$1" name="$2" ver="$3" dir
-  dir="${root}/node_modules/${name}"
-  mkdir -p "${dir}"
-  printf '{"name":"%s","version":"%s"}\n' "${name}" "${ver}" >"${dir}/package.json"
+# deps_count <file> : number of top-level keys in the JSON "dependencies" object,
+# via a tiny awk-free node-free parser using grep (the fixtures are simple, one
+# dependency per line).
+deps_count() {
+  local f="$1"
+  [[ -r "${f}" ]] || { printf '%s' "-1"; return; }
+  # count only the dependency entries the fixtures write (iobroker.dep<N>), so
+  # the surrounding "name"/etc. fields are not miscounted as dependencies.
+  grep -cE '"iobroker\.dep[0-9]+"[[:space:]]*:' "${f}"
 }
 
-# dep_spec <file> <name> : print the dependency spec for <name>, or empty.
-dep_spec() {
-  local f="$1" name="$2"
-  [[ -r "${f}" ]] || { printf ''; return; }
-  IOB_Q_FILE="${f}" IOB_Q_NAME="${name}" node -e '
-    try {
-      const o = JSON.parse(require("fs").readFileSync(process.env.IOB_Q_FILE, "utf8"));
-      const d = (o && o.dependencies) || {};
-      process.stdout.write(String(d[process.env.IOB_Q_NAME] ?? ""));
-    } catch { process.stdout.write(""); }
-  ' 2>/dev/null
+# write_pkg <file> <n> : write a package.json-ish file with n dependency lines.
+write_pkg() {
+  local f="$1" n="$2" i
+  {
+    printf '{\n  "name": "iobroker.inst",\n  "dependencies": {\n'
+    for ((i = 1; i <= n; i++)); do
+      if [[ "${i}" -lt "${n}" ]]; then
+        printf '    "iobroker.dep%d": "1.0.0",\n' "${i}"
+      else
+        printf '    "iobroker.dep%d": "1.0.0"\n' "${i}"
+      fi
+    done
+    printf '  }\n}\n'
+  } >"${f}"
 }
 
-check_eq() {
+check() {
   local desc="$1" got="$2" want="$3"
   if [[ "${got}" == "${want}" ]]; then
-    printf '  ok   %-58s (%s)\n' "${desc}" "${got:-<empty>}"
+    printf '  ok   %-55s (deps=%s)\n' "${desc}" "${got}"
   else
-    printf '  FAIL %-58s want=[%s] got=[%s]\n' "${desc}" "${want}" "${got}" >&2
+    printf '  FAIL %-55s want=%s got=%s\n' "${desc}" "${want}" "${got}" >&2
     fail="${fail} [${desc}]"
   fi
 }
 
-echo "=== persist-package-json (start-time rebuild / merge) ==="
+echo "=== persist-package-json ==="
 
-# --- Case 1: first start seeds the snapshot and lists on-disk packages. -------
+# --- Case 1: first start seeds the persisted copy from the current file. -----
 r1="$(new_root)"
-cat >"${r1}/package.json" <<'JSON'
-{ "name": "iobroker.inst", "dependencies": { "iobroker.js-controller": "7.2.2" } }
-JSON
-mk_pkg_dir "${r1}" "iobroker.js-controller" "7.2.2"
-mk_pkg_dir "${r1}" "iobroker.admin" "8.0.11"
-run_restore "${r1}"
-check_eq "first start: snapshot seeded (admin listed)" "$(dep_spec "${r1}/node_modules/.iob-package.json" iobroker.admin)" "8.0.11"
-check_eq "first start: live gains on-disk admin" "$(dep_spec "${r1}/package.json" iobroker.admin)" "8.0.11"
+write_pkg "${r1}/package.json" 32          # image already grown / full
+run_persist "${r1}" restore
+check "first start seeds persisted copy" "$(deps_count "${r1}/node_modules/.iob-package.json")" "32"
+check "first start leaves live file intact" "$(deps_count "${r1}/package.json")" "32"
 rm -rf -- "${r1}"
 
-# --- Case 2: RECREATE preserves non-trivial specs from the snapshot. ---------
-# snapshot carries the authoritative specs; live was reset to the image baseline.
+# --- Case 2: RECREATE restores the full manifest over an image-reset file. ---
+# Simulate: persisted copy has full set (32); live package.json was reset by the
+# fresh container layer to the image baseline (1). restore must bring it back.
 r2="$(new_root)"
-cat >"${r2}/node_modules/.iob-package.json" <<'JSON'
-{
-  "name": "iobroker.inst",
-  "dependencies": {
-    "iobroker.js-controller": "7.2.2",
-    "iobroker.admin": "8.0.11",
-    "iobroker.lovelace": "^6.1.3",
-    "iobroker.mielecloudservice": "github:Grizzelbee/ioBroker.mielecloudservice#development",
-    "@iobroker-javascript.0/csv-parse": "npm:csv-parse@^7.0.2"
-  }
-}
-JSON
-cat >"${r2}/package.json" <<'JSON'
-{ "name": "iobroker.inst", "dependencies": { "iobroker.js-controller": "7.2.2" } }
-JSON
-# on disk: the adapters exist with their real installed versions
-mk_pkg_dir "${r2}" "iobroker.js-controller" "7.2.2"
-mk_pkg_dir "${r2}" "iobroker.admin" "8.0.11"
-mk_pkg_dir "${r2}" "iobroker.lovelace" "6.1.3"
-mk_pkg_dir "${r2}" "iobroker.mielecloudservice" "7.0.0"
-run_restore "${r2}"
-# github spec must survive verbatim (NOT rewritten to the on-disk 7.0.0)
-check_eq "recreate: github spec preserved" \
-  "$(dep_spec "${r2}/package.json" iobroker.mielecloudservice)" \
-  "github:Grizzelbee/ioBroker.mielecloudservice#development"
-check_eq "recreate: range spec preserved" \
-  "$(dep_spec "${r2}/package.json" iobroker.lovelace)" "^6.1.3"
-check_eq "recreate: npm-alias spec preserved" \
-  "$(dep_spec "${r2}/package.json" '@iobroker-javascript.0/csv-parse')" "npm:csv-parse@^7.0.2"
-check_eq "recreate: pinned spec preserved" \
-  "$(dep_spec "${r2}/package.json" iobroker.admin)" "8.0.11"
+write_pkg "${r2}/node_modules/.iob-package.json" 32   # persisted (grown at runtime, on the volume)
+write_pkg "${r2}/package.json" 1                      # image baseline in the fresh layer
+run_persist "${r2}" restore
+check "recreate restores full package.json over reset" "$(deps_count "${r2}/package.json")" "32"
 rm -rf -- "${r2}"
 
-# --- Case 3: admin-installed adapter (on disk, not in snapshot/live) added. --
+# --- Case 3: save captures runtime growth for the next recreate. -------------
 r3="$(new_root)"
-cat >"${r3}/node_modules/.iob-package.json" <<'JSON'
-{ "name": "iobroker.inst", "dependencies": { "iobroker.js-controller": "7.2.2", "iobroker.admin": "8.0.11" } }
-JSON
-cat >"${r3}/package.json" <<'JSON'
-{ "name": "iobroker.inst", "dependencies": { "iobroker.js-controller": "7.2.2" } }
-JSON
-mk_pkg_dir "${r3}" "iobroker.js-controller" "7.2.2"
-mk_pkg_dir "${r3}" "iobroker.admin" "8.0.11"
-mk_pkg_dir "${r3}" "iobroker.newlyadded" "1.4.2"   # installed via admin, not in any manifest
-run_restore "${r3}"
-check_eq "admin-install: on-disk-only adapter added (prevents prune)" \
-  "$(dep_spec "${r3}/package.json" iobroker.newlyadded)" "1.4.2"
-check_eq "admin-install: snapshot updated too" \
-  "$(dep_spec "${r3}/node_modules/.iob-package.json" iobroker.newlyadded)" "1.4.2"
+write_pkg "${r3}/node_modules/.iob-package.json" 20   # persisted lags behind
+write_pkg "${r3}/package.json" 33                     # runtime grew it further
+run_persist "${r3}" save
+check "save refreshes persisted copy from live file" "$(deps_count "${r3}/node_modules/.iob-package.json")" "33"
 rm -rf -- "${r3}"
 
-# --- Case 4: scoped package on disk is handled. ------------------------------
+# --- Case 4: restore after a save round-trips (idempotent sync). -------------
 r4="$(new_root)"
-cat >"${r4}/package.json" <<'JSON'
-{ "name": "iobroker.inst", "dependencies": { "iobroker.js-controller": "7.2.2" } }
-JSON
-mk_pkg_dir "${r4}" "iobroker.js-controller" "7.2.2"
-mk_pkg_dir "${r4}" "@scope/thing" "2.5.0"
-run_restore "${r4}"
-check_eq "scoped package on disk added" "$(dep_spec "${r4}/package.json" '@scope/thing')" "2.5.0"
+write_pkg "${r4}/package.json" 30
+run_persist "${r4}" restore     # seeds 30
+write_pkg "${r4}/package.json" 1  # simulate recreate reset
+run_persist "${r4}" restore     # should restore 30
+check "seed then recreate-restore round-trips" "$(deps_count "${r4}/package.json")" "30"
 rm -rf -- "${r4}"
 
 echo "---"
@@ -173,6 +128,6 @@ if [[ -n "${fail}" ]]; then
   echo "=== persist-package-json FAILED ===" >&2
   exit 1
 fi
-echo "${PASS_PREFIX} start-time rebuild keeps package.json a superset and preserves specs"
+echo "${PASS_PREFIX} package.json persists across recreate as expected"
 echo "=== persist-package-json PASSED ==="
 exit 0

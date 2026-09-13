@@ -39,20 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sync, so the next `npm install` (reconcile OR a runtime adapter install) treats
   every adapter as extraneous and PRUNES it, collapsing `node_modules` and
   forcing a full reinstall (the "broken admin / reinstall all adapters only after
-  a recreate, never after a restart" symptom). On every start, BEFORE any
-  npm/reconcile runs, `package.json` is now **rebuilt from on-disk truth**: it is
-  merged from a snapshot kept inside the persistent `node_modules` volume
-  (`.iob-package.json`, which carries the authoritative specs), the current live
-  file, and every package actually present under `node_modules`, so the manifest
-  is always a SUPERSET of what is installed and nothing is extraneous to prune.
-  Existing dependency specs (`github:`, `npm:` aliases, ranges, pinned versions)
-  are preserved verbatim — only packages present on disk but missing from the
-  manifest are added (with their on-disk version), which also covers an adapter a
-  user installed via admin at runtime (it is on disk, so a later recreate cannot
-  prune it). Rebuilding from disk on every start is used deliberately instead of
-  a shutdown/post-install save, which may not run (docker kill / OOM) and could
-  persist a half-written manifest. No extra volume is required. See
-  `scripts/persist-package-json.sh`, covered by
+  a recreate, never after a restart" symptom). An authoritative copy of
+  `package.json` is now kept inside the persistent `node_modules` volume
+  (`.iob-package.json`) and restored over the reset file on every start BEFORE
+  any npm/reconcile runs, re-syncing it with the volume so nothing prunes; it is
+  refreshed after the install phase to capture new installs. No extra volume is
+  required. See `scripts/persist-package-json.sh`, covered by
   `test/smoke/persist-package-json.sh`.
 - Reconciliation now detects and repairs a **present-but-incomplete** adapter
   install instead of trusting bare directory presence. An interrupted
