@@ -44,9 +44,11 @@ captured — are ignored for default resolution.
 | `IOB_RECONCILE_STALL_TOLERANCE` | `120` | `0`–`3600` (seconds) | Healthcheck reconcile stall tolerance. While first-boot/post-upgrade reconciliation (adapter installs, native rebuilds) is in progress, the healthcheck tolerates a failing status check for **any** total duration as long as reconcile keeps advancing its heartbeat. This value bounds only how long the heartbeat may go **stale** before reconcile is treated as stuck and unhealthy is reported. Raise it if a single reconcile step (e.g. one large adapter install on a very slow link) can pause longer than the default. |
 | `IOB_ADAPTER_INSTALL_FAILURE_POLICY` | `tolerate-no-instance` | `strict` \| `tolerate-no-instance` \| `tolerate-all` | What to do when an adapter's code cannot be (re)installed during startup reconciliation. See [Adapter install failure policy](#adapter-install-failure-policy) below. Validated. |
 | `IOB_RECONCILE_LOG` | `<log>/reconcile.log` | path | Where startup reconciliation writes its persistent log and end-of-run summary. Mirrors everything reconcile prints to the container log, plus a summary block (phase, outcome, elapsed, observations, per-action results, install tallies). Lives in the Log_Volume (`/opt/iobroker/log`) so it survives container recreation and can be read after a start that hung or failed. See [Reconcile log](#reconcile-log) below. |
-| `IOB_INSTALL_TIMEOUT` | `900` | `0`–… (seconds) | Maximum time a single adapter install/`iobroker url` attempt may run before it is aborted and retried (bounded by `IOB_INSTALL_LOCK_RETRIES`). Prevents a hung install from freezing the whole start. `0` disables the timeout (unbounded, legacy behavior). Raise it if one legitimately large adapter install on a very slow link can exceed the default. |
-| `IOB_INSTALL_SETTLE` | `2` | `0`–… (seconds) | Pause after each **successful** adapter install before the next one starts. During the pre-controller install phase each `iobroker install`/`iobroker url` call runs its own transient jsonl database server that file-locks `objects.jsonl`/`states.jsonl` and releases the lock slightly **after** the process exits; starting the next install immediately races that lagging release and can produce `Failed to lock DB file` or hang. The settle lets each server fully release before the next call opens the file. `0` disables it (only safe with a non-jsonl DB such as Redis, or when there is at most one adapter to install). |
-| `IOB_LIST_TIMEOUT` | `120` | `0`–… (seconds) | Maximum time an `iobroker` observation query (`list instances` and the per-adapter `object get` that reads `installedFrom`) may run before it is aborted. If the query fails or times out, the install-failure policy fails safe — see [Adapter install failure policy](#adapter-install-failure-policy). `0` disables the timeout. |
+
+The image also recognizes a set of low-level tuning knobs (install timeouts,
+pacing, the package.json snapshot watcher, and the node_modules self-heal) that
+have safe defaults and should normally be left unset. They are documented
+separately under [Troubleshooting-only variables](#troubleshooting-only-variables).
 
 ### Multihost master: slave isolation during startup
 
@@ -196,6 +198,58 @@ adapter/instance) — or relax the policy — and recreate the container.
   honored — only the container runtime can assign the UID/GID at start. The
   image supports arbitrary UIDs (OpenShift-style) via GID 0 group-writable data
   directories, so any `runAsUser` value works without extra configuration.
+
+## Troubleshooting-only variables
+
+These are low-level tuning knobs for the startup pipeline. **Do not set them for
+normal operation** — every one has a safe default chosen for the common case, and
+the image works correctly with all of them unset. Reach for them only when you
+are actively diagnosing a specific problem (a slow link, a contended database, a
+corrupted `node_modules`, an unusually large adapter install) and understand what
+you are changing. Setting them without a reason can slow startup or mask a real
+fault.
+
+| Variable | Default | Range / values | Purpose |
+|---|---|---|---|
+| `IOB_INSTALL_TIMEOUT` | `900` | `0`–… (seconds) | Maximum time a single adapter install/`iobroker url` attempt may run before it is aborted and retried (bounded by `IOB_INSTALL_LOCK_RETRIES`). Prevents a hung install from freezing the whole start. `0` disables the timeout (unbounded, legacy behavior). Raise it if one legitimately large adapter install on a very slow link can exceed the default. |
+| `IOB_INSTALL_SETTLE` | `2` | `0`–… (seconds) | Pause after each **successful** adapter install before the next one starts. During the pre-controller install phase each `iobroker install`/`iobroker url` call runs its own transient jsonl database server that file-locks `objects.jsonl`/`states.jsonl` and releases the lock slightly **after** the process exits; starting the next install immediately races that lagging release and can produce `Failed to lock DB file` or hang. The settle lets each server fully release before the next call opens the file. `0` disables it (only safe with a non-jsonl DB such as Redis, or when there is at most one adapter to install). |
+| `IOB_LIST_TIMEOUT` | `120` | `0`–… (seconds) | Maximum time an `iobroker` observation query (`list instances` and the per-adapter `object get` that reads `installedFrom`) may run before it is aborted. If the query fails or times out, the install-failure policy fails safe — see [Adapter install failure policy](#adapter-install-failure-policy). `0` disables the timeout. |
+| `IOB_PKG_WATCH_INTERVAL` | `10` | `0`–… (seconds) | Poll interval for the background watcher that keeps the `package.json` snapshot on the `node_modules` volume current (it copies `package.json` to the snapshot whenever its content changes, so an adapter installed via admin survives a later recreate). `0` disables the watcher entirely — do this only if you have a reason to stop snapshotting `package.json`; the recreate-prune protection then relies solely on the last snapshot restored at start. See [package.json persistence](#packagejson-persistence-across-recreate). |
+| `IOB_HEAL_NODE_MODULES` | `true` | `true` \| `false` | Whether startup runs one `npm install` (after restoring `package.json`, before js-controller) to rebuild any missing hoisted dependency in `node_modules` — the self-heal that clears `Cannot find module '<dep>'` after a tree was left incomplete. Set `false` to skip it (faster start, but a damaged tree is not repaired). See [package.json persistence](#packagejson-persistence-across-recreate). |
+| `IOB_HEAL_TIMEOUT` | `1800` | `0`–… (seconds) | Maximum time the self-heal `npm install` may run before it is aborted (and startup continues anyway). `0` disables the timeout. Raise it only if a legitimately large first-time heal on a very slow link exceeds the default. |
+
+### package.json persistence across recreate
+
+`node_modules` is a persistent volume, but `/opt/iobroker/package.json` lives in
+the container layer. A `docker restart` keeps the same layer (so the two stay in
+sync), but a recreate (`docker compose up` after a pull, `down`+`up`) starts a
+fresh layer that resets `package.json` to the image baseline while the volume
+still holds every adapter. The next `npm install` then treats the on-disk
+adapters as extraneous and **prunes** them, collapsing `node_modules` and forcing
+a full reinstall — a breakage that appears only after a recreate, never after a
+restart.
+
+To prevent this, the image keeps a byte-for-byte snapshot of `package.json`
+inside the `node_modules` volume (`.iob-package.json`) and, on every start before
+any npm/reconcile runs, copies it back over the reset file so nothing is
+extraneous to prune. A lightweight background watcher
+(`IOB_PKG_WATCH_INTERVAL`) keeps that snapshot current as `package.json` changes
+at runtime (e.g. an adapter installed via admin), so the next recreate restores
+the real manifest. The snapshot is captured verbatim rather than reconstructed
+from `node_modules`, because dependency specs are heterogeneous (`github:`,
+`npm:` aliases, ranges, pinned versions, vendor renames) and cannot be reliably
+rebuilt by inspecting the installed tree.
+
+Separately, `IOB_HEAL_NODE_MODULES` controls a one-shot `npm install` at startup
+that repairs a `node_modules` tree left **already** incomplete by an earlier
+prune (adapters depend on shared libraries npm hoists to the top level, e.g.
+`express`, `@iobroker/adapter-core`; if those were pruned, the adapter crashes
+with `Cannot find module '<dep>'` even though its own directory is present). It
+prunes nothing and is a fast no-op when the tree is already consistent; the first
+run after damage may take several minutes and logs that it is in progress.
+
+No additional volume is required for any of this — the snapshot lives inside the
+`node_modules` volume you already have.
 
 ## Database backends and multihost
 
