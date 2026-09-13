@@ -778,26 +778,39 @@ run() {
   return "${rc}"
 }
 
-# run_install: like `run`, but retries specifically on the jsonl DB-file LOCK
-# race that occurs during the pre-controller install phase.
+# run_install: like `run`, but retries the TRANSIENT pre-controller DB races that
+# an `iobroker install`/`iobroker url` invocation can hit while js-controller is
+# not yet running. Two flavours, depending on the configured DB backend:
 #
-# Why this is needed: on a multihost master the objects/states DB host is
-# 0.0.0.0 (network mode). js-controller is NOT running yet during reconcile, so
-# every `iobroker install`/`iobroker url` invocation stands up its OWN transient
-# in-memory jsonl server that opens and file-LOCKS objects.jsonl / states.jsonl
-# for the duration of that one CLI call, then releases the lock as the process
-# exits. Because that release is not perfectly synchronous with process exit
-# (the server shuts down slightly after the CLI returns), the NEXT sequential
-# install can start and try to lock the same file while the previous server is
-# still tearing down, and fail with:
-#     Server Cannot start inMem-objects on port 9001: Failed to lock DB file "...objects.jsonl"!
-# This is a timing race, not a genuine failure — the file is simply held for a
-# few more milliseconds. A remote slave that continuously reconnects to the
-# master's DB port keeps those transient servers alive a little longer, widening
-# the window (which is why it tends to strike only after several successful
-# installs). We absorb it by retrying the SAME command a few times with a short
-# backoff when — and only when — the output shows the lock error. Any other
-# failure returns immediately so real errors still surface to the caller.
+# 1. jsonl (file) backend — DB-file LOCK race. On a multihost master the
+#    objects/states DB host is 0.0.0.0 (network mode). js-controller is NOT
+#    running yet during reconcile, so every CLI invocation stands up its OWN
+#    transient in-memory jsonl server that opens and file-LOCKS objects.jsonl /
+#    states.jsonl for the duration of that one call, then releases the lock as
+#    the process exits. Because that release is not perfectly synchronous with
+#    process exit (the server shuts down slightly after the CLI returns), the
+#    NEXT sequential install can try to lock the same file while the previous
+#    server is still tearing down, and fail with:
+#        Server Cannot start inMem-objects on port 9001: Failed to lock DB file "...objects.jsonl"!
+#    A remote slave that continuously reconnects to the master's DB port keeps
+#    those transient servers alive a little longer, widening the window (which
+#    is why it tends to strike only after several successful installs).
+#
+# 2. redis backend — transient CONNECTION drop. With a Redis-backed
+#    objects/states DB, the CLI connects to Redis for the call; while
+#    js-controller is not yet up (or is itself just starting) that connection
+#    can be reset or closed mid-operation, surfacing as an ioredis error such as:
+#        Error: Connection is closed.
+#    (also ECONNRESET / ECONNREFUSED / ETIMEDOUT). Observed in the wild: an
+#    `iobroker url` install of a single adapter failed on the first start with
+#    "Connection is closed." and then succeeded verbatim after a container
+#    restart — the hallmark of a startup timing race, not a real failure.
+#
+# Both are timing races, not genuine failures, so we absorb them by retrying the
+# SAME command a few times with a short backoff when — and only when — the output
+# matches one of these known-transient patterns. Any OTHER failure (including
+# real Redis auth errors like NOAUTH/WRONGPASS) returns immediately so genuine
+# problems still surface to the caller.
 #
 # Captures combined output so it can both inspect it AND surface it to the log.
 IOB_INSTALL_LOCK_RETRIES="${IOB_INSTALL_LOCK_RETRIES:-6}"
@@ -860,15 +873,21 @@ run_install() {
       return "${rc}"
     fi
 
-    # Retry ONLY the DB-file lock race; everything else is a real failure.
-    if printf '%s' "${out}" | grep -qiE 'Failed to lock DB file|Cannot start inMem-(objects|states)'; then
+    # Retry ONLY the known-transient pre-controller DB races; everything else is
+    # a real failure. Two backends, two patterns (see the header comment):
+    #   * jsonl file-lock race: "Failed to lock DB file" / "Cannot start inMem-*"
+    #   * redis connection race: "Connection is closed" / ECONNRESET /
+    #     ECONNREFUSED / ETIMEDOUT. Deliberately NOT matched: NOAUTH / WRONGPASS
+    #     (genuine auth/config errors, never transient).
+    if printf '%s' "${out}" | grep -qiE \
+      'Failed to lock DB file|Cannot start inMem-(objects|states)|Connection is closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT'; then
       if [[ "${attempt}" -lt "${IOB_INSTALL_LOCK_RETRIES}" ]]; then
-        log "  DB file lock busy (attempt ${attempt}/${IOB_INSTALL_LOCK_RETRIES}); retrying in ${IOB_INSTALL_LOCK_BACKOFF}s"
+        log "  transient DB race (attempt ${attempt}/${IOB_INSTALL_LOCK_RETRIES}); retrying in ${IOB_INSTALL_LOCK_BACKOFF}s"
         sleep "${IOB_INSTALL_LOCK_BACKOFF}"
         attempt=$((attempt + 1))
         continue
       fi
-      log "  DB file lock still busy after ${IOB_INSTALL_LOCK_RETRIES} attempts; giving up on this command"
+      log "  transient DB race still failing after ${IOB_INSTALL_LOCK_RETRIES} attempts; giving up on this command"
     fi
     return "${rc}"
   done
