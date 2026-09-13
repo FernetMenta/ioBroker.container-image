@@ -305,8 +305,9 @@ RECONCILE_ENV=(
 # `restore` copies an authoritative package.json kept inside the persistent
 # node_modules volume back over the (possibly image-reset) file BEFORE any
 # npm/reconcile runs, re-syncing it with the volume so nothing prunes. It runs
-# here, before the reconcile passes and the DB config. `save` (after the install
-# phase) refreshes that persisted copy. See scripts/persist-package-json.sh.
+# here, before the reconcile passes and the DB config. A background `watch`
+# process (started before exec) keeps the snapshot current as package.json
+# changes at runtime. See scripts/persist-package-json.sh.
 # ---------------------------------------------------------------------------
 if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" restore; then
   log "package.json restore reported a problem (continuing; reconcile will recover any prune)"
@@ -633,12 +634,14 @@ fi
 restore_db_hosts
 trap - EXIT
 
-# Capture any adapter (re)installs from this start into the persisted manifest so
-# a future recreate restores a package.json that matches the node_modules volume
-# (see the persist-package-json.sh restore call after Step 1). Best-effort.
-if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" save; then
-  log "package.json save reported a problem (continuing)"
-fi
+# A background watcher (started just before exec, below) keeps the package.json
+# snapshot on the node_modules volume current: it copies package.json to the
+# snapshot whenever it changes at runtime (an adapter installed via admin, a
+# javascript-adapter module install, a js-controller rewrite). There is
+# deliberately no post-install "save" here: the reconcile install phase already
+# updated package.json, and the watcher captures that (and every later change)
+# verbatim, so the snapshot always reflects the real manifest for the next
+# recreate.
 
 # ---------------------------------------------------------------------------
 # 10. exec js-controller under tini.
@@ -674,5 +677,23 @@ omit the node_modules mount entirely. See docs/volumes-and-multihost.md."
 fi
 
 stage "Step 5 of 5: Starting ioBroker"
+
+# Start the package.json snapshot watcher in the BACKGROUND for the container's
+# lifetime. It copies /opt/iobroker/package.json to the snapshot on the
+# persistent node_modules volume whenever it changes (only on an actual change),
+# so adapters installed via admin at runtime — and any other manifest edit — are
+# captured for the next recreate. `exec` below replaces this shell with
+# js-controller, reparenting the watcher to tini (PID 1), which reaps it on
+# exit. Best-effort: launched with a guard so a failure to start never blocks
+# the controller. Disable by setting IOB_PKG_WATCH_INTERVAL=0.
+if [[ "${IOB_PKG_WATCH_INTERVAL:-10}" != "0" ]]; then
+  env "${RECONCILE_ENV[@]}" \
+    IOB_PKG_WATCH_INTERVAL="${IOB_PKG_WATCH_INTERVAL:-10}" \
+    "${SCRIPT_DIR}/persist-package-json.sh" watch &
+  log "started package.json snapshot watcher (pid $!)"
+else
+  log "package.json snapshot watcher disabled (IOB_PKG_WATCH_INTERVAL=0)"
+fi
+
 log "starting js-controller"
 exec node "${JS_CONTROLLER}" "$@"

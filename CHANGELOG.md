@@ -39,12 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sync, so the next `npm install` (reconcile OR a runtime adapter install) treats
   every adapter as extraneous and PRUNES it, collapsing `node_modules` and
   forcing a full reinstall (the "broken admin / reinstall all adapters only after
-  a recreate, never after a restart" symptom). An authoritative copy of
+  a recreate, never after a restart" symptom). A byte-for-byte SNAPSHOT of
   `package.json` is now kept inside the persistent `node_modules` volume
-  (`.iob-package.json`) and restored over the reset file on every start BEFORE
-  any npm/reconcile runs, re-syncing it with the volume so nothing prunes; it is
-  refreshed after the install phase to capture new installs. No extra volume is
-  required. See `scripts/persist-package-json.sh`, covered by
+  (`.iob-package.json`) and copied over the reset file on every start BEFORE any
+  npm/reconcile runs, re-syncing it with the volume so nothing prunes. The
+  snapshot is kept current by a lightweight background watcher that copies
+  `package.json` to it whenever its content changes at runtime (an adapter
+  installed via admin, a javascript-adapter module install, a js-controller
+  rewrite), so the next recreate restores the real manifest — including adapters
+  added after the last start. The snapshot is captured VERBATIM rather than
+  reconstructed from `node_modules`: dependency specs are heterogeneous
+  (`github:`, `npm:` aliases, ranges, pinned, vendor renames) and cannot be
+  reliably rebuilt by inspecting the installed tree. No extra volume is required;
+  the watcher poll interval is `IOB_PKG_WATCH_INTERVAL` (default 10s, `0`
+  disables it). See `scripts/persist-package-json.sh`, covered by
   `test/smoke/persist-package-json.sh`.
 - Reconciliation now detects and repairs a **present-but-incomplete** adapter
   install instead of trusting bare directory presence. An interrupted

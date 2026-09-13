@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # persist-package-json.sh (smoke) - verify package.json survives a container
-# RECREATE so the node_modules volume never gets pruned.
+# RECREATE (restore) and that the watcher captures runtime changes (watch),
+# using verbatim copies (no rebuild/guessing).
 #
-# WHY THIS TEST EXISTS
-# --------------------
-# node_modules is a persistent volume; package.json is not. A recreate resets
-# package.json to the image baseline (1 dependency) while node_modules still
-# holds every adapter, and the next `npm install` prunes the "extraneous"
-# adapters. scripts/persist-package-json.sh keeps an authoritative copy inside
-# the node_modules volume and restores it on start BEFORE anything prunes. This
-# test drives that script through the exact restart/recreate/first-start cases.
-#
-# Drives the real scripts/persist-package-json.sh against temp dirs (no docker,
-# no npm, no network), so it never skips.
+# scripts/persist-package-json.sh keeps a byte-for-byte snapshot of package.json
+# inside the persistent node_modules volume. `restore` copies the snapshot over
+# the (image-reset) package.json on start so the next npm cannot prune adapters;
+# `watch` copies package.json to the snapshot whenever it changes at runtime
+# (only on an actual change), so an adapter installed via admin is captured for
+# the next recreate. Drives the real script against temp dirs (no docker/npm/
+# network), so it never skips.
 #
 # Exit codes: 0 all cases held; 1 a regression.
 set -u
@@ -24,14 +21,13 @@ PERSIST_SH="${REPO_ROOT}/scripts/persist-package-json.sh"
 PASS_PREFIX="persist-package-json: PASS:"
 FAIL_PREFIX="persist-package-json: FAIL:"
 
-if [[ ! -x "${PERSIST_SH}" ]] && [[ ! -r "${PERSIST_SH}" ]]; then
+if [[ ! -r "${PERSIST_SH}" ]]; then
   echo "${FAIL_PREFIX} cannot find ${PERSIST_SH}" >&2
   exit 1
 fi
 
 fail=""
 
-# Each case runs in its own fake IOB_ROOT with a node_modules subdir.
 new_root() {
   local root
   root="$(mktemp -d 2>/dev/null || echo "/tmp/iac-persist.$$.${RANDOM}")"
@@ -39,87 +35,117 @@ new_root() {
   printf '%s' "${root}"
 }
 
-run_persist() {
-  local root="$1" action="$2"
+run_restore() {
+  local root="$1"
   IOB_ROOT="${root}" \
   IOB_NODE_MODULES_DIR="${root}/node_modules" \
   IOB_PKG_JSON="${root}/package.json" \
-  IOB_PKG_JSON_PERSIST="${root}/node_modules/.iob-package.json" \
-    bash "${PERSIST_SH}" "${action}" >/dev/null 2>&1
+  IOB_PKG_JSON_SNAPSHOT="${root}/node_modules/.iob-package.json" \
+    bash "${PERSIST_SH}" restore >/dev/null 2>&1
 }
 
-# deps_count <file> : number of top-level keys in the JSON "dependencies" object,
-# via a tiny awk-free node-free parser using grep (the fixtures are simple, one
-# dependency per line).
-deps_count() {
-  local f="$1"
-  [[ -r "${f}" ]] || { printf '%s' "-1"; return; }
-  # count only the dependency entries the fixtures write (iobroker.dep<N>), so
-  # the surrounding "name"/etc. fields are not miscounted as dependencies.
-  grep -cE '"iobroker\.dep[0-9]+"[[:space:]]*:' "${f}"
-}
-
-# write_pkg <file> <n> : write a package.json-ish file with n dependency lines.
-write_pkg() {
-  local f="$1" n="$2" i
-  {
-    printf '{\n  "name": "iobroker.inst",\n  "dependencies": {\n'
-    for ((i = 1; i <= n; i++)); do
-      if [[ "${i}" -lt "${n}" ]]; then
-        printf '    "iobroker.dep%d": "1.0.0",\n' "${i}"
-      else
-        printf '    "iobroker.dep%d": "1.0.0"\n' "${i}"
-      fi
-    done
-    printf '  }\n}\n'
-  } >"${f}"
-}
+# marker <file> : print a stable content marker we can compare (the whole file).
+content() { cat -- "$1" 2>/dev/null || printf ''; }
 
 check() {
   local desc="$1" got="$2" want="$3"
   if [[ "${got}" == "${want}" ]]; then
-    printf '  ok   %-55s (deps=%s)\n' "${desc}" "${got}"
+    printf '  ok   %-52s\n' "${desc}"
   else
-    printf '  FAIL %-55s want=%s got=%s\n' "${desc}" "${want}" "${got}" >&2
+    printf '  FAIL %-52s want=[%s] got=[%s]\n' "${desc}" "${want}" "${got}" >&2
     fail="${fail} [${desc}]"
   fi
 }
 
-echo "=== persist-package-json ==="
+echo "=== persist-package-json (restore) ==="
 
-# --- Case 1: first start seeds the persisted copy from the current file. -----
+# --- Case 1: first start seeds the snapshot verbatim from package.json. -------
 r1="$(new_root)"
-write_pkg "${r1}/package.json" 32          # image already grown / full
-run_persist "${r1}" restore
-check "first start seeds persisted copy" "$(deps_count "${r1}/node_modules/.iob-package.json")" "32"
-check "first start leaves live file intact" "$(deps_count "${r1}/package.json")" "32"
+printf 'PKG-FULL-35\n' >"${r1}/package.json"
+run_restore "${r1}"
+check "first start seeds snapshot verbatim" "$(content "${r1}/node_modules/.iob-package.json")" "PKG-FULL-35"
+check "first start leaves package.json intact" "$(content "${r1}/package.json")" "PKG-FULL-35"
 rm -rf -- "${r1}"
 
-# --- Case 2: RECREATE restores the full manifest over an image-reset file. ---
-# Simulate: persisted copy has full set (32); live package.json was reset by the
-# fresh container layer to the image baseline (1). restore must bring it back.
+# --- Case 2: RECREATE restores the snapshot verbatim over the reset file. ----
 r2="$(new_root)"
-write_pkg "${r2}/node_modules/.iob-package.json" 32   # persisted (grown at runtime, on the volume)
-write_pkg "${r2}/package.json" 1                      # image baseline in the fresh layer
-run_persist "${r2}" restore
-check "recreate restores full package.json over reset" "$(deps_count "${r2}/package.json")" "32"
+printf 'PKG-FULL-35\n' >"${r2}/node_modules/.iob-package.json"   # snapshot (grown at runtime)
+printf 'PKG-BASELINE-1\n' >"${r2}/package.json"                  # image reset in fresh layer
+run_restore "${r2}"
+check "recreate restores full snapshot verbatim" "$(content "${r2}/package.json")" "PKG-FULL-35"
 rm -rf -- "${r2}"
 
-# --- Case 3: save captures runtime growth for the next recreate. -------------
+echo "=== persist-package-json (watch) ==="
+
+# --- Case 3: watch copies package.json to the snapshot ONLY on change. -------
 r3="$(new_root)"
-write_pkg "${r3}/node_modules/.iob-package.json" 20   # persisted lags behind
-write_pkg "${r3}/package.json" 33                     # runtime grew it further
-run_persist "${r3}" save
-check "save refreshes persisted copy from live file" "$(deps_count "${r3}/node_modules/.iob-package.json")" "33"
+printf 'PKG-V1\n' >"${r3}/package.json"
+printf 'PKG-V1\n' >"${r3}/node_modules/.iob-package.json"   # already in sync at watch start
+# Start the watcher with a short interval in the background.
+IOB_ROOT="${r3}" \
+IOB_NODE_MODULES_DIR="${r3}/node_modules" \
+IOB_PKG_JSON="${r3}/package.json" \
+IOB_PKG_JSON_SNAPSHOT="${r3}/node_modules/.iob-package.json" \
+IOB_PKG_WATCH_INTERVAL=1 \
+  bash "${PERSIST_SH}" watch >/dev/null 2>&1 &
+watch_pid=$!
+
+# Give the watcher a moment, then change package.json (ensure mtime advances).
+sleep 2
+printf 'PKG-V2-adminadapter\n' >"${r3}/package.json"
+touch -- "${r3}/package.json"
+# Wait for at least one poll cycle to capture it.
+sleep 3
+
+got3="$(content "${r3}/node_modules/.iob-package.json")"
+kill "${watch_pid}" 2>/dev/null || true
+wait "${watch_pid}" 2>/dev/null || true
+check "watch captures a runtime change to the snapshot" "${got3}" "PKG-V2-adminadapter"
 rm -rf -- "${r3}"
 
-# --- Case 4: restore after a save round-trips (idempotent sync). -------------
+# --- Case 3b: watch does NOT copy when only mtime changes (content same). ----
+# Detect a spurious copy by watching the snapshot's own mtime: if the watcher
+# rewrites it despite identical content, its mtime advances.
+r3b="$(new_root)"
+printf 'PKG-SAME\n' >"${r3b}/package.json"
+printf 'PKG-SAME\n' >"${r3b}/node_modules/.iob-package.json"
+snap_mtime_before="$(stat -c '%Y' "${r3b}/node_modules/.iob-package.json" 2>/dev/null)"
+IOB_ROOT="${r3b}" \
+IOB_NODE_MODULES_DIR="${r3b}/node_modules" \
+IOB_PKG_JSON="${r3b}/package.json" \
+IOB_PKG_JSON_SNAPSHOT="${r3b}/node_modules/.iob-package.json" \
+IOB_PKG_WATCH_INTERVAL=1 \
+  bash "${PERSIST_SH}" watch >/dev/null 2>&1 &
+wpid3b=$!
+sleep 1
+touch -- "${r3b}/package.json"   # bump mtime only; content unchanged
+sleep 3
+snap_mtime_after="$(stat -c '%Y' "${r3b}/node_modules/.iob-package.json" 2>/dev/null)"
+kill "${wpid3b}" 2>/dev/null || true
+wait "${wpid3b}" 2>/dev/null || true
+check "watch skips copy when content unchanged (mtime-only)" "${snap_mtime_after}" "${snap_mtime_before}"
+rm -rf -- "${r3b}"
+
+# --- Case 4: watch exits promptly on SIGTERM. --------------------------------
 r4="$(new_root)"
-write_pkg "${r4}/package.json" 30
-run_persist "${r4}" restore     # seeds 30
-write_pkg "${r4}/package.json" 1  # simulate recreate reset
-run_persist "${r4}" restore     # should restore 30
-check "seed then recreate-restore round-trips" "$(deps_count "${r4}/package.json")" "30"
+printf 'PKG-V1\n' >"${r4}/package.json"
+IOB_ROOT="${r4}" \
+IOB_NODE_MODULES_DIR="${r4}/node_modules" \
+IOB_PKG_JSON="${r4}/package.json" \
+IOB_PKG_JSON_SNAPSHOT="${r4}/node_modules/.iob-package.json" \
+IOB_PKG_WATCH_INTERVAL=5 \
+  bash "${PERSIST_SH}" watch >/dev/null 2>&1 &
+wpid=$!
+sleep 1
+kill -TERM "${wpid}" 2>/dev/null || true
+# Give it up to ~3s to exit; it should be well under the 5s poll interval.
+exited="no"
+for _ in 1 2 3; do
+  if ! kill -0 "${wpid}" 2>/dev/null; then exited="yes"; break; fi
+  sleep 1
+done
+wait "${wpid}" 2>/dev/null || true
+check "watch exits promptly on SIGTERM (< poll interval)" "${exited}" "yes"
 rm -rf -- "${r4}"
 
 echo "---"
@@ -128,6 +154,6 @@ if [[ -n "${fail}" ]]; then
   echo "=== persist-package-json FAILED ===" >&2
   exit 1
 fi
-echo "${PASS_PREFIX} package.json persists across recreate as expected"
+echo "${PASS_PREFIX} restore + watch behave correctly"
 echo "=== persist-package-json PASSED ==="
 exit 0
