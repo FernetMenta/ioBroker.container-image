@@ -41,6 +41,8 @@ run_restore() {
   IOB_NODE_MODULES_DIR="${root}/node_modules" \
   IOB_PKG_JSON="${root}/package.json" \
   IOB_PKG_JSON_SNAPSHOT="${root}/node_modules/.iob-package.json" \
+  IOB_PKG_LOCK="${root}/package-lock.json" \
+  IOB_PKG_LOCK_SNAPSHOT="${root}/node_modules/.iob-package-lock.json" \
     bash "${PERSIST_SH}" restore >/dev/null 2>&1
 }
 
@@ -75,32 +77,62 @@ run_restore "${r2}"
 check "recreate restores full snapshot verbatim" "$(content "${r2}/package.json")" "PKG-FULL-35"
 rm -rf -- "${r2}"
 
+# --- Case 2-lock: RECREATE restores package-lock.json as the coherent pair. --
+r2l="$(new_root)"
+printf 'PKG-FULL-35\n' >"${r2l}/node_modules/.iob-package.json"        # pkg snapshot
+printf 'LOCK-FULL-35\n' >"${r2l}/node_modules/.iob-package-lock.json"  # lock snapshot
+printf 'PKG-BASELINE-1\n' >"${r2l}/package.json"                       # image reset
+printf 'LOCK-BASELINE-1\n' >"${r2l}/package-lock.json"                 # image reset
+run_restore "${r2l}"
+check "recreate restores package.json verbatim" "$(content "${r2l}/package.json")" "PKG-FULL-35"
+check "recreate restores package-lock.json verbatim" "$(content "${r2l}/package-lock.json")" "LOCK-FULL-35"
+# The restored lockfile must not be older than package.json (npm staleness).
+pkg_mtime="$(stat -c '%Y' "${r2l}/package.json" 2>/dev/null)"
+lock_mtime="$(stat -c '%Y' "${r2l}/package-lock.json" 2>/dev/null)"
+if [[ -n "${pkg_mtime}" && -n "${lock_mtime}" && "${lock_mtime}" -ge "${pkg_mtime}" ]]; then ok_pair="yes"; else ok_pair="no"; fi
+check "restored lockfile is not older than package.json" "${ok_pair}" "yes"
+rm -rf -- "${r2l}"
+
+# --- Case 2-lock-seed: first start seeds the lock snapshot from the live file. -
+r2ls="$(new_root)"
+printf 'LOCK-LIVE-9\n' >"${r2ls}/package-lock.json"   # live lockfile, no snapshot yet
+run_restore "${r2ls}"
+check "first start seeds lock snapshot verbatim" "$(content "${r2ls}/node_modules/.iob-package-lock.json")" "LOCK-LIVE-9"
+rm -rf -- "${r2ls}"
+
 echo "=== persist-package-json (watch) ==="
 
 # --- Case 3: watch copies package.json to the snapshot ONLY on change. -------
 r3="$(new_root)"
 printf 'PKG-V1\n' >"${r3}/package.json"
 printf 'PKG-V1\n' >"${r3}/node_modules/.iob-package.json"   # already in sync at watch start
+printf 'LOCK-V1\n' >"${r3}/package-lock.json"
+printf 'LOCK-V1\n' >"${r3}/node_modules/.iob-package-lock.json"
 # Start the watcher with a short interval in the background.
 IOB_ROOT="${r3}" \
 IOB_NODE_MODULES_DIR="${r3}/node_modules" \
 IOB_PKG_JSON="${r3}/package.json" \
 IOB_PKG_JSON_SNAPSHOT="${r3}/node_modules/.iob-package.json" \
+IOB_PKG_LOCK="${r3}/package-lock.json" \
+IOB_PKG_LOCK_SNAPSHOT="${r3}/node_modules/.iob-package-lock.json" \
 IOB_PKG_WATCH_INTERVAL=1 \
   bash "${PERSIST_SH}" watch >/dev/null 2>&1 &
 watch_pid=$!
 
-# Give the watcher a moment, then change package.json (ensure mtime advances).
+# Give the watcher a moment, then change both files (an install rewrites both).
 sleep 2
 printf 'PKG-V2-adminadapter\n' >"${r3}/package.json"
-touch -- "${r3}/package.json"
+printf 'LOCK-V2-adminadapter\n' >"${r3}/package-lock.json"
+touch -- "${r3}/package.json" "${r3}/package-lock.json"
 # Wait for at least one poll cycle to capture it.
 sleep 3
 
 got3="$(content "${r3}/node_modules/.iob-package.json")"
+got3lock="$(content "${r3}/node_modules/.iob-package-lock.json")"
 kill "${watch_pid}" 2>/dev/null || true
 wait "${watch_pid}" 2>/dev/null || true
-check "watch captures a runtime change to the snapshot" "${got3}" "PKG-V2-adminadapter"
+check "watch captures a package.json change to the snapshot" "${got3}" "PKG-V2-adminadapter"
+check "watch captures a package-lock.json change to the snapshot" "${got3lock}" "LOCK-V2-adminadapter"
 rm -rf -- "${r3}"
 
 # --- Case 3b: watch does NOT copy when only mtime changes (content same). ----

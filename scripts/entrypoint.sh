@@ -302,12 +302,14 @@ RECONCILE_ENV=(
 # adapter as extraneous and forces a full reinstall. This is why the breakage
 # appears only after a recreate, never after a restart.
 #
-# `restore` copies an authoritative package.json kept inside the persistent
-# node_modules volume back over the (possibly image-reset) file BEFORE any
-# npm/reconcile runs, re-syncing it with the volume so nothing prunes. It runs
-# here, before the reconcile passes and the DB config. A background `watch`
-# process (started before exec) keeps the snapshot current as package.json
-# changes at runtime. See scripts/persist-package-json.sh.
+# `restore` copies an authoritative package.json AND package-lock.json kept
+# inside the persistent node_modules volume back over the (possibly image-reset)
+# files BEFORE any npm/reconcile runs, re-syncing them with the volume so nothing
+# prunes and npm sees an up-to-date tree (restoring package.json alone leaves npm
+# without a matching lockfile, so it re-resolves and reinstalls the whole tree).
+# It runs here, before the reconcile passes and the DB config. A background
+# `watch` process (started before exec) keeps both snapshots current as the files
+# change at runtime. See scripts/persist-package-json.sh.
 # ---------------------------------------------------------------------------
 if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" restore; then
   log "package.json restore reported a problem (continuing; reconcile will recover any prune)"
@@ -635,13 +637,13 @@ restore_db_hosts
 trap - EXIT
 
 # A background watcher (started just before exec, below) keeps the package.json
-# snapshot on the node_modules volume current: it copies package.json to the
-# snapshot whenever it changes at runtime (an adapter installed via admin, a
-# javascript-adapter module install, a js-controller rewrite). There is
+# and package-lock.json snapshots on the node_modules volume current: it copies
+# each to its snapshot whenever it changes at runtime (an adapter installed via
+# admin, a javascript-adapter module install, a js-controller rewrite). There is
 # deliberately no post-install "save" here: the reconcile install phase already
-# updated package.json, and the watcher captures that (and every later change)
-# verbatim, so the snapshot always reflects the real manifest for the next
-# recreate.
+# updated both files, and the watcher captures those (and every later change)
+# verbatim, so the snapshots always reflect the real manifest + lockfile for the
+# next recreate.
 
 # ---------------------------------------------------------------------------
 # 10. exec js-controller under tini.

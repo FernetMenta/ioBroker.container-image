@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# persist-package-json.sh - keep /opt/iobroker/package.json alive across a
-# container RECREATE by capturing it verbatim into the persistent node_modules
-# volume and restoring it on start.
+# persist-package-json.sh - keep /opt/iobroker/package.json and its sibling
+# /opt/iobroker/package-lock.json alive across a container RECREATE by capturing
+# them verbatim into the persistent node_modules volume and restoring them on
+# start.
 #
 # THE PROBLEM
 # -----------
@@ -45,10 +46,17 @@
 #             reflects the latest real manifest for the next recreate. It only
 #             writes when the file actually changed.
 #
-# A dotfile + COPY (not a symlink) is deliberate: npm/js-controller write
-# package.json atomically (write temp + rename), which would silently replace a
-# symlink with a regular file. Because the writes are atomic, the watcher only
-# ever copies a complete file, never a half-written one.
+# package-lock.json is handled IDENTICALLY and as the COHERENT PAIR of
+# package.json: it lives next to package.json in the same reset layer, and it is
+# npm's record of the resolved tree. If only package.json is restored, npm finds
+# no matching lockfile, judges the tree out of date, and re-resolves/reinstalls
+# everything on recreate — even though the node_modules volume is correct (a
+# restart proves it). Restoring both keeps npm on its `up to date` fast path.
+#
+# A dotfile + COPY (not a symlink) is deliberate: npm/js-controller write these
+# files atomically (write temp + rename), which would silently replace a symlink
+# with a regular file. Because the writes are atomic, the watcher only ever
+# copies a complete file, never a half-written one.
 #
 # All operations are BEST-EFFORT: failures are logged and do not block startup
 # (worst case is the pre-fix behavior, which reconcile's completeness check and
@@ -62,6 +70,8 @@
 #   IOB_NODE_MODULES_DIR   node_modules dir     (default $IOB_ROOT/node_modules)
 #   IOB_PKG_JSON           package.json path    (default $IOB_ROOT/package.json)
 #   IOB_PKG_JSON_SNAPSHOT  snapshot path        (default $IOB_NODE_MODULES_DIR/.iob-package.json)
+#   IOB_PKG_LOCK           package-lock.json    (default $IOB_ROOT/package-lock.json)
+#   IOB_PKG_LOCK_SNAPSHOT  lock snapshot path   (default $IOB_NODE_MODULES_DIR/.iob-package-lock.json)
 #   IOB_PKG_WATCH_INTERVAL watch poll seconds   (default 10)
 set -u
 
@@ -69,6 +79,11 @@ IOB_ROOT="${IOB_ROOT:-/opt/iobroker}"
 IOB_NODE_MODULES_DIR="${IOB_NODE_MODULES_DIR:-${IOB_ROOT}/node_modules}"
 IOB_PKG_JSON="${IOB_PKG_JSON:-${IOB_ROOT}/package.json}"
 IOB_PKG_JSON_SNAPSHOT="${IOB_PKG_JSON_SNAPSHOT:-${IOB_NODE_MODULES_DIR}/.iob-package.json}"
+# package-lock.json sits next to package.json in $IOB_ROOT and is reset on the
+# same recreate, so it is snapshotted/restored identically. Both must be put
+# back as a coherent pair or npm judges the tree out of date and reinstalls it.
+IOB_PKG_LOCK="${IOB_PKG_LOCK:-${IOB_ROOT}/package-lock.json}"
+IOB_PKG_LOCK_SNAPSHOT="${IOB_PKG_LOCK_SNAPSHOT:-${IOB_NODE_MODULES_DIR}/.iob-package-lock.json}"
 IOB_PKG_WATCH_INTERVAL="${IOB_PKG_WATCH_INTERVAL:-10}"
 
 log() { printf 'persist-package-json: %s\n' "$*"; }
@@ -102,6 +117,27 @@ do_restore() {
   else
     log "no package.json at ${IOB_PKG_JSON} and no snapshot; nothing to do"
   fi
+
+  # package-lock.json: identical restore-or-seed, as the coherent pair of
+  # package.json. Restored AFTER package.json (and touched) so its mtime is not
+  # older than package.json's — npm treats a lockfile older than package.json as
+  # stale and re-resolves the whole tree, which is exactly what we prevent.
+  if [[ -f "${IOB_PKG_LOCK_SNAPSHOT}" ]]; then
+    if cp -f -- "${IOB_PKG_LOCK_SNAPSHOT}" "${IOB_PKG_LOCK}" 2>/dev/null; then
+      touch -- "${IOB_PKG_LOCK}" 2>/dev/null || true
+      log "restored package-lock.json from snapshot ${IOB_PKG_LOCK_SNAPSHOT} (paired with package.json so npm sees an up-to-date tree; skips the full reinstall)"
+    else
+      log "WARNING could not restore package-lock.json from ${IOB_PKG_LOCK_SNAPSHOT}; npm may re-resolve and reinstall on this start (self-heal will recover, but slowly)"
+    fi
+  elif [[ -f "${IOB_PKG_LOCK}" ]]; then
+    if cp -f -- "${IOB_PKG_LOCK}" "${IOB_PKG_LOCK_SNAPSHOT}" 2>/dev/null; then
+      log "seeded snapshot ${IOB_PKG_LOCK_SNAPSHOT} from current package-lock.json (first start; will survive future recreates)"
+    else
+      log "WARNING could not seed snapshot ${IOB_PKG_LOCK_SNAPSHOT} (continuing)"
+    fi
+  else
+    log "no package-lock.json at ${IOB_PKG_LOCK} and no snapshot; nothing to do"
+  fi
   return 0
 }
 
@@ -118,16 +154,25 @@ do_watch() {
   local running=1
   trap 'running=0' TERM INT
 
-  log "watching ${IOB_PKG_JSON} for changes (every ${interval}s); snapshot -> ${IOB_PKG_JSON_SNAPSHOT}"
+  log "watching ${IOB_PKG_JSON} + ${IOB_PKG_LOCK} for changes (every ${interval}s); snapshots -> ${IOB_PKG_JSON_SNAPSHOT}, ${IOB_PKG_LOCK_SNAPSHOT}"
 
   while [[ "${running}" -eq 1 ]]; do
-    # Copy ONLY when package.json differs in content from the snapshot, so an
-    # atomic rewrite that does not change the bytes produces no spurious copy.
+    # Copy ONLY when a file differs in content from its snapshot, so an atomic
+    # rewrite that does not change the bytes produces no spurious copy. Each of
+    # package.json / package-lock.json is captured independently on its own
+    # change (an install rewrites both; a dedupe may touch only the lockfile).
     if files_differ "${IOB_PKG_JSON}" "${IOB_PKG_JSON_SNAPSHOT}"; then
       if cp -f -- "${IOB_PKG_JSON}" "${IOB_PKG_JSON_SNAPSHOT}" 2>/dev/null; then
         log "package.json changed; updated snapshot ${IOB_PKG_JSON_SNAPSHOT}"
       else
         log "WARNING package.json changed but snapshot update failed (will retry)"
+      fi
+    fi
+    if files_differ "${IOB_PKG_LOCK}" "${IOB_PKG_LOCK_SNAPSHOT}"; then
+      if cp -f -- "${IOB_PKG_LOCK}" "${IOB_PKG_LOCK_SNAPSHOT}" 2>/dev/null; then
+        log "package-lock.json changed; updated snapshot ${IOB_PKG_LOCK_SNAPSHOT}"
+      else
+        log "WARNING package-lock.json changed but snapshot update failed (will retry)"
       fi
     fi
     # Sleep in the background and wait, so a TERM interrupts the wait promptly.
