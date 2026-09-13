@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reconciliation now detects and repairs a **present-but-incomplete** adapter
+  install instead of trusting bare directory presence. An interrupted
+  `npm install`, an npm prune that stripped a package's files, or a truncated
+  copy can leave `node_modules/iobroker.<name>` in place while its contents are
+  incomplete. The old "is the directory there?" check counted such a tree as
+  installed, so reconciliation SKIPPED it and js-controller crashed at runtime
+  on the missing files — most visibly `iobroker.admin` whose built UI directory
+  `adminWww/` was gone, throwing
+  `ENOENT ... scandir '.../iobroker.admin/adminWww'` on every request while
+  reconcile reported "no actions". An adapter now counts as installed only when
+  its package is COMPLETE (`package.json` readable AND the entry point its
+  `main` field declares, default `main.js`, exists on disk); an incomplete tree
+  is treated as missing so the planner reinstalls it. The install path also
+  `rm -rf`s a present-but-incomplete directory before `iobroker install` /
+  `iobroker url`, because npm would otherwise see the requested version as
+  already satisfied and short-circuit to "up to date" WITHOUT re-extracting the
+  tarball — so a reinstall now actually repairs the tree rather than leaving it
+  broken. Covered by `test/smoke/installed-adapters-complete.sh`.
 - Multihost master install phase no longer floods the log with `Objects DB is not
   allowed to start in the current Multihost environment` and
   `connect ECONNREFUSED 127.0.0.1:9001`. On a master, `multihostService.enabled`

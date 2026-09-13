@@ -636,13 +636,70 @@ source_is_url() {
   esac
 }
 
-# installed_adapters: adapter names currently PRESENT under node_modules,
-# observed from directory content (independent of mount state). ioBroker adapter
+# adapter_dir_complete: is the on-disk package at node_modules/iobroker.<name> a
+# COMPLETE, usable install rather than a present-but-partial tree?
+#
+# WHY THIS MATTERS: an interrupted `npm install`, an npm prune that removed a
+# package's files, or a copy that was cut short can leave the top-level
+# `iobroker.<name>` DIRECTORY in place while its contents are incomplete. A bare
+# presence check (`is the directory there?`) then reports the adapter as
+# installed, so reconciliation SKIPS it and js-controller later crashes at
+# runtime on the missing files — e.g. iobroker.admin whose built UI directory
+# `adminWww/` is gone throws `ENOENT ... scandir '.../iobroker.admin/adminWww'`
+# on every request. Treating such a tree as "installed" also means a reinstall
+# never runs to repair it. We therefore require the minimal invariants of a
+# usable adapter package before counting it:
+#
+#   1. package.json is present and readable (the npm package manifest), and
+#   2. the file its `main` field points at exists (default `main.js` when the
+#      field is absent, matching Node's resolution) — i.e. the adapter's entry
+#      point is actually on disk, not just the directory shell.
+#
+# This is intentionally minimal (manifest + entry point) rather than a deep file
+# census: it reliably catches the "directory present but tree truncated" class
+# without needing to know each adapter's full file list. An incomplete tree
+# fails the check, so installed_adapters() omits it, the planner sees it as
+# missing, and the install path (which removes the stale dir first) re-extracts
+# a complete package. (Fixes the adminWww crash / non-self-healing reinstall.)
+adapter_dir_complete() {
+  local dir="$1"
+  [[ -d "${dir}" ]] || return 1
+  local pkg="${dir}/package.json"
+  [[ -r "${pkg}" ]] || return 1
+  # Resolve the entry point from package.json `main` (default main.js) and
+  # require it to exist. node is always present in this image; if it somehow is
+  # not, fall back to requiring package.json only rather than failing closed.
+  if command -v node >/dev/null 2>&1; then
+    local main_rel
+    main_rel="$(IOB_ADC_PKG="${pkg}" node -e '
+      try {
+        const m = require(process.env.IOB_ADC_PKG).main;
+        process.stdout.write(typeof m === "string" && m.length ? m : "main.js");
+      } catch { process.stdout.write("main.js"); }
+    ' 2>/dev/null)" || main_rel="main.js"
+    [[ -n "${main_rel}" ]] || main_rel="main.js"
+    [[ -e "${dir}/${main_rel}" ]] || return 1
+  fi
+  return 0
+}
+
+# installed_adapters: adapter names whose code is present AND complete under
+# node_modules (see adapter_dir_complete for what "complete" means). A
+# present-but-partial `iobroker.<name>` is deliberately NOT reported, so the
+# planner treats it as missing and the install path repairs it. ioBroker adapter
 # packages are published as `iobroker.<name>` directories.
 installed_adapters() {
   [[ -d "${IOB_NODE_MODULES_DIR}" ]] || return 0
-  find "${IOB_NODE_MODULES_DIR}" -maxdepth 1 -type d -name 'iobroker.*' -printf '%f\n' 2>/dev/null |
-    sed 's/^iobroker\.//' || true
+  local dir name
+  # -maxdepth 1 -type d matches only real top-level package directories (a
+  # symlink is -type l and would not be a normal adapter install here).
+  while IFS= read -r dir; do
+    [[ -n "${dir}" ]] || continue
+    adapter_dir_complete "${dir}" || continue
+    name="${dir##*/iobroker.}"
+    printf '%s\n' "${name}"
+  done < <(find "${IOB_NODE_MODULES_DIR}" -maxdepth 1 -type d -name 'iobroker.*' 2>/dev/null) |
+    sort -u || true
 }
 
 # native_modules: native modules subject to an ABI rebuild. Names the affected
@@ -1073,6 +1130,26 @@ while IFS=$'\t' read -r action args_rest; do
               tolerate-all) : ;;
             esac
           }
+
+          # Repair guard: if the adapter's directory is PRESENT but INCOMPLETE
+          # (adapter_dir_complete fails), npm would see the requested version as
+          # already satisfied and short-circuit to "up to date" WITHOUT
+          # re-extracting the tarball — leaving the partial tree unrepaired
+          # (this is exactly how a missing iobroker.admin/adminWww survives a
+          # reinstall). Remove the stale directory first so `iobroker install` /
+          # `iobroker url` re-extract a complete package. Only touch dirs that
+          # are present-but-incomplete: a complete dir would not be in the
+          # install list (installed_adapters counts it), and a wholly absent one
+          # needs no removal. Best-effort; a failed remove still lets the install
+          # attempt proceed.
+          adapter_dir="${IOB_NODE_MODULES_DIR}/iobroker.${adapter}"
+          if [[ -d "${adapter_dir}" ]] && ! adapter_dir_complete "${adapter_dir}"; then
+            log "  ${adapter}: present but incomplete install; removing ${adapter_dir} to force a clean re-extract"
+            if [[ "${IOB_RECONCILE_DRY_RUN}" != "true" ]]; then
+              rm -rf -- "${adapter_dir}" 2>/dev/null \
+                || log "  ${adapter}: WARNING could not remove ${adapter_dir}; reinstall may not repair the tree"
+            fi
+          fi
 
           src="$(adapter_install_source "${adapter}")"
           if source_is_url "${src}"; then
