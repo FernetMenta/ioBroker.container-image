@@ -300,12 +300,28 @@ IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
 # port/lock open, so the NEXT install cannot acquire it — producing "Failed to
 # lock DB file" errors that no retry can win, and the whole start hangs.
 #
-# The fix: for the install phase ONLY, bind the objects/states DB to loopback
-# (`127.0.0.1`). The transient servers then listen only inside the container, so a
-# slave hitting the master's LAN address is connection-refused and cannot
-# interfere. The original hosts are restored right before we `exec` js-controller,
-# so the master serves its slaves normally once it is actually up. Ports are left
-# unchanged; only the host is narrowed.
+# The fix has TWO parts, both applied for the install phase ONLY and both
+# reverted before we `exec` js-controller:
+#
+#   (a) bind the objects/states DB to loopback (`127.0.0.1`). The transient
+#       servers then listen only inside the container, so a slave hitting the
+#       master's LAN address is connection-refused and cannot interfere.
+#
+#   (b) disable multihostService.enabled. This is the part that actually stops
+#       the scary error flood. `configure-db.sh` set enabled=true for a master;
+#       while it is true, every pre-controller CLI whose transient objects
+#       server overlaps the previous one hits js-controller's guard and throws
+#       "Objects DB is not allowed to start in the current Multihost
+#       environment" as an UNHANDLED rejection, tearing the connection down and
+#       spewing `ECONNREFUSED 127.0.0.1:9001` until the attempt times out. With
+#       enabled=false for the install phase, each transient server is a plain
+#       standalone jsonl server: the guard never fires, servers tear down
+#       cleanly, and the residual lock-race window shrinks dramatically. Our own
+#       multihostService.role marker is left intact so nothing else loses track
+#       of the configured role, and enabled=true is restored before exec so the
+#       master serves its slaves normally once it is actually up.
+#
+# Ports are left unchanged; only the host is narrowed and the flag toggled.
 #
 # ROLE-DRIVEN, not host-guessing: isolation is applied IFF this container is a
 # multihost MASTER (`multihostService.enabled === true` in iobroker.json — the
@@ -322,6 +338,7 @@ IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
 # loopback (which would silently cut off every slave after a bad start).
 DB_HOST_BACKUP=""          # "<objectsHost>\t<statesHost>" captured before isolation
 DB_HOSTS_ISOLATED=false    # whether we actually narrowed the hosts (needs restore)
+DB_MULTIHOST_DISABLED=false # whether we temporarily disabled multihostService.enabled (needs restore)
 
 # read_db_state: print "<objectsHost>\t<statesHost>\t<isMaster>" from iobroker.json
 # (host fields empty when absent; isMaster is "true"/"false"). isMaster reflects
@@ -338,6 +355,30 @@ read_db_state() {
       const master = !!(c.multihostService && c.multihostService.enabled === true);
       process.stdout.write(String(o) + '\t' + String(s) + '\t' + (master ? 'true' : 'false'));
     } catch { /* no output */ }
+  "
+}
+
+# set_multihost_enabled: set multihostService.enabled to the given boolean
+# ("true"/"false") in iobroker.json, leaving multihostService.role (our own
+# marker) and everything else untouched. Returns non-zero on failure. Used to
+# temporarily quiesce the master's multihost guard for the install phase (see
+# isolate_db_hosts_for_install) so the pre-controller CLI's transient jsonl
+# servers are plain standalone servers rather than tripping js-controller's
+# "Objects DB is not allowed to start in the current Multihost environment"
+# guard (which throws an unhandled rejection and spews ECONNREFUSED until the
+# attempt times out).
+set_multihost_enabled() {
+  local enabled="$1"
+  IOB_JSON_PATH="${IOB_JSON}" IOB_MH_ENABLED="${enabled}" run_node "
+    import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+    const path = process.env.IOB_JSON_PATH;
+    const c = JSON.parse(readFileSync(path, 'utf8'));
+    if (c.multihostService && typeof c.multihostService === 'object') {
+      c.multihostService.enabled = process.env.IOB_MH_ENABLED === 'true';
+    }
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, JSON.stringify(c, null, 2) + '\n');
+    renameSync(tmp, path);
   "
 }
 
@@ -371,17 +412,35 @@ isolate_db_hosts_for_install() {
   states_host="${rest%%$'\t'*}"
   is_master="${rest#*$'\t'}"
 
-  # Only a master hosts a network DB that a slave can latch onto; slave/standalone
-  # have nothing to isolate (and a slave's host points at the REMOTE master, which
-  # must not be rewritten).
+  # Only a master hosts a network DB that a slave can latch onto and only a master
+  # carries the multihostService.enabled flag that trips the DB guard; slave and
+  # standalone have nothing to isolate (and a slave's host points at the REMOTE
+  # master, which must not be rewritten).
   if [[ "${is_master}" != "true" ]]; then
     log "install-phase DB isolation: not a multihost master (objects='${obj_host}' states='${states_host}'); no isolation needed"
     return 0
   fi
 
-  # Already loopback on both? Then a slave cannot reach us regardless; nothing to
-  # narrow, and no restore needed. (A master persisted on loopback cannot serve
-  # slaves after startup, but that is a configuration choice, not ours to change.)
+  # Part (b): disable the multihost service flag for the install phase. This is
+  # done UNCONDITIONALLY for a master — including when the hosts are already
+  # loopback — because js-controller's "Objects DB is not allowed to start in the
+  # current Multihost environment" guard keys off multihostService.enabled, NOT
+  # off the host, so it fires (and floods ECONNREFUSED) even on a loopback-bound
+  # master. Only the `enabled` boolean is touched; our `role` marker is kept.
+  if set_multihost_enabled "false"; then
+    DB_MULTIHOST_DISABLED=true
+    log "install-phase DB isolation: multihostService.enabled disabled for the install phase" \
+      "(prevents the 'Objects DB is not allowed to start in the current Multihost environment' guard)"
+  else
+    log "install-phase DB isolation: WARNING could not disable multihostService.enabled in ${IOB_JSON};" \
+      "the install phase may log the multihost DB guard error and retry"
+  fi
+
+  # Part (a): narrow the DB hosts to loopback. If they are already loopback a
+  # slave cannot reach us regardless, so there is nothing to narrow and no host
+  # restore is needed. (A master persisted on loopback cannot serve slaves after
+  # startup, but that is a configuration choice, not ours to change.) Note this
+  # short-circuits ONLY the host narrowing; the flag toggle above already ran.
   local already_loopback=true
   case "${obj_host}" in ''|127.0.0.1|localhost|::1) : ;; *) already_loopback=false ;; esac
   case "${states_host}" in ''|127.0.0.1|localhost|::1) : ;; *) already_loopback=false ;; esac
@@ -404,22 +463,35 @@ isolate_db_hosts_for_install() {
   fi
 }
 
-# restore_db_hosts: put the original objects/states hosts back. Registered on
-# EXIT (and called explicitly before exec) so the master's public binding is
-# always restored, even if the install phase fails or the container is killed
-# mid-install. Idempotent: only acts when we actually isolated.
+# restore_db_hosts: undo BOTH parts of the install-phase isolation — put the
+# original objects/states hosts back AND re-enable multihostService.enabled.
+# Registered on EXIT (and called explicitly before exec) so the master's public
+# binding and multihost role are always restored, even if the install phase
+# fails or the container is killed mid-install. Idempotent: each part acts only
+# when it was actually applied. (Name kept for continuity with the EXIT trap.)
 restore_db_hosts() {
-  [[ "${DB_HOSTS_ISOLATED}" == "true" ]] || return 0
-  local obj_host states_host
-  obj_host="${DB_HOST_BACKUP%%$'\t'*}"
-  states_host="${DB_HOST_BACKUP#*$'\t'}"
-  if set_db_hosts "${obj_host}" "${states_host}"; then
-    log "install-phase DB isolation: restored objects/states hosts (objects='${obj_host}' states='${states_host}')"
-  else
-    log "install-phase DB isolation: WARNING could not restore original DB hosts in ${IOB_JSON};" \
-      "expected objects='${obj_host}' states='${states_host}' — check the file before slaves reconnect"
+  if [[ "${DB_HOSTS_ISOLATED}" == "true" ]]; then
+    local obj_host states_host
+    obj_host="${DB_HOST_BACKUP%%$'\t'*}"
+    states_host="${DB_HOST_BACKUP#*$'\t'}"
+    if set_db_hosts "${obj_host}" "${states_host}"; then
+      log "install-phase DB isolation: restored objects/states hosts (objects='${obj_host}' states='${states_host}')"
+    else
+      log "install-phase DB isolation: WARNING could not restore original DB hosts in ${IOB_JSON};" \
+        "expected objects='${obj_host}' states='${states_host}' — check the file before slaves reconnect"
+    fi
+    DB_HOSTS_ISOLATED=false
   fi
-  DB_HOSTS_ISOLATED=false
+
+  if [[ "${DB_MULTIHOST_DISABLED}" == "true" ]]; then
+    if set_multihost_enabled "true"; then
+      log "install-phase DB isolation: re-enabled multihostService.enabled (master serves slaves again)"
+    else
+      log "install-phase DB isolation: WARNING could not re-enable multihostService.enabled in ${IOB_JSON};" \
+        "the master will not serve slaves until this is fixed — check the file"
+    fi
+    DB_MULTIHOST_DISABLED=false
+  fi
 }
 
 # ---------------------------------------------------------------------------

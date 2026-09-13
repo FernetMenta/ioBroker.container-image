@@ -52,29 +52,49 @@ captured — are ignored for default resolution.
 
 Adapter installs run **before** js-controller starts. On a multihost **master**
 the objects/states jsonl database binds `host: 0.0.0.0` so slaves on the LAN can
-reach it (ports 9001/9000). During the install phase, every `iobroker` CLI call
-stands up its own transient jsonl server on those ports and briefly file-locks
-`objects.jsonl`/`states.jsonl`. If a slave is running and connected, it keeps
-those transient servers alive, holding the lock so the next install cannot
-acquire it — producing `Failed to lock DB file` errors that no retry can win, and
-the start can hang.
+reach it (ports 9001/9000), and `multihostService.enabled` is `true`. During the
+install phase, every `iobroker` CLI call stands up its own transient jsonl server
+on those ports and briefly file-locks `objects.jsonl`/`states.jsonl`. Two things
+can go wrong:
 
-To prevent this, the entrypoint temporarily binds the objects/states DB to
-`127.0.0.1` for the install phase only, then restores the original host right
-before starting js-controller. While installs run, a slave hitting the master's
-LAN address is refused, so it cannot interfere; once the master is actually up it
-serves slaves normally. The rewrite is a pure `iobroker.json` patch (ports
-unchanged) and is restored even if the install phase fails or the container is
-killed mid-install, so a master is never left stuck on loopback.
+- If a slave is running and connected, it keeps those transient servers alive,
+  holding the lock so the next install cannot acquire it — producing `Failed to
+  lock DB file` errors that no retry can win, and the start can hang.
+- Whenever two of the master's own transient servers briefly overlap, the second
+  one sees `multihostService.enabled === true` and js-controller refuses it with
+  **`Objects DB is not allowed to start in the current Multihost environment`**,
+  thrown as an unhandled rejection. The torn-down connection then floods the log
+  with `connect ECONNREFUSED 127.0.0.1:9001` until that attempt times out. The
+  install is retried and usually succeeds, so the start still completes, but it
+  looks alarming and adds minutes of dead time.
+
+To prevent both, the entrypoint applies two temporary changes to `iobroker.json`
+for the install phase only, then reverts them right before starting
+js-controller:
+
+1. **Bind the objects/states DB to `127.0.0.1`.** A slave hitting the master's
+   LAN address is refused, so it cannot interfere.
+2. **Set `multihostService.enabled` to `false`.** Each transient server is then a
+   plain standalone jsonl server: the multihost guard never fires, so there is no
+   unhandled rejection and no `ECONNREFUSED` flood, and servers tear down cleanly
+   (which also shrinks the residual file-lock race window). Our own
+   `multihostService.role` marker is left intact so the configured role is not
+   lost.
+
+Both changes are pure `iobroker.json` patches (ports unchanged) and are restored
+even if the install phase fails or the container is killed mid-install, so a
+master is never left stuck on loopback or with multihost disabled — once it is
+actually up it serves slaves normally.
 
 This isolation is driven by the persisted multihost **role**, not by guessing
 from the current host value: it applies only when this container is a master
 (`multihostService.enabled` in `iobroker.json`, set by the `IOB_MULTIHOST=master`
 configuration), and it applies unconditionally for a master — even if the host
-already reads `127.0.0.1` — so the slave lockout never depends on the current
-host happening to be non-loopback. A **slave** (whose objects/states host points
-at the remote master, and which therefore has no local DB to lock) and a
-**standalone** container (which has no slave to lock out) are left untouched.
+already reads `127.0.0.1` — because the multihost guard keys off the `enabled`
+flag, not the host, so it fires (and floods) even on a loopback-bound master. A
+**slave** (whose objects/states host points at the remote master, and which
+therefore has no local DB to lock) and a **standalone** container (which has no
+slave to lock out and no multihost flag set) are left untouched.
 
 Even with isolation in place, the pre-controller install phase paces successive
 installs (`IOB_INSTALL_SETTLE`) and bounds each DB call (`IOB_INSTALL_TIMEOUT`,

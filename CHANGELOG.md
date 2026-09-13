@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Multihost master install phase no longer floods the log with `Objects DB is not
+  allowed to start in the current Multihost environment` and
+  `connect ECONNREFUSED 127.0.0.1:9001`. On a master, `multihostService.enabled`
+  is `true`, and whenever two of the pre-controller install-time transient jsonl
+  servers briefly overlapped, js-controller's multihost guard rejected the second
+  one as an unhandled rejection and tore the connection down, spewing
+  `ECONNREFUSED` until the attempt timed out (the install was retried and usually
+  succeeded, but the start looked alarming and lost minutes). The install-phase
+  DB isolation now also sets `multihostService.enabled` to `false` for the
+  duration of the install phase (restored before js-controller starts, with the
+  `multihostService.role` marker left intact), so each transient server is a
+  plain standalone jsonl server: the guard never fires and servers tear down
+  cleanly, which also shrinks the residual file-lock race window. Restored even
+  on failure or a mid-install kill, so a master is never left with multihost
+  disabled. See
+  [docs/environment-variables.md](docs/environment-variables.md#multihost-master-slave-isolation-during-startup).
+
 ### Added
 
 - Multihost master keeps a running slave OUT during startup. Adapter installs run
