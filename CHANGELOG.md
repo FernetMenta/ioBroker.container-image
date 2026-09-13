@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Container **recreate** no longer prunes the persisted adapters out of
+  `node_modules`. `node_modules` is a persistent volume but `/opt/iobroker/
+  package.json` is not — it lives in the container layer. js-controller and
+  adapters (e.g. the javascript adapter installing script modules) grow
+  `package.json`'s dependency list at runtime to match the installed adapters. A
+  `docker restart` keeps the same layer, so that grown manifest survives and
+  stays in sync with the volume. A `docker compose up`/recreate starts a FRESH
+  layer, resetting `package.json` to the image baseline (only
+  `iobroker.js-controller`) while the volume still holds every adapter — out of
+  sync, so the next `npm install` (reconcile OR a runtime adapter install) treats
+  every adapter as extraneous and PRUNES it, collapsing `node_modules` and
+  forcing a full reinstall (the "broken admin / reinstall all adapters only after
+  a recreate, never after a restart" symptom). An authoritative copy of
+  `package.json` is now kept inside the persistent `node_modules` volume
+  (`.iob-package.json`) and restored over the reset file on every start BEFORE
+  any npm/reconcile runs, re-syncing it with the volume so nothing prunes; it is
+  refreshed after the install phase to capture new installs. No extra volume is
+  required. See `scripts/persist-package-json.sh`, covered by
+  `test/smoke/persist-package-json.sh`.
 - Reconciliation now detects and repairs a **present-but-incomplete** adapter
   install instead of trusting bare directory presence. An interrupted
   `npm install`, an npm prune that stripped a package's files, or a truncated

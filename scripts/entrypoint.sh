@@ -278,12 +278,39 @@ if ! "${SCRIPT_DIR}/ensure-npmrc.sh"; then
   die "npm settings could not be ensured; refusing to start js-controller"
 fi
 
-# Shared environment for both reconcile passes (init and install).
+# Shared environment for both reconcile passes (init and install) and the
+# package.json persistence helper (which reads IOB_ROOT / IOB_NODE_MODULES_DIR).
+# Defined here so the restore call below can use it.
 RECONCILE_ENV=(
   "IOB_ROOT=${IOBROKER_DIR}"
   "IOB_DATA_DIR=${IOBROKER_DIR}/iobroker-data"
   "IOB_NODE_MODULES_DIR=${IOBROKER_DIR}/node_modules"
 )
+
+# ---------------------------------------------------------------------------
+# Persist /opt/iobroker/package.json across container RECREATE.
+#
+# node_modules is a persistent VOLUME but package.json is NOT — it lives in the
+# image/container layer. js-controller and adapters (e.g. the javascript adapter
+# installing script modules) grow package.json's dependency list at runtime to
+# match the installed adapter set. A `docker restart` reuses the same writable
+# layer, so that grown package.json survives and stays in sync with the
+# node_modules volume. A `docker compose up`/recreate starts a FRESH layer,
+# resetting package.json to the image baseline (only iobroker.js-controller)
+# while the node_modules volume still holds every adapter — out of sync, so the
+# next `npm install` (reconcile OR a runtime adapter install) prunes every
+# adapter as extraneous and forces a full reinstall. This is why the breakage
+# appears only after a recreate, never after a restart.
+#
+# `restore` copies an authoritative package.json kept inside the persistent
+# node_modules volume back over the (possibly image-reset) file BEFORE any
+# npm/reconcile runs, re-syncing it with the volume so nothing prunes. It runs
+# here, before the reconcile passes and the DB config. `save` (after the install
+# phase) refreshes that persisted copy. See scripts/persist-package-json.sh.
+# ---------------------------------------------------------------------------
+if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" restore; then
+  log "package.json restore reported a problem (continuing; reconcile will recover any prune)"
+fi
 
 # The controller config file (objects/states DB backend definition).
 IOB_JSON="${IOB_JSON:-${IOBROKER_DIR}/iobroker-data/iobroker.json}"
@@ -581,6 +608,13 @@ fi
 # the normal exec path is unaffected.
 restore_db_hosts
 trap - EXIT
+
+# Capture any adapter (re)installs from this start into the persisted manifest so
+# a future recreate restores a package.json that matches the node_modules volume
+# (see the persist-package-json.sh restore call after Step 1). Best-effort.
+if ! env "${RECONCILE_ENV[@]}" "${SCRIPT_DIR}/persist-package-json.sh" save; then
+  log "package.json save reported a problem (continuing)"
+fi
 
 # ---------------------------------------------------------------------------
 # 10. exec js-controller under tini.
