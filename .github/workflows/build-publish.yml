@@ -351,3 +351,17 @@ jobs:
             JS_CONTROLLER_VERSION=${{ needs.read-build-config.outputs.js_controller_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Notify Slack that a new image was published
+        # Runs only after the manifest push above succeeds (this step is the
+        # last in the publish job, which itself only runs on a pushed tag), so a
+        # Slack message is sent exactly when a new image reaches GHCR. Posts a
+        # plain message to the channel via a Slack incoming webhook.
+        # SLACK_WEBHOOK_URL is the incoming-webhook URL stored as a repository
+        # secret.
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "New ioBroker container image published: `${{ needs.read-build-config.outputs.image }}:${{ needs.read-build-config.outputs.release_tag }}`\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Work In Progress]
 
+### Added
+
+- The `build-publish` workflow now posts a Slack notification when a new
+  container image is published to GHCR. After the multi-arch manifest push
+  succeeds, the `publish` job posts a message with the published image
+  reference and the workflow run URL to a Slack channel via an incoming webhook
+  (`SLACK_WEBHOOK_URL` repository secret).
+
 ### Changed
 
 - Build-only tooling is now separated from the runtime files. The local build
