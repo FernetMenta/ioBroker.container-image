@@ -12,13 +12,14 @@ message and exits 0**, so it never hard-fails in a build-less environment.
 
 ## Scripts
 
-| Script             | Purpose                                                                 | Requirements                                |
-| ------------------ | ----------------------------------------------------------------------- | ------------------------------------------- |
-| `manifest-size.sh` | Multi-arch manifest + image-size checks                                 | 1.3, 1.4, 1.5, 1.6, 1.7, 2.5                |
-| `runtime-deps.sh`  | Runtime-dependency + packaging checks (dpkg, ldd, smoke start, getcap)  | 2.3, 2.6, 5.2, 5.3, 7.1                     |
-| `rootless-uid.sh`  | Non-root default, arbitrary-UID volume access, container-env indicators | 3.3, 3.4, 3.5, 3.6, 4.5, 4.6, 6.1, 6.2, 6.3 |
-| `pid1-signals.sh`  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
-| `install-source-classify.sh` | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes | 8.9, 8.10 |
+| Script                             | Purpose                                                                                                                                                                                                                                      | Requirements                                  |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `manifest-size.sh`                 | Multi-arch manifest + image-size checks                                                                                                                                                                                                      | 1.3, 1.4, 1.5, 1.6, 1.7, 2.5                  |
+| `runtime-deps.sh`                  | Runtime-dependency + packaging checks (dpkg, ldd, smoke start, getcap)                                                                                                                                                                       | 2.3, 2.6, 5.2, 5.3, 7.1                       |
+| `rootless-uid.sh`                  | Non-root default, arbitrary-UID volume access, container-env indicators                                                                                                                                                                      | 3.3, 3.4, 3.5, 3.6, 4.5, 4.6, 6.1, 6.2, 6.3   |
+| `pid1-signals.sh`                  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts                                                                                                             | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
+| `install-source-classify.sh`       | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes                                                                                                | 8.9, 8.10                                     |
+| `fresh-install-admin-bootstrap.sh` | Drives `reconcile.sh` across the entrypoint's two passes (init -> install) to prove the fresh-install `admin` seed survives the split, installs the setup UI AND creates the `admin.0` instance (and does neither again on a normal restart) | 8.6, 8.9, 8.10                                |
 
 ## `manifest-size.sh`
 
@@ -262,13 +263,13 @@ CONTAINER_CLI=podman IMAGE=iobroker:local ./test/smoke/pid1-signals.sh
 
 ### Configuration (environment variables)
 
-| Variable                | Default          | Meaning                                                              |
-| ----------------------- | ---------------- | -------------------------------------------------------------------- |
-| `IMAGE`                 | _(unset)_        | Image reference to test; when unset, all tests skip with a message   |
-| `CONTAINER_CLI`         | `docker`         | Container CLI (e.g. `podman`)                                        |
-| `SMOKE_FULL`            | `0`              | When `1`, also run the heavy tests that start a full ioBroker        |
-| `SMOKE_STARTUP_TIMEOUT` | `300`            | Seconds to wait for `iobroker status` to succeed (heavy tests)       |
-| `SMOKE_STOP_TIMEOUT`    | `30`             | Seconds passed to `<cli> stop -t` and the bounded-exit assertion     |
+| Variable                | Default   | Meaning                                                            |
+| ----------------------- | --------- | ------------------------------------------------------------------ |
+| `IMAGE`                 | _(unset)_ | Image reference to test; when unset, all tests skip with a message |
+| `CONTAINER_CLI`         | `docker`  | Container CLI (e.g. `podman`)                                      |
+| `SMOKE_FULL`            | `0`       | When `1`, also run the heavy tests that start a full ioBroker      |
+| `SMOKE_STARTUP_TIMEOUT` | `300`     | Seconds to wait for `iobroker status` to succeed (heavy tests)     |
+| `SMOKE_STOP_TIMEOUT`    | `30`      | Seconds passed to `<cli> stop -t` and the bounded-exit assertion   |
 
 ### Exit codes
 
@@ -314,3 +315,56 @@ Cases asserted:
 - `0` — every source classified as expected.
 - `1` — at least one source was misrouted (routing regression). This script
   **never skips**: it has no external prerequisites beyond bash.
+
+## `fresh-install-admin-bootstrap.sh`
+
+A **no-Docker, no-image** check that pins the fresh-install `admin` bootstrap
+across the entrypoint's **two-pass** reconciliation. It drives the real
+`scripts/reconcile.sh` in dry-run mode against temp dirs, with tiny stub
+`iobroker`/`npm` binaries on `PATH`, so it needs only bash + node.
+
+### The regression it pins
+
+On a brand-new container the Data_Volume is empty, so reconciliation must seed
+`admin` into the desired set and install it (the setup UI on port 8081). The
+entrypoint splits reconciliation into two passes around DB configuration:
+
+- pass 1 (`IOB_RECONCILE_PHASE=init`) runs `iobroker setup first`, which
+  **populates** the Data_Volume, and
+- pass 2 (`IOB_RECONCILE_PHASE=install`) runs `install-missing`.
+
+Two related bugs are pinned:
+
+1. The fresh-install signal was recomputed per pass from `data_volume_empty()`.
+   Because the init pass fills the volume, by the install pass the volume is no
+   longer empty, the `admin` seed was dropped (`desiredAdapters=0`), and **admin
+   was never installed on a fresh container**. The fix bridges the passes with a
+   `.iob-fresh-install` marker written by the init pass and consumed (then
+   cleared) by the install pass.
+2. Even once admin's CODE installs, reconciliation never creates an INSTANCE
+   (it only converges `node_modules`), so a fresh container had admin code but
+   no `admin.0` — js-controller started with nothing to run and the Admin UI
+   never came up (the "hangs after starting js-controller" symptom). The fix
+   also runs `iobroker add admin 0 --enabled` on a fresh install.
+
+Cases asserted:
+
+1. **init pass** plans `init-default-config` and writes the fresh-install marker.
+2. **install pass** (volume now populated) seeds `admin`, plans to install it
+   (`desiredAdapters=1`), plans to create the `admin.0` instance
+   (`iobroker add admin 0 --enabled`), and clears the marker.
+3. **normal restart** (non-fresh, marker gone) does **not** re-seed/re-install
+   `admin` and does **not** re-create the instance (`desiredAdapters=0`).
+
+### Usage
+
+```bash
+./test/smoke/fresh-install-admin-bootstrap.sh
+```
+
+### Exit codes
+
+- `0` — the bootstrap survives the init->install split and does not repeat, **or**
+  skipped because `node` was unavailable.
+- `1` — regression (admin not installed on a fresh start, or re-installed on a
+  routine restart).

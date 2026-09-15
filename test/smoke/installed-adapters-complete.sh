@@ -113,6 +113,11 @@ mk_complete           nested build/index.js   # complete, main in a subdir
 mk_default_main       nomain          # complete via default main.js
 mk_incomplete_no_main partial         # present but entry file missing
 mk_incomplete_no_pkg  shell           # present but no manifest
+# The controller ships in the image as node_modules/iobroker.js-controller and
+# is a COMPLETE package, but it is the runtime core, NOT an adapter, so
+# installed_adapters() must exclude it (otherwise a freshly-built image that
+# carries only the controller reports a phantom installedAdapters=1).
+mk_complete           js-controller   # complete, but excluded (not an adapter)
 
 fail=""
 
@@ -129,14 +134,17 @@ expect_complete() {
 }
 
 echo "=== adapter_dir_complete ==="
-expect_complete good    yes "complete tree (explicit main.js) -> complete"
-expect_complete nested  yes "complete tree (main in subdir) -> complete"
-expect_complete nomain  yes "no main field, default main.js present -> complete"
-expect_complete partial no  "package.json present but entry file missing -> incomplete"
-expect_complete shell   no  "no package.json -> incomplete"
+expect_complete good          yes "complete tree (explicit main.js) -> complete"
+expect_complete nested        yes "complete tree (main in subdir) -> complete"
+expect_complete nomain        yes "no main field, default main.js present -> complete"
+expect_complete partial       no  "package.json present but entry file missing -> incomplete"
+expect_complete shell         no  "no package.json -> incomplete"
+expect_complete js-controller yes "controller is a complete package (completeness is orthogonal to the adapter filter)"
 
-# installed_adapters should list ONLY the complete adapters, sorted, unique.
-echo "=== installed_adapters (only complete trees reported) ==="
+# installed_adapters should list ONLY the complete ADAPTERS, sorted, unique —
+# and must EXCLUDE iobroker.js-controller even though its tree is complete (the
+# controller is the runtime core, not an adapter).
+echo "=== installed_adapters (only complete adapters; controller excluded) ==="
 got_list="$(installed_adapters | tr '\n' ' ' | sed 's/ *$//')"
 want_list="good nested nomain"
 if [[ "${got_list}" == "${want_list}" ]]; then
@@ -144,6 +152,15 @@ if [[ "${got_list}" == "${want_list}" ]]; then
 else
   printf '  FAIL want=[%s] got=[%s]\n' "${want_list}" "${got_list}" >&2
   fail="${fail} [installed_adapters-list]"
+fi
+
+# Explicit guard on the exclusion so a regression names the controller directly.
+echo "=== installed_adapters (js-controller is not an adapter) ==="
+if installed_adapters | grep -qx "js-controller"; then
+  printf '  FAIL installed_adapters reported js-controller as an adapter\n' >&2
+  fail="${fail} [installed_adapters-controller-leak]"
+else
+  printf '  ok   js-controller excluded from the installed-adapter set\n'
 fi
 
 # An empty node_modules yields an empty list (and no error).

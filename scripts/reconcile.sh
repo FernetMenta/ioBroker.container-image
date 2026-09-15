@@ -117,6 +117,28 @@ IOB_ADAPTER_INSTALL_FAILURE_POLICY="${IOB_ADAPTER_INSTALL_FAILURE_POLICY:-tolera
 IOB_RECONCILE_MARKER="${IOB_RECONCILE_MARKER:-${IOB_DATA_DIR}/.iob-reconciling}"
 IOB_RECONCILE_HEARTBEAT="${IOB_RECONCILE_HEARTBEAT:-${IOB_DATA_DIR}/.iob-reconcile-heartbeat}"
 
+# Fresh-install handoff marker (init phase -> install phase).
+#
+# The fresh-install `admin` bootstrap must seed `admin` into the desired set so
+# the install phase installs the setup UI on a brand-new container. But the
+# entrypoint splits reconciliation into two passes around DB configuration:
+# phase=init runs `iobroker setup first` (which POPULATES the Data_Volume), then
+# phase=install runs install-missing. By the time the install pass runs, the
+# Data_Volume is no longer empty, so `data_volume_empty()` returns false and the
+# "empty volume" signal is gone — the pass that would install admin can no longer
+# see that this was a fresh start. Recomputing emptiness per pass therefore drops
+# the admin bootstrap in the two-phase flow (desiredAdapters=0, admin never
+# installed).
+#
+# We bridge the two passes with a marker: the init pass, having observed the
+# volume empty BEFORE `iobroker setup first` fills it, writes this marker; the
+# install pass treats the marker as "this start was a fresh install" and seeds
+# admin, then clears it so a normal restart does not re-seed. In a standalone
+# `phase=all` run the in-memory `data_empty` still covers the same start, so the
+# marker is only strictly required for the split flow but is written/cleared
+# there too for consistency. Lives in the Data_Volume; overridable for tests.
+IOB_FRESH_INSTALL_MARKER="${IOB_FRESH_INSTALL_MARKER:-${IOB_DATA_DIR}/.iob-fresh-install}"
+
 # Persistent reconcile log + end-of-run summary. Everything the run logs to the
 # container's stderr (visible via `docker logs`) is ALSO appended here with a
 # timestamp, and the EXIT trap writes a summary block naming the phase, the
@@ -342,17 +364,18 @@ data_volume_empty() {
   # `find ... -mindepth 1` prints nothing for an empty dir; use it so we do not
   # depend on `ls` output formatting or hidden-file globbing quirks.
   #
-  # Exclude our OWN reconcile liveness markers (.iob-reconciling /
-  # .iob-reconcile-heartbeat): begin_reconcile writes them into IOB_DATA_DIR
-  # BEFORE this check runs, so counting them would make a genuinely fresh volume
+  # Exclude our OWN reconcile markers (.iob-reconciling / .iob-reconcile-heartbeat
+  # / .iob-fresh-install): begin_reconcile and the fresh-install handoff write
+  # them into IOB_DATA_DIR, so counting them would make a genuinely fresh volume
   # look non-empty and skip `iobroker setup first`. (The reconcile log lives in
   # the Log_Volume, not here, so it is not a concern for this check.) We match on
   # the marker file names so the check reflects real ioBroker content only.
-  local marker_name heartbeat_name
+  local marker_name heartbeat_name fresh_name
   marker_name="$(basename -- "${IOB_RECONCILE_MARKER}")"
   heartbeat_name="$(basename -- "${IOB_RECONCILE_HEARTBEAT}")"
+  fresh_name="$(basename -- "${IOB_FRESH_INSTALL_MARKER}")"
   if [[ -z "$(find "${IOB_DATA_DIR}" -mindepth 1 \
-    ! -name "${marker_name}" ! -name "${heartbeat_name}" \
+    ! -name "${marker_name}" ! -name "${heartbeat_name}" ! -name "${fresh_name}" \
     -print -quit 2>/dev/null)" ]]; then
     return 0
   fi
@@ -688,6 +711,16 @@ adapter_dir_complete() {
 # present-but-partial `iobroker.<name>` is deliberately NOT reported, so the
 # planner treats it as missing and the install path repairs it. ioBroker adapter
 # packages are published as `iobroker.<name>` directories.
+#
+# EXCLUDES `iobroker.js-controller`: the controller is baked into the image and
+# lives in node_modules as `iobroker.js-controller`, so it matches the
+# `iobroker.*` glob — but it is the RUNTIME CORE, not an adapter. Counting it
+# would report a phantom "installed adapter" (installedAdapters=1 on a
+# freshly-built image that ships only the controller) that never appears in the
+# desired set (which is derived from `system.adapter.*` INSTANCES, and the
+# controller has a `system.host.*` object, not an adapter instance). Reporting it
+# is misleading in the logs/summary and conceptually wrong, so it is filtered out
+# here — reconciliation converges the ADAPTER set only.
 installed_adapters() {
   [[ -d "${IOB_NODE_MODULES_DIR}" ]] || return 0
   local dir name
@@ -697,6 +730,8 @@ installed_adapters() {
     [[ -n "${dir}" ]] || continue
     adapter_dir_complete "${dir}" || continue
     name="${dir##*/iobroker.}"
+    # The controller is not an adapter; never report it as an installed adapter.
+    [[ "${name}" == "js-controller" ]] && continue
     printf '%s\n' "${name}"
   done < <(find "${IOB_NODE_MODULES_DIR}" -maxdepth 1 -type d -name 'iobroker.*' 2>/dev/null) |
     sort -u || true
@@ -767,8 +802,42 @@ fi
 # instances yet, so seed the desired set with `admin` (only admin) so a brand-new
 # container installs the setup UI. `iobroker setup first` (init-default-config)
 # runs first via the plan; the admin install then flows through install-missing.
+#
+# The emptiness signal must cross the entrypoint's two-phase split: the init pass
+# sees the volume empty but has no install-missing step, and by the install pass
+# `iobroker setup first` has already filled the volume so `data_empty` is false.
+# We therefore treat "fresh install" as (volume empty now) OR (the init pass left
+# a fresh-install marker), and seed admin on that combined signal. The init pass
+# writes the marker; the install/all pass consumes it and clears it so a normal
+# restart does not re-seed admin.
+fresh_install=false
 if [[ "${data_empty}" == "true" ]]; then
+  fresh_install=true
+  # Record the fresh start so the later install pass can still see it after
+  # `iobroker setup first` has populated the volume. On a brand-new container the
+  # Data_Volume directory may not exist yet (that is exactly why data_empty is
+  # true), so ensure it exists before writing the marker into it. Best-effort: a
+  # non-writable volume just means the standalone `all` path (which keeps
+  # data_empty in memory) still works; only the split init/install flow depends
+  # on this marker.
+  mkdir -p -- "$(dirname -- "${IOB_FRESH_INSTALL_MARKER}")" 2>/dev/null || true
+  : >>"${IOB_FRESH_INSTALL_MARKER}" 2>/dev/null || true
+elif [[ -f "${IOB_FRESH_INSTALL_MARKER}" ]]; then
+  # The volume looks populated, but the init pass of THIS start flagged it as a
+  # fresh install. Honor the bootstrap.
+  fresh_install=true
+fi
+
+if [[ "${fresh_install}" == "true" ]]; then
   desired_list="$(printf '%s\nadmin\n' "${desired_list}")"
+fi
+
+# Clear the fresh-install marker once we are in the pass that actually installs
+# adapters (install or all). The init pass leaves it in place precisely so the
+# install pass can observe it; after the install pass has consumed it there is
+# no more work gated on it, and leaving it would re-seed admin on every restart.
+if [[ "${IOB_RECONCILE_PHASE}" != "init" && -f "${IOB_FRESH_INSTALL_MARKER}" ]]; then
+  rm -f -- "${IOB_FRESH_INSTALL_MARKER}" 2>/dev/null || true
 fi
 
 log "observed: dataVolumeEmpty=${data_empty} registryReachable=${registry_ok} abiMismatch=${abi_bad}"
@@ -847,6 +916,58 @@ run() {
   "$@" || rc=$?
   heartbeat
   return "${rc}"
+}
+
+# bootstrap_admin_instance: create the admin.0 instance on a FRESH install.
+#
+# Reconciliation installs adapter CODE only; it never creates instances, because
+# the desired set is normally derived from instances that already exist. The
+# fresh-install `admin` seed is the sole exception: a brand-new container has the
+# admin CODE installed but no `admin.0` INSTANCE, so js-controller starts with
+# nothing to run and the Admin UI never comes up (the container appears to hang
+# after "starting js-controller"). This creates that first instance, the same
+# thing the classic ioBroker images do with `iobroker add admin 0` on first boot.
+#
+# Idempotent + safe:
+#   * Only called when fresh_install=true (once per new Data_Volume).
+#   * Skips if an admin instance already exists (guards against a double run and
+#     against `iobroker add` failing on an existing singleton instance).
+#   * Non-fatal: if instance creation fails we WARN and still start js-controller
+#     rather than blocking — the operator can create the instance from the CLI.
+#     A missing Admin UI is a degraded start, not a reason to crash-loop.
+bootstrap_admin_instance() {
+  # In dry-run we only log the intended command (tests assert the mapping).
+  if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
+    log "admin instance bootstrap: would create admin.0 (fresh install)"
+    run iobroker add admin 0 --enabled || true
+    summary_add_action "admin-instance-bootstrap: dry-run (admin.0)"
+    return 0
+  fi
+
+  # Already have an admin instance? Then this is not really a first boot for
+  # admin (e.g. a re-run against a partially-initialized volume); do nothing.
+  local existing rc=0
+  existing="$(_iobroker_list_instances_raw 2>/dev/null | grep -E 'system\.adapter\.admin\.[0-9]+' || true)"
+  if [[ -n "${existing}" ]]; then
+    log "admin instance bootstrap: admin instance already exists; skipping"
+    summary_add_action "admin-instance-bootstrap: skipped (already exists)"
+    return 0
+  fi
+
+  log "admin instance bootstrap: creating admin.0 (fresh install; setup UI)"
+  run iobroker add admin 0 --enabled || rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    log "admin instance bootstrap: admin.0 created and enabled"
+    summary_add_action "admin-instance-bootstrap: created admin.0"
+  else
+    # Non-fatal: warn and continue to start js-controller. The Admin UI will be
+    # absent until the operator creates the instance, but blocking/crash-looping
+    # would be worse than a degraded-but-running host.
+    log "admin instance bootstrap: WARNING could not create admin.0 (exit ${rc}); starting anyway." \
+      "Create it later with: iobroker add admin 0"
+    summary_add_action "admin-instance-bootstrap: FAILED (exit ${rc}; non-fatal)"
+  fi
+  return 0
 }
 
 # run_install: like `run`, but (1) paces successful installs with IOB_INSTALL_SETTLE
@@ -1197,6 +1318,28 @@ while IFS=$'\t' read -r action args_rest; do
         else
           summary_add_action "install-missing: ${installed_ok} installed, 0 failures"
         fi
+      fi
+
+      # Fresh-install admin INSTANCE bootstrap.
+      #
+      # install-missing only installs adapter CODE, never instances — because the
+      # desired set is normally derived from instances that ALREADY exist in the
+      # Data_Volume (reconciliation just converges node_modules to match). The
+      # fresh-install bootstrap is the one exception: on a brand-new container
+      # `admin` is seeded into the desired set with NO pre-existing instance, so
+      # after its code is installed there is still no `admin.0` for js-controller
+      # to run — nothing binds the Admin UI port and the container looks "hung".
+      # So on a fresh install we additionally CREATE the admin.0 instance here,
+      # after the code is present. This mirrors what the classic ioBroker images
+      # do (`iobroker add admin 0` on first boot) and is what actually brings the
+      # setup UI up.
+      #
+      # Gated on fresh_install so it runs ONCE per new Data_Volume: a normal
+      # restart has fresh_install=false (admin already has an instance recorded),
+      # and a multihost slave never sets fresh_install on the shared DB either.
+      # Guarded by an existence check so it is idempotent even if reached twice.
+      if [[ "${fresh_install}" == "true" ]]; then
+        bootstrap_admin_instance
       fi
       ;;
 

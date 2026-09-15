@@ -32,6 +32,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped in the runtime image. References in `package.json`, the CI workflows,
   the tests, and the documentation were updated accordingly.
 
+### Fixed
+
+- A fresh container now actually comes up with a working Admin UI. On an empty
+  Data_Volume the `admin` bootstrap was lost between the entrypoint's two
+  reconcile passes: the init pass runs `iobroker setup first` (which POPULATES
+  the volume), and the install pass — where adapters are actually installed —
+  then saw a non-empty volume, recomputed "fresh install" as false, and dropped
+  the `admin` seed (`desiredAdapters=0`, no install). The fresh-install signal is
+  now carried across the passes with a `.iob-fresh-install` marker written by the
+  init pass and consumed (then cleared) by the install pass, so `admin` is seeded
+  and installed on first run and never re-seeded on a routine restart.
+- The fresh-install bootstrap now also CREATES the `admin.0` instance, not just
+  the admin code. Reconciliation installs adapter code only (the desired set is
+  normally derived from instances that already exist), so on a brand-new
+  container admin had code but no instance — js-controller started with nothing
+  to run, nothing bound the Admin UI port, and the container appeared to hang
+  after "starting js-controller". A fresh install now runs
+  `iobroker add admin 0 --enabled` after the code is present (idempotent: skipped
+  when an admin instance already exists; non-fatal: a failure warns and still
+  starts js-controller rather than crash-looping). Covered by
+  `test/smoke/fresh-install-admin-bootstrap.sh`.
+- `js-controller` is no longer miscounted as an installed adapter. The controller
+  ships in the image as `node_modules/iobroker.js-controller`, which matched the
+  `iobroker.*` adapter glob, so a freshly built image reported a phantom
+  `installedAdapters=1`. It is the runtime core, not an adapter (and never
+  appears in the desired set, which is derived from adapter instances), so it is
+  now excluded from the installed-adapter set. Covered by
+  `test/smoke/installed-adapters-complete.sh`.
+
 ## [7.2.2] 13.07.2026
 
 ### Added
@@ -56,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Container **recreate** no longer prunes the persisted adapters out of
   `node_modules`. `node_modules` is a persistent volume but `/opt/iobroker/
-  package.json` is not — it lives in the container layer. js-controller and
+package.json` is not — it lives in the container layer. js-controller and
   adapters (e.g. the javascript adapter installing script modules) grow
   `package.json`'s dependency list at runtime to match the installed adapters. A
   `docker restart` keeps the same layer, so that grown manifest survives and
@@ -100,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tarball — so a reinstall now actually repairs the tree rather than leaving it
   broken. Covered by `test/smoke/installed-adapters-complete.sh`.
 - Multihost master install phase no longer floods the log with `Objects DB is not
-  allowed to start in the current Multihost environment` and
+allowed to start in the current Multihost environment` and
   `connect ECONNREFUSED 127.0.0.1:9001`. On a master, `multihostService.enabled`
   is `true`, and whenever two of the pre-controller install-time transient jsonl
   servers briefly overlapped, js-controller's multihost guard rejected the second
@@ -210,13 +239,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   originally installed from (`common.installedFrom`): repository adapters via
   `iobroker install <name>`, and non-repository adapters (GitHub tarball, custom
   URL, npm spec, or a package not in the active repo) via `iobroker url
-  <source>`. Previously every adapter was installed by name against the default
+<source>`. Previously every adapter was installed by name against the default
   repository, so a non-repository adapter failed with "Unknown packet name" and
   aborted the whole startup. A single adapter that still cannot be installed is
   now skipped with a warning instead of preventing the host from starting.
 - Multihost role is applied by patching `iobroker.json`
   (`multihostService.enabled`) instead of running `iobroker multihost
-  enable/disable` during early startup. That CLI connects to the objects/states
+enable/disable` during early startup. That CLI connects to the objects/states
   database, which is not serving yet at that point (js-controller starts later),
   so `IOB_MULTIHOST=master` failed with `ECONNREFUSED` on the database port.
 - Startup no longer hangs in the reconcile init phase. The init pass gathered
