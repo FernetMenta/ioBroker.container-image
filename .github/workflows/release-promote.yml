@@ -9,7 +9,7 @@
 #                            NOT part of the 3-component `<version>`).
 #
 # On such a signal this workflow decides which `<version>-r<n>` RELEASE tags to
-# create (via scripts/plan-release-tags.sh) and pushes them. Those pushes
+# create (via build/scripts/plan-release-tags.sh) and pushes them. Those pushes
 # trigger build-publish.yml, which does the actual multi-arch build + publish.
 # This workflow only DECIDES and TAGS; it never builds or publishes images.
 #
@@ -84,7 +84,7 @@ jobs:
           fi
 
           mapfile -t all_tags < <(git tag --list)
-          mapfile -t planned < <(scripts/plan-release-tags.sh "${all_tags[@]}")
+          mapfile -t planned < <(build/scripts/plan-release-tags.sh "${all_tags[@]}")
 
           if [[ ${#planned[@]} -eq 0 ]]; then
             echo "No versions to release (no '<version>-r<n>' or '<version>-dev-r<n>' tags found)."

@@ -59,10 +59,10 @@ if ! "${DOCKER}" info >/dev/null 2>&1; then
 fi
 
 # The target image must exist locally. We do NOT pull here: this test validates
-# a locally BUILT image (scripts/build-local.sh) or one the caller already
+# a locally BUILT image (build/scripts/build-local.sh) or one the caller already
 # pulled. If it is absent, skip with guidance rather than fail.
 if ! "${DOCKER}" image inspect "${IMAGE}" >/dev/null 2>&1; then
-  echo "${SKIP_PREFIX} image '${IMAGE}' not found locally. Build it first (e.g. 'IMAGE_TAG=${IMAGE} scripts/build-local.sh single') or set IMAGE=<ref>. Skipping runtime-dependency smoke test." >&2
+  echo "${SKIP_PREFIX} image '${IMAGE}' not found locally. Build it first (e.g. 'IMAGE_TAG=${IMAGE} build/scripts/build-local.sh single') or set IMAGE=<ref>. Skipping runtime-dependency smoke test." >&2
   exit 0
 fi
 

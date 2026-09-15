@@ -5,16 +5,16 @@
 # This script builds the same image CI builds, from the same Dockerfile, with
 # NODE_MAJOR and DEBIAN_CODENAME read from the maintainer-owned Build_Config in
 # package.json (the `containerImage` key: `nodeMajor` + `debianCodename`) using
-# the SAME pure derivation the rest of the code uses (lib/build-config.js +
-# lib/node-major.js -> deriveNodeMajorFromPackageJson). The derivation is
+# the SAME pure derivation the rest of the code uses (build/lib/build-config.js
+# + build/lib/node-major.js -> deriveNodeMajorFromPackageJson). The derivation is
 # fail-fast: a missing/empty/whitespace/non-integer nodeMajor aborts the build
 # before any `docker buildx` step, exactly like CI. It NEVER falls back to a
 # system default. (Req 5.4, 5.5, 5.7)
 #
 # Equivalence with CI (Req 2 build correctness):
 #   - same Dockerfile              (-f Dockerfile)
-#   - same Build_Config read       (deriveNodeMajorFromPackageJson from lib/,
-#                                    debianCodename from package.json)
+#   - same Build_Config read       (deriveNodeMajorFromPackageJson from
+#                                    build/lib/, debianCodename from package.json)
 #   - same build args             (--build-arg NODE_MAJOR / DEBIAN_CODENAME)
 #   - same runtime-dependency gate (a separate `--target verify` build, run by
 #                                    run_verify_gate, matching the gate CI runs)
@@ -43,7 +43,7 @@
 # is CI's job (task 16.1). (design: "Local builds do not push by default.")
 #
 # Usage:
-#   scripts/build-local.sh [single|multi]
+#   build/scripts/build-local.sh [single|multi]
 #
 # Environment overrides:
 #   CONTAINER_ENGINE  Container engine to build with: `docker` (default) or
@@ -85,12 +85,18 @@
 #   1  a build knob could not be read, or a prerequisite/build step failed
 set -euo pipefail
 
-# --- Locate ourselves, the repo root and the sibling lib/ modules -----------
-# Resolve this script's directory so lib/ and package.json resolve regardless
-# of the working directory the caller runs us from (same approach as the other
-# scripts under scripts/).
+# --- Locate ourselves, the repo root and the build lib/ modules -------------
+# Resolve this script's directory so the build lib modules, the Dockerfile and
+# package.json resolve regardless of the working directory the caller runs us
+# from. This script lives at build/scripts/, so its build-only lib modules are
+# siblings under build/lib/, while the repo root (holding package.json, the
+# Dockerfile and the build context) is two levels up.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
+# Build-only decision modules (build-config.js, node-major.js) live alongside
+# this script under build/lib/, separate from the runtime lib/ that is copied
+# into the image.
+BUILD_LIB_DIR="$(cd -- "${SCRIPT_DIR}/../lib" >/dev/null 2>&1 && pwd)"
 
 # --- Configuration (all overridable via the environment) --------------------
 MODE="${1:-single}"
@@ -156,13 +162,13 @@ if [[ ! -f "${BUILD_CONFIG_JSON}" ]]; then
 fi
 
 # --- Read the build knobs using the SAME pure modules as the code -----------
-# We reuse lib/build-config.js (readPackageJson/readDebianCodename) +
-# lib/node-major.js (deriveNodeMajorFromPackageJson) so the local read is
+# We reuse build/lib/build-config.js (readPackageJson/readDebianCodename) +
+# build/lib/node-major.js (deriveNodeMajorFromPackageJson) so the local read is
 # byte-for-byte the same logic CI uses. deriveNodeMajorFromPackageJson throws
 # (non-zero exit) on any missing/empty/whitespace/non-integer nodeMajor —
 # fail-fast, no fallback.
-BUILD_CONFIG_MODULE="${REPO_ROOT}/lib/build-config.js"
-NODE_MAJOR_MODULE="${REPO_ROOT}/lib/node-major.js"
+BUILD_CONFIG_MODULE="${BUILD_LIB_DIR}/build-config.js"
+NODE_MAJOR_MODULE="${BUILD_LIB_DIR}/node-major.js"
 
 if ! NODE_MAJOR="$(
   IOB_BUILD_CONFIG_PATH="${BUILD_CONFIG_JSON}" \

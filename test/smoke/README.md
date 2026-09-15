@@ -120,7 +120,7 @@ Checks, against `IMAGE`:
 ### Usage
 
 ```bash
-# Default image: iobroker:local (as produced by scripts/build-local.sh single)
+# Default image: iobroker:local (as produced by build/scripts/build-local.sh single)
 ./test/smoke/runtime-deps.sh
 
 # Explicit image

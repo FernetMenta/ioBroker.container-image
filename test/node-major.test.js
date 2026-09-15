@@ -1,6 +1,6 @@
 // Unit test for happy-path Node major version derivation (task 3.3).
 //
-// Verifies the concrete happy path of `lib/node-major.js`: a valid `nodeMajor`
+// Verifies the concrete happy path of `build/lib/node-major.js`: a valid `nodeMajor`
 // value derives to its integer major version, both from a string and from a
 // real integer, and via the package.json Build_Config convenience helper. Also
 // confirms that NO fallback path exists — an absent value throws rather than
@@ -14,7 +14,7 @@ import {
   deriveNodeMajor,
   deriveNodeMajorFromPackageJson,
   NodeMajorDerivationError,
-} from '../lib/node-major.js';
+} from '../build/lib/node-major.js';
 
 describe('Node major derivation (happy path)', () => {
   it('derives 22 from the string "22"', () => {

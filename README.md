@@ -149,10 +149,10 @@ Local builds mirror CI (same `Dockerfile`, same build knobs read from
 ```bash
 # single-arch build for your host platform: loads the shippable rootless
 # runtime image into the local image store, and runs the verification gate:
-scripts/build-local.sh single
+build/scripts/build-local.sh single
 
 # multi-arch validation build (linux/amd64,linux/arm64), no push:
-scripts/build-local.sh multi
+build/scripts/build-local.sh multi
 ```
 
 The loaded image is the shippable `runtime` stage (rootless, `USER 1000`); the

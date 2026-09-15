@@ -11,11 +11,11 @@ build therefore reproduces what CI builds. (Requirements 2.2, 5.4, 5.5, 5.7)
 ```sh
 # single-arch build for your local host platform (loads into docker):
 npm run build:local
-#   or: scripts/build-local.sh single
+#   or: build/scripts/build-local.sh single
 
 # multi-arch validation build (linux/amd64,linux/arm64), no push, no load:
 npm run build:local:multi
-#   or: scripts/build-local.sh multi
+#   or: build/scripts/build-local.sh multi
 ```
 
 Neither command pushes anything. Publishing is CI's job.
@@ -49,20 +49,20 @@ non-empty string (or supplied via the `DEBIAN_CODENAME` environment override).
 > ioBroker's, not the image maintainer's, and is misleading as a source of
 > image build knobs. Nothing reads it at container runtime.
 
-The read is not re-implemented for the local path. `scripts/build-local.sh` runs
+The read is not re-implemented for the local path. `build/scripts/build-local.sh` runs
 the **same pure modules** the rest of the codebase and CI use:
 
-- `lib/build-config.js` — reads/parses `package.json` and locates the
+- `build/lib/build-config.js` — reads/parses `package.json` and locates the
   `containerImage.nodeMajor` / `containerImage.debianCodename` fields.
-- `lib/node-major.js` — `deriveNodeMajorFromPackageJson()` turns the `nodeMajor`
+- `build/lib/node-major.js` — `deriveNodeMajorFromPackageJson()` turns the `nodeMajor`
   value into an integer major version (or throws, no fallback).
 
 The equivalent of a manual one-liner is:
 
 ```sh
 node --input-type=module -e '
-  import { readPackageJson, readDebianCodename } from "./lib/build-config.js";
-  import { deriveNodeMajorFromPackageJson } from "./lib/node-major.js";
+  import { readPackageJson, readDebianCodename } from "./build/lib/build-config.js";
+  import { deriveNodeMajorFromPackageJson } from "./build/lib/node-major.js";
   const pkg = readPackageJson("./package.json");
   process.stdout.write(deriveNodeMajorFromPackageJson(pkg) + " " + readDebianCodename(pkg));
 '
@@ -80,7 +80,7 @@ environment (the override wins over the Build_Config value):
 
 ```sh
 DEBIAN_CODENAME=bookworm npm run build:local
-#   or: DEBIAN_CODENAME=bookworm scripts/build-local.sh single
+#   or: DEBIAN_CODENAME=bookworm build/scripts/build-local.sh single
 #   or (raw): docker buildx build --build-arg NODE_MAJOR=<n> \
 #             --build-arg DEBIAN_CODENAME=bookworm -f Dockerfile .
 ```
@@ -90,7 +90,7 @@ To make the change permanent, edit `containerImage.debianCodename` in
 
 ## Single-arch vs multi-arch
 
-`scripts/build-local.sh` takes one positional argument, the mode:
+`build/scripts/build-local.sh` takes one positional argument, the mode:
 
 - `single` (default) — builds the shippable **`runtime`** stage for your **local
   host platform** and `--load`s it into your local docker image store so you can
@@ -182,7 +182,7 @@ git tag 7.2.2   && git push origin 7.2.2
 git tag 7.2.2.1 && git push origin 7.2.2.1
 ```
 
-On that signal, `release-promote.yml` (via `scripts/plan-release-tags.sh`):
+On that signal, `release-promote.yml` (via `build/scripts/plan-release-tags.sh`):
 
 1. Takes the **latest 2 distinct** 3-component `<version>`s across **all** tags
    (both `-dev-r<n>` and `-r<n>` reveal a version). Older versions stay frozen.
@@ -257,7 +257,7 @@ js-controller versions current:
    versions (those with just `<version>-dev-r<n>` tags) and older versions are
    left frozen — a version is refreshed only after `release-promote.yml` has
    cut its first `-r1`.
-2. For each, `scripts/check-base-refresh.sh` finds the highest revision (e.g.
+2. For each, `build/scripts/check-base-refresh.sh` finds the highest revision (e.g.
    `7.2.2-r5`), reads the base image from that published image's own
    `org.opencontainers.image.base.name` label, and compares the base image's
    `created` timestamp against the published image's `created` timestamp.
@@ -294,7 +294,7 @@ without creating anything.
 
 ## Configuration (environment overrides)
 
-`scripts/build-local.sh` honors these environment variables:
+`build/scripts/build-local.sh` honors these environment variables:
 
 - `CONTAINER_ENGINE` — the container engine to build with: `docker` (default) or
   `podman`. Both expose a Docker-compatible `buildx build` CLI, and the script

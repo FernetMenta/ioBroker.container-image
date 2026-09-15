@@ -18,8 +18,8 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "build:local": "scripts/build-local.sh single",
-    "build:local:multi": "scripts/build-local.sh multi"
+    "build:local": "build/scripts/build-local.sh single",
+    "build:local:multi": "build/scripts/build-local.sh multi"
   },
   "license": "MIT",
   "author": "FernetMenta <fernetmenta@online.de>",

@@ -21,8 +21,9 @@
 #
 # NODE_MAJOR (from `nodeMajor`) and DEBIAN_CODENAME (from `debianCodename`) are
 # read once from the maintainer-owned Build_Config in package.json (the
-# `containerImage` key), reusing the same strict derivation as lib/node-major.js
-# + lib/build-config.js. The workflow FAILS FAST before any build step in EVERY
+# `containerImage` key), reusing the same strict derivation as
+# build/lib/node-major.js + build/lib/build-config.js. The workflow FAILS FAST
+# before any build step in EVERY
 # trigger mode when a knob is missing/empty/invalid. (Req 5.4, 5.5, 5.7)
 #
 # The image is published EXPLICITLY as ghcr.io/<owner>/iobroker (lowercased),
@@ -106,8 +107,9 @@ jobs:
 
       - name: Read NODE_MAJOR and DEBIAN_CODENAME from package.json containerImage
         id: read
-        # Reuse the exact strict derivation from lib/node-major.js +
-        # lib/build-config.js. Read the maintainer-owned Build_Config from the
+        # Reuse the exact strict derivation from build/lib/node-major.js +
+        # build/lib/build-config.js. Read the maintainer-owned Build_Config from
+        # the
         # repo-root package.json `containerImage` key. Fail (exit 1) with a
         # naming error if nodeMajor is missing/empty/invalid or debianCodename is
         # missing/empty — never fall back to a system default. (Req 5.4, 5.5, 5.7)
@@ -115,8 +117,8 @@ jobs:
           set -euo pipefail
           node --input-type=module <<'NODE'
           import { appendFileSync } from 'node:fs';
-          import { readPackageJson, readDebianCodename } from './lib/build-config.js';
-          import { deriveNodeMajorFromPackageJson } from './lib/node-major.js';
+          import { readPackageJson, readDebianCodename } from './build/lib/build-config.js';
+          import { deriveNodeMajorFromPackageJson } from './build/lib/node-major.js';
 
           try {
             const pkg = readPackageJson('./package.json');

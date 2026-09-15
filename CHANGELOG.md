@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Work In Progress]
+
+### Changed
+
+- Build-only tooling is now separated from the runtime files. The local build
+  path and CI helper scripts (`build-local.sh`, `check-base-refresh.sh`,
+  `plan-release-tags.sh`) moved from `scripts/` to `build/scripts/`, and their
+  build-time decision modules (`build-config.js`, `node-major.js`) moved from
+  `lib/` to `build/lib/`. The Dockerfile's `COPY scripts/` / `COPY lib/` now
+  bring only runtime files into the image, so build-only code is no longer
+  shipped in the runtime image. References in `package.json`, the CI workflows,
+  the tests, and the documentation were updated accordingly.
+
 ## [7.2.2] 13.07.2026
 
 ### Added

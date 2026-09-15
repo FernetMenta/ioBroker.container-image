@@ -9,7 +9,7 @@
 # The Debian release is selected by the DEBIAN_CODENAME build arg (default
 # trixie); both stages share it. NODE_MAJOR and DEBIAN_CODENAME are read from
 # the maintainer-owned Build_Config in package.json (the `containerImage` key:
-# `nodeMajor` + `debianCodename`; see lib/build-config.js + lib/node-major.js)
+# `nodeMajor` + `debianCodename`; see build/lib/build-config.js + build/lib/node-major.js)
 # and supplied by CI / the local build path as build args, with fail-fast
 # behavior before any build begins. (Req 5.4, 5.5, 5.7)
 
@@ -66,7 +66,7 @@ ENV JS_CONTROLLER_VERSION=${JS_CONTROLLER_VERSION}
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Fail fast if NODE_MAJOR was not supplied. The value must be an integer major
-# version (validated upstream by lib/node-major.js against the package.json
+# version (validated upstream by build/lib/node-major.js against the package.json
 # `containerImage.nodeMajor` Build_Config); this guard prevents an accidental
 # build without it and never falls back to a system default. (Req 5.4, 5.5)
 RUN set -eu; \
@@ -367,6 +367,11 @@ COPY --from=build /opt/iobroker ${IOB_DIR}
 # scripts resolve their modules via `${SCRIPT_DIR}/../lib`, so the scripts/ and
 # lib/ directories MUST remain siblings. They are placed under /opt as
 # /opt/scripts and /opt/lib to preserve that `../lib` relationship. (Req 6, 8)
+#
+# Only the RUNTIME scripts/modules live under scripts/ and lib/ and are copied
+# here. Build-only tooling (the local build path + CI helpers and their decision
+# modules) lives under build/ (build/scripts, build/lib) and is deliberately NOT
+# copied into the shipped image.
 COPY scripts/ /opt/scripts/
 COPY lib/ /opt/lib/
 

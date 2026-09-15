@@ -11,7 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 import { assertParams } from './helpers/fast-check-config.js';
-import { deriveNodeMajor, NodeMajorDerivationError } from '../lib/node-major.js';
+import { deriveNodeMajor, NodeMajorDerivationError } from '../build/lib/node-major.js';
 
 // A raw value that is a valid integer major version and the exact integer it
 // must derive to. Covers integer numbers and (possibly whitespace-padded)

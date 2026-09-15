@@ -14,7 +14,7 @@ import {
   readBuildConfig,
   readNodeMajor,
   readDebianCodename,
-} from '../lib/build-config.js';
+} from '../build/lib/build-config.js';
 
 describe('test tooling scaffold', () => {
   it('runs the unit test framework', () => {

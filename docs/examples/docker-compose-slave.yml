@@ -20,7 +20,7 @@
 # and the image runs as uid 1000, so writes line up without extra steps.
 #
 # Build the image first (from the repo root):
-#   scripts/build-local.sh single      # produces iobroker:local
+#   build/scripts/build-local.sh single      # produces iobroker:local
 # Then, from this testing/ folder:
 #   docker compose up            # add -d to detach
 #
