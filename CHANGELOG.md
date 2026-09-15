@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   succeeds, the `publish` job posts a message with the published image
   reference and the workflow run URL to a Slack channel via an incoming webhook
   (`SLACK_WEBHOOK_URL` repository secret).
+- Pushing a plain `<version>` release-signal tag (e.g. `7.2.3`) now also creates
+  a matching GitHub Release. The `release-promote` workflow creates the release
+  for the signal tag, drawing its notes from the corresponding `## [<version>]`
+  CHANGELOG section (falling back to auto-generated notes when absent). The
+  per-revision `<version>-r<n>` image tags do NOT each create a release, so a
+  GitHub Release stays in sync with the CHANGELOG.
 
 ### Changed
 

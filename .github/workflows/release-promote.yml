@@ -117,3 +117,52 @@ jobs:
           if [[ "${DRY_RUN}" != "true" && "${created_any}" -eq 0 ]]; then
             echo "No new release tags were created."
           fi
+
+      - name: Create GitHub Release for the signal tag
+        # A GitHub Release tracks the human-facing CHANGELOG, which is keyed by
+        # the 3-component `<version>` — NOT the per-revision `<version>-r<n>`
+        # image tags (those are cut on every rebuild/base-refresh and must not
+        # each spawn a release). So the release is created for the plain
+        # `<version>` (or `<version>.<build>`) SIGNAL tag the maintainer pushes,
+        # exactly the tag that triggered this workflow.
+        #
+        # Only on a real signal-tag push (not workflow_dispatch, not dry-run).
+        # Idempotent: if a release for the tag already exists it is left as-is.
+        # Notes come from the CHANGELOG section for the 3-component version; if
+        # that section is absent, auto-generated notes are used. The promote job
+        # already has contents:write, which `gh release` needs.
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNAL_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${SIGNAL_TAG}" >/dev/null 2>&1; then
+            echo "GitHub Release '${SIGNAL_TAG}' already exists; leaving it unchanged."
+            exit 0
+          fi
+
+          # The CHANGELOG is keyed by the 3-component `<version>`. The signal tag
+          # is either that exact version (e.g. 7.2.3) or a 4-component image-only
+          # nudge (e.g. 7.2.2.1); take the first three components for the lookup.
+          changelog_version="$(printf '%s' "${SIGNAL_TAG}" | cut -d. -f1-3)"
+
+          # Extract the CHANGELOG section: lines between `## [${changelog_version}]`
+          # and the next `## ` header.
+          notes_file="$(mktemp)"
+          release_args=(--title "${SIGNAL_TAG}" --verify-tag)
+          if awk -v ver="${changelog_version}" '
+               index($0, "## [" ver "]") == 1 { grab=1; next }
+               grab && /^## / { exit }
+               grab { print }
+             ' CHANGELOG.md > "${notes_file}" && [[ -s "${notes_file}" ]]; then
+            echo "Using CHANGELOG section for '${changelog_version}' as release notes."
+            release_args+=(--notes-file "${notes_file}")
+          else
+            echo "No CHANGELOG section for '${changelog_version}'; using auto-generated notes."
+            release_args+=(--generate-notes)
+          fi
+
+          echo "Creating GitHub Release '${SIGNAL_TAG}'."
+          gh release create "${SIGNAL_TAG}" "${release_args[@]}"
