@@ -67,6 +67,12 @@
 #   BUILD_CONFIG_JSON  Path to the package.json holding the containerImage
 #                      Build_Config. Defaults to the repo-root ./package.json.
 #   IMAGE_TAG      Image reference/tag for the build (default: iobroker:local).
+#   IMAGE_VERSION_TAG  The immutable version tag baked into the image as
+#                      /opt/iobroker/.image-tag and printed by the entrypoint's
+#                      "System Information" banner (the `<version>-r<n>` shape CI
+#                      publishes, e.g. 7.2.2-r7). For a local build this is just
+#                      a marker; defaults to `local`. Passed to the Dockerfile
+#                      IMAGE_TAG build arg.
 #   BUILD_TARGET   Dockerfile stage to build and load (default: `runtime`, the
 #                  shippable rootless image). Override to build a specific stage;
 #                  when overridden away from `runtime` the separate verify gate
@@ -106,6 +112,12 @@ MODE="${1:-single}"
 # the per-mode arguments are added below.
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 IMAGE_TAG="${IMAGE_TAG:-iobroker:local}"
+# Immutable version tag baked into the image (/opt/iobroker/.image-tag) and
+# surfaced by the entrypoint banner. Distinct from IMAGE_TAG (the docker
+# reference the image is loaded under): this is the `<version>-r<n>` marker CI
+# derives from the git tag. Local builds have no git tag, so it defaults to
+# `local`. Passed through as the Dockerfile IMAGE_TAG build arg.
+IMAGE_VERSION_TAG="${IMAGE_VERSION_TAG:-local}"
 # js-controller version to pin in the image. Empty => let the Dockerfile default
 # (`stable`) apply. Set to a concrete version (e.g. 6.0.11) or dist-tag to build
 # an image for upgrade/downgrade testing.
@@ -239,7 +251,7 @@ if [[ -n "${JS_CONTROLLER_VERSION}" ]]; then
   echo "build-local: pinning JS_CONTROLLER_VERSION=${JS_CONTROLLER_VERSION}" >&2
 fi
 
-echo "build-local: engine=${CONTAINER_ENGINE}, mode=${MODE}, target=${BUILD_TARGET}, tag=${IMAGE_TAG}, debian=${DEBIAN_CODENAME}" >&2
+echo "build-local: engine=${CONTAINER_ENGINE}, mode=${MODE}, target=${BUILD_TARGET}, tag=${IMAGE_TAG}, image-tag=${IMAGE_VERSION_TAG}, debian=${DEBIAN_CODENAME}" >&2
 
 # --- Run the runtime-dependency verification gate ---------------------------
 # The loadable/validation build below targets the shippable stage (default
@@ -268,6 +280,7 @@ run_verify_gate() {
     -f "${REPO_ROOT}/Dockerfile"
     --build-arg "NODE_MAJOR=${NODE_MAJOR}"
     --build-arg "DEBIAN_CODENAME=${DEBIAN_CODENAME}"
+    --build-arg "IMAGE_TAG=${IMAGE_VERSION_TAG}"
     "${jsc_build_arg[@]}"
     --target "${VERIFY_TARGET}"
   )
@@ -291,6 +304,7 @@ build_args=(
   -f "${REPO_ROOT}/Dockerfile"
   --build-arg "NODE_MAJOR=${NODE_MAJOR}"
   --build-arg "DEBIAN_CODENAME=${DEBIAN_CODENAME}"
+  --build-arg "IMAGE_TAG=${IMAGE_VERSION_TAG}"
   "${jsc_build_arg[@]}"
   --target "${BUILD_TARGET}"
   -t "${IMAGE_TAG}"

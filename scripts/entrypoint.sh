@@ -149,6 +149,7 @@ ENV_SNAPSHOT="$(run_node "process.stdout.write(JSON.stringify(process.env));")"
   banner_line ""
   rule
   banner_line "System Information"
+  kv_line "image tag:" "$(cat "${IOBROKER_DIR}/.image-tag" 2>/dev/null || echo unknown)"
   kv_line "arch:" "$(uname -m 2>/dev/null || echo unknown)"
   kv_line "hostname:" "$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
   kv_line "node:" "$(node --version 2>/dev/null || echo unknown)"

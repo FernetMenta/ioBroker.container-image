@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ## [WORK IN PROGRESS]
 -->
 
+## [WORK IN PROGRESS]
+
+### Added
+
+- Image version tag is baked into the image and logged out with the banner on entrypoint.
+
 ## [7.2.2.1] 15.07.2026
 
 ### Added

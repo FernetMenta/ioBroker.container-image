@@ -288,6 +288,16 @@ ARG IOB_DIR=/opt/iobroker
 ARG NODE_MAJOR
 ARG DEBIAN_CODENAME=trixie
 
+# The immutable image tag this build is published under, e.g. `7.2.2-r7`
+# (`<version>-r<n>`) or `7.2.2-dev-r2`. CI passes it from the pushed git tag (the
+# single source of truth; see .github/workflows/build-publish.yml -> release_tag)
+# and the local build path passes IMAGE_VERSION_TAG. It is BAKED into the image
+# as /opt/iobroker/.image-tag (below) so the running container knows exactly
+# which published image it came from, and the entrypoint prints it in the
+# startup "System Information" banner. Defaults to `unknown` for ad-hoc builds
+# that do not supply it (e.g. a plain `docker build` with no tag arg).
+ARG IMAGE_TAG=unknown
+
 # Non-interactive apt for reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -374,6 +384,18 @@ COPY --from=build /opt/iobroker ${IOB_DIR}
 # copied into the shipped image.
 COPY scripts/ /opt/scripts/
 COPY lib/ /opt/lib/
+
+# Bake the immutable image tag (`<version>-r<n>`, e.g. `7.2.2-r7`) into the image
+# as a dotfile the running container can read. The entrypoint reads this file and
+# prints it in the startup "System Information" banner so `docker logs` shows
+# exactly which published image the container was launched from. Written here as
+# root; the file lives under /opt/iobroker (owned 1000:0 by the user-model step
+# below) and is made world-readable there via the `chmod -R o+rX "${IOB_DIR}"`
+# in that step, so the non-root Container_User (uid 1000) can read it. Using
+# printf (no trailing prompt) keeps the file a single clean line. (Req 1.3)
+RUN set -eux; \
+    printf '%s\n' "${IMAGE_TAG}" > "${IOB_DIR}/.image-tag"; \
+    test -s "${IOB_DIR}/.image-tag"
 
 # =============================================================================
 # Runtime_Image capabilities / user model / metadata (task 14.3)
@@ -559,6 +581,7 @@ LABEL org.opencontainers.image.title="ioBroker" \
       org.opencontainers.image.documentation="https://github.com/FernetMenta/ioBroker.container-image" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.base.name="node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim" \
+      org.opencontainers.image.version="${IMAGE_TAG}" \
       org.iobroker.node.major="${NODE_MAJOR}" \
       org.iobroker.debian.codename="${DEBIAN_CODENAME}"
 

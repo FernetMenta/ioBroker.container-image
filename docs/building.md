@@ -244,6 +244,24 @@ On a **dev** tag (`<version>-dev-r<n>`) only the immutable tag is published;
 | -------------- | --------- | ---------------- |
 | `7.2.2-dev-r2` | immutable | this exact build |
 
+### The immutable tag is baked into the image
+
+Whichever tag CI publishes (`<version>-r<n>` or `<version>-dev-r<n>`) is also
+**baked into the image** at build time as `/opt/iobroker/.image-tag` (via the
+`IMAGE_TAG` build arg) and recorded as the `org.opencontainers.image.version` OCI
+label. The entrypoint reads that dotfile and prints it in the startup
+**System Information** banner, so `docker logs` opens with the exact image the
+container was launched from:
+
+```
+-----                          System Information                          -----
+-----     image tag:              7.2.2-r7                                  -----
+```
+
+A local build (`build/scripts/build-local.sh`) sets this from `IMAGE_VERSION_TAG`
+(default `local`); an ad-hoc `docker build` with no `--build-arg IMAGE_TAG=...`
+shows `unknown`.
+
 ### Automatic revision bumps on a newer base image
 
 The base image (`node:<major>-<codename>-slim`) is rebuilt upstream for security

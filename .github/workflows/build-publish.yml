@@ -260,6 +260,12 @@ jobs:
             # Dockerfile version-match check fires here — catching a bad tag
             # BEFORE publish. On non-tag builds it is `stable`.
             JS_CONTROLLER_VERSION=${{ needs.read-build-config.outputs.js_controller_version }}
+            # The immutable image tag (`<version>-r<n>`, e.g. 7.2.2-r7) baked
+            # into the image as /opt/iobroker/.image-tag and printed by the
+            # entrypoint's "System Information" banner. On non-tag builds
+            # (PRs, main, dispatch) release_tag is empty, so the Dockerfile ARG
+            # default (`unknown`) applies.
+            IMAGE_TAG=${{ needs.read-build-config.outputs.release_tag }}
 
       - name: Report failing architecture
         if: failure()
@@ -349,6 +355,13 @@ jobs:
             # published image installs exactly what the tag claims, never the
             # drifting `stable` dist-tag.
             JS_CONTROLLER_VERSION=${{ needs.read-build-config.outputs.js_controller_version }}
+            # Bake the immutable image tag (`<version>-r<n>` e.g. 7.2.2-r7, or
+            # `<version>-dev-r<n>`) into the published image as
+            # /opt/iobroker/.image-tag. This is the exact git tag being
+            # published (publish only runs on a pushed tag, so release_tag is
+            # always non-empty here) and is what the entrypoint's "System
+            # Information" banner reports at startup.
+            IMAGE_TAG=${{ needs.read-build-config.outputs.release_tag }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
