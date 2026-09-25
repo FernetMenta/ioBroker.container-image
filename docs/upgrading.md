@@ -123,6 +123,11 @@ major upgrade:
 - Keep the previous image tag. If something goes wrong, start the old tag again
   against the same volumes to roll back.
 
+If you need to restore such a backup — onto the same container or a fresh one —
+see [Restoring a backup](./restore-backup.md): stage the archive in a `restore/`
+folder and recreate the container, and the restore runs at startup (the only
+point where js-controller is stopped).
+
 ## Reclaim disk space: prune orphaned anonymous volumes
 
 This applies to the **default** setup where you did **not** explicitly mount a

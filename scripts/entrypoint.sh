@@ -25,6 +25,13 @@
 #   7. Reconcile INIT phase via scripts/reconcile.sh (IOB_RECONCILE_PHASE=init):
 #      on an empty Data_Volume, initialize the default config + local DB so
 #      iobroker.json exists for the next step to patch.                (Req 8.6)
+#   7b. Restore an ioBroker backup on request via scripts/restore-backup.sh:
+#      when a `restore/` folder with a single backup file exists in the
+#      Data_Volume, run `iobroker restore` here (js-controller is stopped, so
+#      this is the only safe point), log to log/restore.log, delete the folder
+#      on success, and refuse to start on any error. Runs after init (so the
+#      CLI has a config/DB to operate on, making a fresh-container restore work)
+#      and before DB config so the restored config drives the steps below.
 #   8. Configure objects/states DB backends + multihost role via
 #      scripts/configure-db.sh (idempotent; patches only operator-specified
 #      fields). Runs AFTER init so iobroker.json exists, and BEFORE the install
@@ -273,7 +280,7 @@ fi
 # the settings file is corrupt or inaccessible and the adapter install must be
 # blocked, so we refuse to continue (Req 11.4 / 11.5).
 # ---------------------------------------------------------------------------
-stage "Step 1 of 5: Ensuring npm settings"
+stage "Step 1 of 6: Ensuring npm settings"
 log "ensuring .npmrc npm settings"
 if ! "${SCRIPT_DIR}/ensure-npmrc.sh"; then
   die "npm settings could not be ensured; refusing to start js-controller"
@@ -557,11 +564,45 @@ restore_db_hosts() {
 # so there is an iobroker.json for configure-db to patch. On a populated
 # Data_Volume there is nothing to init and this pass is a no-op.
 # ---------------------------------------------------------------------------
-stage "Step 2 of 5: Initializing configuration"
+stage "Step 2 of 6: Initializing configuration"
 log "running reconciliation (init phase)"
 if ! env "${RECONCILE_ENV[@]}" IOB_RECONCILE_PHASE=init \
   "${SCRIPT_DIR}/reconcile.sh"; then
   die "configuration initialization failed; refusing to start js-controller"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. Restore an ioBroker backup on request (BEFORE js-controller starts).
+#
+# `iobroker restore` requires js-controller to be STOPPED while it rewrites the
+# objects/states DBs and iobroker.json. Here js-controller is PID 1's foreground
+# process (exec'd as the very last step), so there is no running container in
+# which an operator could stop-restore-start — stopping the controller would
+# terminate the container. The only safe moment to restore is DURING startup,
+# before the exec, which is here.
+#
+# An operator triggers a restore by dropping a SINGLE backup file into a
+# `restore/` folder in the Data_Volume and (re)creating the container. On this
+# start we detect the folder, run the restore, log the full CLI transcript to
+# Log_Volume/restore.log, and — on success — delete the folder so the restore
+# happens EXACTLY ONCE (a later restart must not re-apply it over live data). On
+# ANY restore error we refuse to start (a half-restored DB is worse than a clear
+# failure), leaving the folder in place for inspection.
+#
+# It runs AFTER the reconcile init phase (so iobroker.json + the local DB exist
+# for the CLI to operate on, making a restore onto a FRESH container work) and
+# BEFORE DB configuration + the install phase, so the restored config is what
+# configure-db patches and what the desired-adapter query reads — the adapters
+# the backup expects then get installed by the install phase below.
+#
+# RECONCILE_ENV does not carry the Log_Volume path, so pass IOB_LOG_DIR
+# explicitly for restore.log.
+stage "Step 3 of 6: Restoring backup (if requested)"
+log "checking for a backup restore request"
+if ! env "${RECONCILE_ENV[@]}" \
+  "IOB_LOG_DIR=${IOBROKER_DIR}/log" \
+  "${SCRIPT_DIR}/restore-backup.sh"; then
+  die "backup restore failed; refusing to start js-controller"
 fi
 
 # ---------------------------------------------------------------------------
@@ -585,7 +626,7 @@ fi
 # IOB_* DB variables are passed through from the entrypoint environment (they
 # are opt-in and NOT defaulted).
 # ---------------------------------------------------------------------------
-stage "Step 3 of 5: Configuring database / multihost"
+stage "Step 4 of 6: Configuring database / multihost"
 log "configuring database backends / multihost"
 if ! IOB_ROOT="${IOBROKER_DIR}" \
   IOB_MULTIHOST="${IOB_MULTIHOST:-}" \
@@ -619,7 +660,7 @@ fi
 # if a required install/rebuild command genuinely fails. We surface that as a
 # hard error so we do not exec a half-provisioned runtime.
 # ---------------------------------------------------------------------------
-stage "Step 4 of 5: Reconciling adapters"
+stage "Step 5 of 6: Reconciling adapters"
 log "running reconciliation (install phase)"
 # Keep any running multihost slave OUT during the install phase by binding the
 # objects/states DB to loopback (see isolate_db_hosts_for_install above). Restore
@@ -679,7 +720,7 @@ seeded from the image on first start) rather than an empty host bind mount, or \
 omit the node_modules mount entirely. See docs/volumes-and-multihost.md."
 fi
 
-stage "Step 5 of 5: Starting ioBroker"
+stage "Step 6 of 6: Starting ioBroker"
 
 # Start the package.json snapshot watcher in the BACKGROUND for the container's
 # lifetime. It copies /opt/iobroker/package.json to the snapshot on the

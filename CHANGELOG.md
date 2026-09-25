@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Image version tag is baked into the image and logged out with the banner on entrypoint.
+- Backups can now be restored at container startup. Because `iobroker restore`
+  requires a stopped js-controller (and stopping it terminates the container),
+  the entrypoint performs the restore during startup: if a `restore/` folder
+  with a single backup archive is present in the Data_Volume, it runs
+  `iobroker restore` before js-controller starts, logs the full CLI transcript
+  to `log/restore.log`, deletes the `restore/` folder on success, and refuses to
+  start on any error (leaving the folder in place for inspection). It runs after
+  the init phase and before database configuration, so it also works on a fresh
+  container with no prior data — allowing a backup to be restored onto a new
+  system. See [docs/restore-backup.md](docs/restore-backup.md).
 
 ## [7.2.2.1] 15.07.2026
 
