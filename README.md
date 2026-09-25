@@ -124,6 +124,62 @@ podman run -d \
 
 Then open <http://localhost:8081> for the admin UI.
 
+#### Advanced: keep the default user and grant the subuid via ACLs
+
+If you would rather not run as container uid 0 at all — even though under
+rootless Podman that only maps to your own host user — you can keep the image's
+default non-root user (uid 1000) and instead grant the **mapped subuid** access
+to the storage with POSIX ACLs. This is the more paranoid option: the container
+runs as a genuinely unprivileged in-namespace user, and only that user's host
+identity gets write access to the data.
+
+Under rootless Podman, container uid 1000 maps to a host subuid derived from
+your `/etc/subuid` range. With the common range that starts at 100000, it lands
+on **100999** (base `100000` + container uid `1000` − 1, because container uid 0
+maps to your own host user). Check your own base with
+`grep "^$(whoami):" /etc/subuid` and adjust the number below if it differs.
+
+For named volumes, grant the subuid access to the volume's mountpoint (repeat
+for each volume you use). The default ACL on directories makes files created
+later inherit the permission:
+
+```bash
+for v in iobroker-data iobroker-node; do
+  p=$(podman volume inspect "$v" --format '{{.Mountpoint}}')
+  setfacl -R -m u:100999:rwX "$p"
+  find "$p" -type d -exec setfacl -m d:u:100999:rwX {} +
+done
+```
+
+To seed a named volume with existing data (e.g. a backup) before first start,
+copy into the same mountpoint:
+
+```bash
+p=$(podman volume inspect iobroker-data --format '{{.Mountpoint}}')
+cp -a ./backup-data/. "$p"/
+```
+
+For a bind mount, apply the same ACLs to the host directory:
+
+```bash
+LOGDIR=/home/youruser/iobroker/logs
+setfacl -R -m u:100999:rwX "$LOGDIR"
+find "$LOGDIR" -type d -exec setfacl -m d:u:100999:rwX {} +
+```
+
+With the ACLs in place you run the container normally, without any `--user`
+override, so it stays on the default uid 1000:
+
+```bash
+podman run -d \
+  --name iobroker \
+  -p 8081:8081 \
+  -p 8082:8082 \
+  -v iobroker-data:/opt/iobroker/iobroker-data \
+  -v iobroker-log:/opt/iobroker/log \
+  ghcr.io/fernetmenta/iobroker
+```
+
 ## Persistence
 
 The image persists only the folders that hold configuration, state, logs, and

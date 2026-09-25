@@ -42,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (container uid 0 maps to your host user), and avoid `--userns=keep-id` (it
   forces a slow one-time image-layer remap on first start). The backup restore
   guide ([docs/restore-backup.md](docs/restore-backup.md)) gained a matching
-  rootless-Podman ownership note.
+  rootless-Podman ownership note. The README also documents an advanced
+  alternative for rootless Podman: keep the default non-root user (uid 1000) and
+  grant its mapped host subuid access to volumes/bind mounts via POSIX ACLs
+  (`setfacl`), avoiding container uid 0 entirely.
 
 ## [7.2.2.1] 15.07.2026
 
