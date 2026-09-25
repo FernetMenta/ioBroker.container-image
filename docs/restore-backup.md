@@ -55,6 +55,17 @@ too since it also starts the container.
    sudo chown -R 1000:0 ./iobroker-data/restore   # if your host user is not uid 1000
    ```
 
+   > **Rootless Podman with a host bind mount:** the ownership rule is
+   > different. There the container runs as uid 0, which maps to your own host
+   > user, so the container reaches the file through *your* host ownership — no
+   > `chown` to 1000:0 is needed (and it would be wrong). Just stage the file as
+   > your host user and start the container with `--user 0:0`:
+   >
+   > ```bash
+   > mkdir -p ./iobroker-data/restore
+   > cp 2025_01_31-02_00_00_backupIoBroker.tar.gz ./iobroker-data/restore/
+   > ```
+
    For a named volume, run a throwaway helper **as uid 1000:0** so the copy is
    owned correctly:
 

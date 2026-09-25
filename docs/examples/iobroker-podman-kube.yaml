@@ -1,0 +1,122 @@
+# Example Podman kube play manifest for a ROOTFUL Podman deployment.
+#
+# This example targets rootful Podman (run via `sudo podman kube play` or the
+# root Podman service). Rootful is required for setups like macvlan networking,
+# which needs the container to attach to a host interface — something rootless
+# Podman cannot do.
+#
+# Because Podman runs as root here, the container's uid/gid map directly to the
+# host (no user-namespace remap). Running as a non-root user is therefore
+# achieved by `runAsUser: 1000` / `runAsGroup: 1000` below, and the host paths
+# behind the bind-mounted volumes should be owned by uid 1000 so writes line up.
+#
+# Do NOT reuse this as-is under ROOTLESS Podman: there container uid 1000 maps
+# to a subordinate uid you do not own, so bind-mounted writes end up unreadable
+# from the host. For rootless with bind mounts, run as uid 0 (which maps to your
+# host user) instead.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iobroker-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Podman ignores this PVC size for volume allocation and quota.
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iobroker-log
+  annotations:
+    volume.podman.io/driver: local
+    volume.podman.io/type: bind
+    volume.podman.io/device: /home/user1/progs/iobroker/log
+    volume.podman.io/mount-options: bind
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Podman ignores this PVC size for volume allocation and quota.
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iobroker-node
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Podman ignores this PVC size for volume allocation and quota.
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iobroker-scripts
+  annotations:
+    volume.podman.io/driver: local
+    volume.podman.io/type: bind
+    volume.podman.io/device: /home/user1/progs/iobroker/scripts-mirror
+    volume.podman.io/mount-options: bind
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # Podman ignores this PVC size for volume allocation and quota.
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iobroker
+  labels:
+    app: iobroker
+spec:
+  hostname: iobroker
+  restartPolicy: Never # restart is handled by Quadlet
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    sysctls:
+      - name: net.ipv4.ping_group_range
+        value: "0 2147483647"
+  terminationGracePeriodSeconds: 10
+  containers:
+    - name: iobroker
+      image: ghcr.io/fernetmenta/iobroker:7.2.2
+      imagePullPolicy: Always
+      env:
+        - name: IOB_MULTIHOST
+          value: master
+        - name: TZ
+          value: Europe/Berlin
+      volumeMounts:
+        - name: iobroker-data
+          mountPath: /opt/iobroker/iobroker-data
+        - name: iobroker-log
+          mountPath: /opt/iobroker/log
+        - name: iobroker-node
+          mountPath: /opt/iobroker/node_modules
+        - name: iobroker-scripts
+          mountPath: /opt/iob-scripts-mirror
+  volumes:
+    - name: iobroker-data
+      persistentVolumeClaim:
+        claimName: iobroker-data
+    - name: iobroker-log
+      persistentVolumeClaim:
+        claimName: iobroker-log
+    - name: iobroker-node
+      persistentVolumeClaim:
+        claimName: iobroker-node
+    - name: iobroker-scripts
+      persistentVolumeClaim:
+        claimName: iobroker-scripts

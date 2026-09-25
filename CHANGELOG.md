@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the init phase and before database configuration, so it also works on a fresh
   container with no prior data — allowing a backup to be restored onto a new
   system. See [docs/restore-backup.md](docs/restore-backup.md).
+- Example rootful Podman `kube play` manifest
+  ([docs/examples/iobroker-podman-kube.yaml](docs/examples/iobroker-podman-kube.yaml)),
+  including macvlan networking and PVC-backed volumes. It documents that rootful
+  Podman is required for setups like macvlan and that, under rootful Podman, the
+  container uid/gid map directly to the host so `runAsUser: 1000` selects a
+  non-root runtime user.
+
+### Changed
+
+- Corrected the run examples for the rootless vs. rootful distinction. The
+  README quick start now shows that `--user $(id -u):$(id -g)` applies to
+  **rootful** Docker/Podman (where the container uid maps directly to the host),
+  while under **rootless** Podman the default user is already unprivileged: use
+  named volumes with the default user, or run as `--user 0:0` for bind mounts
+  (container uid 0 maps to your host user), and avoid `--userns=keep-id` (it
+  forces a slow one-time image-layer remap on first start). The backup restore
+  guide ([docs/restore-backup.md](docs/restore-backup.md)) gained a matching
+  rootless-Podman ownership note.
 
 ## [7.2.2.1] 15.07.2026
 

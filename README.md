@@ -41,12 +41,30 @@ First boot on an empty data volume takes a short while as the container
 initializes ioBroker and installs the admin adapter, after which the admin UI is
 available on port 8081.
 
-### Docker
+> **Don't run as host root — but "host root" depends on the runtime.**
+>
+> - **Rootful Docker / rootful Podman** (the daemon or `sudo podman` runs as
+>   root): the container's uid maps directly to the host, so pass
+>   `--user $(id -u):$(id -g)`. Otherwise the process — and every file it writes
+>   to your mounts — is owned by real host root.
+> - **Rootless Podman**: everything already runs inside your user namespace, so
+>   nothing here is host root. The container's uid 0 maps to *your* host user,
+>   while the image default (uid 1000) maps to a subordinate uid that is not
+>   you. So do **not** pass `--user $(id -u):$(id -g)` (that number lands on a
+>   subuid you don't own and breaks mount ownership). Use named volumes with the
+>   default user, or for bind mounts run as container root (`--user 0:0`) so the
+>   files come out owned by your host user. Avoid `--userns=keep-id`: it triggers
+>   a slow one-time layer remap on first start.
+
+### Docker (rootful)
+
+Named volumes let the runtime manage ownership, so they work without extra
+setup:
 
 ```bash
-docker volume create iobroker-data
 docker run -d \
   --name iobroker \
+  --user $(id -u):$(id -g) \
   -p 8081:8081 \
   -p 8082:8082 \
   -v iobroker-data:/opt/iobroker/iobroker-data \
@@ -54,9 +72,28 @@ docker run -d \
   ghcr.io/fernetmenta/iobroker
 ```
 
+#### Bind mounts (local directories)
+
+If you prefer to bind-mount local directories (handy during development),
+create them first and run as your own uid/gid so the container can write to
+them:
+
+```bash
+mkdir -p data logs
+docker run -d \
+  --name iobroker \
+  --user $(id -u):$(id -g) \
+  -p 8081:8081 \
+  -p 8082:8082 \
+  -v ./data:/opt/iobroker/iobroker-data \
+  -v ./logs:/opt/iobroker/log \
+  ghcr.io/fernetmenta/iobroker
+```
+
 ### Podman (rootless)
 
-Podman uses the same syntax as Docker:
+Rootless Podman already runs the image's default non-root user unprivileged, so
+no `--user` flag is needed with named volumes:
 
 ```bash
 podman run -d \
@@ -65,6 +102,23 @@ podman run -d \
   -p 8082:8082 \
   -v iobroker-data:/opt/iobroker/iobroker-data \
   -v iobroker-log:/opt/iobroker/log \
+  ghcr.io/fernetmenta/iobroker
+```
+
+For bind mounts, run as container root (`--user 0:0`). Under rootless Podman
+container uid 0 maps to your host user, so the files created in `./data` and
+`./logs` come out owned by you on the host, and the container can read/write
+them — with no `--userns=keep-id` layer remap:
+
+```bash
+mkdir -p data logs
+podman run -d \
+  --name iobroker \
+  --user 0:0 \
+  -p 8081:8081 \
+  -p 8082:8082 \
+  -v ./data:/opt/iobroker/iobroker-data \
+  -v ./logs:/opt/iobroker/log \
   ghcr.io/fernetmenta/iobroker
 ```
 
