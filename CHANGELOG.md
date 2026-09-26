@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ## [WORK IN PROGRESS]
 -->
 
-## [WORK IN PROGRESS]
+## [7.2.2.2] 26.09.2026
 
 ### Added
 
@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grant its mapped host subuid access to volumes/bind mounts via POSIX ACLs
   (`setfacl`), avoiding container uid 0 entirely.
 
-## [7.2.2.1] 15.07.2026
+## [7.2.2.1] 15.09.2026
 
 ### Added
 
@@ -103,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now excluded from the installed-adapter set. Covered by
   `test/smoke/installed-adapters-complete.sh`.
 
-## [7.2.2] 13.07.2026
+## [7.2.2] 13.09.2026
 
 ### Added
 
