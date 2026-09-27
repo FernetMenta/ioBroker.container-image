@@ -16,10 +16,16 @@
 #      built on is now NEWER than the published image. The base image is read
 #      from the published image's own OCI label, so there is no second source of
 #      truth.
-#   3. If the base is newer, create and push the next revision tag (7.2.2-r6).
-#      Pushing that tag triggers .github/workflows/build-publish.yml, which
-#      does the actual multi-arch build + publish. This workflow itself never
-#      builds or pushes images — it only decides and tags.
+#   3. If the base is newer, create and push the next revision tag (7.2.2-r6)
+#      pointing at the SAME commit as the previous revision (7.2.2-r5), NOT at
+#      current main. A base refresh must rebuild the exact released source tree
+#      (Dockerfile, scripts, lib, package.json containerImage) on a fresh base
+#      image — only the base moves, the code does not. Tagging off main would
+#      silently pull in unreleased changes (e.g. a bumped nodeMajor) under a
+#      mere revision bump. Pushing that tag triggers
+#      .github/workflows/build-publish.yml, which does the actual multi-arch
+#      build + publish. This workflow itself never builds or pushes images — it
+#      only decides and tags.
 #
 # IMPORTANT — token choice and the "workflows don't trigger workflows" rule:
 # a tag pushed using the default GITHUB_TOKEN does NOT trigger other workflows
@@ -145,14 +151,31 @@ jobs:
               continue
             fi
 
+            # The new revision must reproduce the PREVIOUS revision's source
+            # tree on a fresh base — same js-controller version, same
+            # Dockerfile/scripts/lib and same package.json containerImage — not
+            # whatever main happens to be now. check-base-refresh.sh derives
+            # next_tag as (highest existing revision + 1), so the previous
+            # revision is exactly `<version>-r<next-1>` and is guaranteed to
+            # exist. Tag off THAT commit so build-publish rebuilds the released
+            # code, not current main.
+            prev_rev=$(( ${next_tag##*-r} - 1 ))
+            prev_tag="${version}-r${prev_rev}"
+            if ! git rev-parse -q --verify "refs/tags/${prev_tag}" >/dev/null; then
+              # Defensive: the helper guarantees this exists; if it somehow does
+              # not, fail loudly rather than silently tagging off main.
+              echo "::error title=Previous revision missing::Expected previous revision tag '${prev_tag}' to exist (base for '${next_tag}'), but it does not. Refusing to tag off main."
+              exit 1
+            fi
+
             if [[ "${DRY_RUN}" == "true" ]]; then
-              echo "DRY RUN: would create and push tag '${next_tag}'."
+              echo "DRY RUN: would create and push tag '${next_tag}' at commit of '${prev_tag}' ($(git rev-parse --short "refs/tags/${prev_tag}"))."
               echo "::endgroup::"
               continue
             fi
 
-            echo "Creating tag '${next_tag}' (base image is newer than the published revision)."
-            git tag "${next_tag}"
+            echo "Creating tag '${next_tag}' at commit of '${prev_tag}' (rebuild released code on a newer base image)."
+            git tag "${next_tag}" "refs/tags/${prev_tag}^{commit}"
             git push origin "refs/tags/${next_tag}"
             created_any=1
 
