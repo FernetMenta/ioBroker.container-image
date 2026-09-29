@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Placeholder for the next version (at the beginning of the line):
     ## [WORK IN PROGRESS]
 -->
+## [WORK IN PROGRESS]
+
+### Changed
+
+- bump node major to 24
 
 ## [7.2.2.2] 26.09.2026
 

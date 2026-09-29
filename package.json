@@ -8,7 +8,7 @@
     "node": ">=22"
   },
   "containerImage": {
-    "nodeMajor": 22,
+    "nodeMajor": 24,
     "debianCodename": "trixie"
   },
   "scripts": {
