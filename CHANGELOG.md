@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - bump node major to 24
+- bump node in github action to 24
 
 ## [7.2.2.2] 26.09.2026
 
