@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image's native modules are verified to load under the running Node, so a stale
   or missing binary can no longer be silently masked by a marker that claims the
   new ABI.
+- Native-module repair is now triggered by TWO independent signals, so an
+  ALREADY-corrupted volume is detected and healed on the next start — not just a
+  future ABI change. In addition to the classic ABI-marker mismatch, the
+  reconciler now probes whether the image's seeded native modules actually
+  `require()`; if a seeded module fails to load while the marker nonetheless
+  matches the running ABI (exactly the state a pre-fix upgrade left behind), it
+  schedules the overlay repair anyway. This means upgrading a broken container to
+  the fixed image self-heals with no manual volume recreation.
 - An ABI mismatch can now be repaired fully offline (via the local native seed),
   not only when the npm registry is reachable.
 - Native-module detection (`native_modules()` and the build-stage seed step) now

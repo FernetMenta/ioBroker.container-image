@@ -914,11 +914,33 @@ native_seed_ok=false
 
 if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
   if registry_reachable; then registry_ok=true; fi
-  if abi_mismatch; then abi_bad=true; fi
+
   # Whether the image ships a pristine, correct-ABI native-module seed we can
   # overlay locally (no registry/toolchain needed). This lets the planner emit
   # npm-rebuild (-> overlay) on an ABI mismatch even fully offline. (Req 8.12)
   if [[ -n "$(seed_native_modules)" ]]; then native_seed_ok=true; fi
+
+  # Decide whether the native modules need repair ("ABI bad"). TWO independent
+  # triggers, because the ABI marker alone is not trustworthy:
+  #
+  #   (a) marker mismatch — the recorded .node-abi differs from the running Node
+  #       ABI (the classic Node-major upgrade signal).
+  #
+  #   (b) a seeded image module does not actually LOAD — even when the marker
+  #       MATCHES. This catches an already-corrupted volume where the marker was
+  #       wrongly advanced to the new ABI while a binary was left stale/missing
+  #       (exactly the state a pre-fix upgrade produced: unix-dgram's .node gone,
+  #       marker reading the new ABI, so a marker-only check sees "fine"). We
+  #       only run this load probe when a seed exists AND the marker did not
+  #       already flag a mismatch — if there is no seed we could not repair it
+  #       here anyway, and if the marker already mismatched the repair is already
+  #       scheduled. The probe require()s the tiny seeded addons, so it is cheap.
+  if abi_mismatch; then
+    abi_bad=true
+  elif [[ "${native_seed_ok}" == "true" ]] && ! seed_modules_all_load; then
+    abi_bad=true
+    log "native modules: ABI marker matches but a seeded image module failed to load; scheduling overlay repair"
+  fi
 
   # Newline-separated lists for the observation snapshot.
   desired_list="$(desired_adapters)"

@@ -18,7 +18,10 @@
 #   * overlay_native_seed() copies the seed's binaries over the volume,
 #   * a volume module that EXISTS in the seed is repaired (binary restored),
 #   * a volume module NOT in the seed is left untouched,
-#   * dry-run performs no copy.
+#   * dry-run performs no copy,
+#   * load-based detection: native_module_loads / seed_modules_all_load flag a
+#     module that fails to require() even when the ABI marker MATCHES (the
+#     already-corrupted-volume case), and pass once it is repaired.
 #
 # Exit codes: 0 all cases held; 1 a regression.
 set -u
@@ -43,16 +46,22 @@ fail=""
 # real shipped code; if the function names/shape change, this extraction (and
 # thus the test) breaks loudly, which is the intent.
 FUNCS="$(mktemp 2>/dev/null || echo "/tmp/iac-seed-funcs.$$")"
-sed -n '/^native_module_names_under() {/,/^}/p; /^seed_native_modules() {/,/^}/p; /^overlay_native_seed() {/,/^}/p' \
+sed -n \
+  -e '/^native_module_names_under() {/,/^}/p' \
+  -e '/^seed_native_modules() {/,/^}/p' \
+  -e '/^native_module_loads() {/,/^}/p' \
+  -e '/^seed_modules_all_load() {/,/^}/p' \
+  -e '/^overlay_native_seed() {/,/^}/p' \
   "${RECONCILE_SH}" >"${FUNCS}"
 
-if ! grep -q 'native_module_names_under() {' "${FUNCS}" \
-   || ! grep -q 'seed_native_modules() {' "${FUNCS}" \
-   || ! grep -q 'overlay_native_seed() {' "${FUNCS}"; then
-  echo "${FAIL_PREFIX} could not extract seed/overlay functions from reconcile.sh" >&2
-  rm -f -- "${FUNCS}"
-  exit 1
-fi
+for fn in native_module_names_under seed_native_modules native_module_loads \
+          seed_modules_all_load overlay_native_seed; do
+  if ! grep -q "^${fn}() {" "${FUNCS}"; then
+    echo "${FAIL_PREFIX} could not extract ${fn}() from reconcile.sh" >&2
+    rm -f -- "${FUNCS}"
+    exit 1
+  fi
+done
 
 # Minimal log() shim (reconcile.sh's log writes to stderr); the functions call it.
 log() { printf 'reconcile(test): %s\n' "$*" >&2; }
@@ -140,6 +149,65 @@ else
   fail="${fail} [missing-seed]"
 fi
 rm -rf -- "${sbx}"
+
+# --- Case 5 & 6: load-based detection (the already-corrupted-volume case). ---
+# This is the key signal that catches the pi scenario: the ABI marker MATCHES
+# the running Node, but a seeded native module does not actually load. We build
+# REAL require()-able modules (plain JS entry points) so native_module_loads /
+# seed_modules_all_load exercise a genuine `node -e require(dir)`:
+#   * a HEALTHY module: index.js that loads cleanly.
+#   * a BROKEN module: index.js that require()s a missing ./build/Release/*.node,
+#     reproducing unix-dgram's "Could not locate the bindings file" throw.
+if command -v node >/dev/null 2>&1; then
+  sbx="$(mktemp -d 2>/dev/null || echo "/tmp/iac-seed-load.$$")"
+  # Seed just needs to list these two modules (seed_modules_all_load iterates
+  # seed_native_modules); give each a .node so it is recognized as native.
+  mkdir -p "${sbx}/seed/diskusage/build/Release" "${sbx}/seed/unix-dgram/build/Release"
+  printf 'x\n' >"${sbx}/seed/diskusage/build/Release/diskusage.node"
+  printf 'x\n' >"${sbx}/seed/unix-dgram/build/Release/unix_dgram.node"
+  # Volume: diskusage loads fine; unix-dgram throws on require (missing binding).
+  mkdir -p "${sbx}/vol/diskusage/build/Release" "${sbx}/vol/unix-dgram/build/Release"
+  printf 'x\n' >"${sbx}/vol/diskusage/build/Release/diskusage.node"
+  printf 'module.exports = {};\n' >"${sbx}/vol/diskusage/index.js"
+  printf "module.exports = require('./build/Release/unix_dgram.node');\n" \
+    >"${sbx}/vol/unix-dgram/index.js" # the .node is intentionally ABSENT in vol
+
+  IOB_NATIVE_SEED_DIR="${sbx}/seed" IOB_NODE_MODULES_DIR="${sbx}/vol" IOB_RECONCILE_DRY_RUN=false
+  export IOB_NATIVE_SEED_DIR IOB_NODE_MODULES_DIR IOB_RECONCILE_DRY_RUN
+
+  # Case 5: a healthy module loads, a broken one does not.
+  ok=1
+  native_module_loads diskusage || ok=0            # should load
+  native_module_loads unix-dgram && ok=0           # should NOT load
+  if [[ "${ok}" -eq 1 ]]; then
+    printf '  ok   native_module_loads distinguishes loadable vs broken module\n'
+  else
+    printf '  FAIL native_module_loads misclassified a module\n' >&2
+    fail="${fail} [module-loads]"
+  fi
+
+  # Case 6: seed_modules_all_load fails when ANY seeded module is broken — this
+  # is what flips abi_bad=true even though the marker matches, triggering repair.
+  if seed_modules_all_load; then
+    printf '  FAIL seed_modules_all_load returned success despite a broken module\n' >&2
+    fail="${fail} [all-load-broken]"
+  else
+    printf '  ok   seed_modules_all_load detects a broken seeded module (marker-independent)\n'
+  fi
+
+  # And it SUCCEEDS once the broken module is repaired (add the missing binding).
+  printf 'x\n' >"${sbx}/vol/unix-dgram/build/Release/unix_dgram.node"
+  printf 'module.exports = {};\n' >"${sbx}/vol/unix-dgram/index.js"
+  if seed_modules_all_load; then
+    printf '  ok   seed_modules_all_load passes once all seeded modules load\n'
+  else
+    printf '  FAIL seed_modules_all_load still failing after repair\n' >&2
+    fail="${fail} [all-load-repaired]"
+  fi
+  rm -rf -- "${sbx}"
+else
+  printf '  skip load-based detection (node not on PATH)\n'
+fi
 
 rm -f -- "${FUNCS}"
 
