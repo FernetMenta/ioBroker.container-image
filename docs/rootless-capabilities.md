@@ -55,6 +55,33 @@ privileged operations are handled entirely at the runtime layer (see below).
   own; see [Granting capabilities](#granting-capabilities-docker--podman--kubernetes)
   for the full recipe. (Req 7.2, 7.5)
 
+### js-controller's own `setcap` attempt (`IOB_NO_SETCAP`)
+
+Independently of the build-time decision above, **js-controller itself** tries
+to apply capabilities to the `node` binary whenever it detects that the Node.js
+version has changed since its last start. It runs, roughly,
+`sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw+… /usr/local/bin/node`.
+
+In this rootless image that command cannot succeed — the unprivileged container
+user has no passwordless `sudo`, so it fails with *"sudo: a password is
+required"*. Worse, js-controller records the detected Node version **after** the
+`setcap` call inside the same error-handled block, so the failure skips the
+write-back: the `system.host.<host>.nodeVersion` state is never updated. The
+controller therefore re-detects a "version change" on **every** start, retries
+the doomed `setcap`, and logs the same warning each time.
+
+The image sets **`IOB_NO_SETCAP=true`** by default so js-controller skips the
+`setcap` step entirely (it still records the Node version). This is consistent
+with the file-capability policy above — the image intentionally ships `node`
+without file capabilities and routes `NET_BIND_SERVICE` / `NET_RAW` through
+runtime **ambient** capabilities instead, so there is nothing for the
+controller's `setcap` to usefully do. The default both silences the recurring
+warning and lets the Node-version write-back complete, so the detection fires at
+most once after a genuine Node upgrade and is silent thereafter.
+
+If you run the image **rootful** and specifically want js-controller to manage
+the node binary's file capabilities, override with `-e IOB_NO_SETCAP=false`.
+
 ## Privileged ports below 1024 (Req 7.2)
 
 In a fully rootless, no-added-capability scenario, `cap_net_bind_service` on the

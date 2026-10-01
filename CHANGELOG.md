@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dropped the no-op `--build-from-source` flag from the build-stage
   `npm rebuild` (npm does not recognize it and only emitted an "Unknown cli
   config" warning).
+- The image now sets `IOB_NO_SETCAP=true` by default. On a Node version change
+  js-controller otherwise runs `sudo setcap … /usr/local/bin/node`, which cannot
+  succeed in this rootless image ("sudo: a password is required"). Because the
+  controller writes the detected Node version back AFTER that call in the same
+  try block, the failure skipped the write-back, so `system.host.<host>
+  .nodeVersion` stayed stale and the controller re-detected a "version change" —
+  re-attempting setcap and logging the warning — on EVERY start. Skipping setcap
+  (which is intentionally incompatible with the image's no-file-capability
+  rootless model; NET_BIND_SERVICE / NET_RAW are delivered as runtime ambient
+  caps instead) both silences the recurring warning and lets the version
+  write-back complete. Override with `-e IOB_NO_SETCAP=false` for rootful runs.
 
 ## [7.2.2.3] 30.09.2026
 

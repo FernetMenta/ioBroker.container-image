@@ -502,6 +502,27 @@ RUN set -eux; \
 # ioBroker's own admin (8081) and web (8082) use high ports, so the default
 # setup needs none of this. See docs/rootless-capabilities.md. (Req 7.1)
 
+# Tell js-controller NOT to attempt its own `setcap` on the node binary.
+#
+# On every start where the recorded Node version differs from the running one,
+# js-controller runs `sudo setcap cap_net_admin,cap_net_bind_service,cap_net_raw
+# ... /usr/local/bin/node`. In this rootless image that fails ("sudo: a password
+# is required"), and because js-controller performs the version write-back AFTER
+# the setcap call inside the SAME try block, the throw skips the write-back: the
+# `system.host.<host>.nodeVersion` state is never updated. So the controller
+# re-detects a "version change" on EVERY subsequent start, re-attempts setcap,
+# fails, and logs the same warning forever — the stored version is stuck.
+#
+# `IOB_NO_SETCAP=true` makes js-controller skip the setcap step entirely (it
+# still records the Node version), which both silences the recurring warning and
+# lets the version write-back complete. This is the correct default for this
+# image because the setcap can NEVER succeed here by design (see the node file-
+# capability rationale directly above): we deliberately ship node WITHOUT file
+# capabilities and route NET_BIND_SERVICE / NET_RAW through runtime ambient caps
+# instead. Operators who want the controller to try setcap anyway (e.g. a rootful
+# run) can override with `-e IOB_NO_SETCAP=false`. (Req 7.1)
+ENV IOB_NO_SETCAP=true
+
 # Container-environment indicators. The ioBroker installer / runtime detects a
 # container via these entries. `/proc/self/cgroup` (Req 6.1) is inherent to any
 # container runtime and needs no action here. `/.dockerenv` (Req 6.2) and
