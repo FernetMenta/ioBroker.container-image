@@ -67,6 +67,17 @@ IOB_LOG_DIR="${IOB_LOG_DIR:-${IOB_ROOT}/log}"
 IOB_NODE_MODULES_DIR="${IOB_NODE_MODULES_DIR:-${IOB_ROOT}/node_modules}"
 IOB_RECONCILE_DRY_RUN="${IOB_RECONCILE_DRY_RUN:-false}"
 
+# IOB_NATIVE_SEED_DIR holds the PRISTINE, image-compiled copies of the native
+# modules that ship IN the image (js-controller's diskusage + unix-dgram). The
+# Dockerfile stashes them here, OUTSIDE the node_modules VOLUME path, so they are
+# never shadowed by a mounted volume and stay available after a Node-major
+# upgrade. On an ABI mismatch the reconciler overlays these onto the persisted
+# volume instead of trying to `npm rebuild` from source (impossible in the
+# toolchain-free runtime image). The dir contains native-module dirs mirroring
+# their node_modules layout plus a `.node-abi` recording the ABI they were built
+# for. Overridable for tests. (Req 8.12)
+IOB_NATIVE_SEED_DIR="${IOB_NATIVE_SEED_DIR:-/opt/iobroker-native-seed}"
+
 # IOB_RECONCILE_PHASE selects which part of the plan to execute, so the
 # entrypoint can split reconciliation around database configuration:
 #   * "init"    run ONLY the init-default-config action (create iobroker.json +
@@ -737,14 +748,138 @@ installed_adapters() {
     sort -u || true
 }
 
+# native_module_names_under: print the top-level PACKAGE names (one per line)
+# of every native module under the given node_modules-style root — i.e. each
+# package dir that contains a compiled `*.node` somewhere inside it. Handles both
+# unscoped (`pkg`) and scoped (`@scope/pkg`) packages, and the usual
+# `<pkg>/build/Release/<name>.node` layout (the binary sits a few levels deep, so
+# we search deep and then fold each hit back to its top-level package name).
+# Shared by native_modules() (volume) and seed_native_modules() (image seed).
+native_module_names_under() {
+  local root="$1"
+  [[ -d "${root}" ]] || return 0
+  find "${root}" -name '*.node' -printf '%P\n' 2>/dev/null |
+    awk -F/ '{ if ($1 ~ /^@/ && NF >= 2) print $1 "/" $2; else print $1 }' |
+    sort -u || true
+}
+
 # native_modules: native modules subject to an ABI rebuild. Names the affected
 # modules in the rebuild action / warning (Req 8.12, 8.13).
 native_modules() {
-  [[ -d "${IOB_NODE_MODULES_DIR}" ]] || return 0
-  # Native modules are those shipping prebuilt `.node` binaries; list the
-  # top-level package dirs that contain one.
-  find "${IOB_NODE_MODULES_DIR}" -maxdepth 3 -name '*.node' -printf '%h\n' 2>/dev/null |
-    sed "s#^${IOB_NODE_MODULES_DIR}/##; s#/.*##" | sort -u || true
+  native_module_names_under "${IOB_NODE_MODULES_DIR}"
+}
+
+# seed_native_modules: the native modules the IMAGE can authoritatively supply,
+# i.e. the top-level package names stashed under IOB_NATIVE_SEED_DIR by the
+# Dockerfile (today js-controller's diskusage + unix-dgram). These are the only
+# modules we can repair by COPY on an ABI mismatch, because the image compiled
+# them against its own Node and the runtime image has no toolchain to rebuild
+# anything from source. Prints one package name per line.
+seed_native_modules() {
+  # Each entry is a package dir (possibly scoped, e.g. @scope/pkg) that mirrors
+  # its node_modules layout; list the ones that actually contain a *.node so we
+  # never "repair" something that is not a compiled module.
+  native_module_names_under "${IOB_NATIVE_SEED_DIR}"
+}
+
+# overlay_native_seed: copy the image's pristine, correct-ABI native modules
+# from IOB_NATIVE_SEED_DIR over the persisted volume's copies. This REPLACES the
+# impossible "npm rebuild from source" for the image-shipped NAN modules
+# (diskusage, unix-dgram) on a Node-major upgrade: the runtime image has no
+# compiler, but it DID compile these against its own Node at build time, so a
+# straight copy restores a loadable binary.
+#
+# Returns:
+#   0  at least one module was overlaid successfully (or dry-run)
+#   1  the seed dir is missing/empty, or every copy failed
+#
+# Only modules present in the seed are touched; anything else (e.g. an adapter's
+# own native module installed into the volume) is left to the caller. Idempotent:
+# re-copying an already-correct module is harmless.
+overlay_native_seed() {
+  local seed_dir="${IOB_NATIVE_SEED_DIR}"
+  if [[ ! -d "${seed_dir}" ]]; then
+    log "native-seed: no seed directory at ${seed_dir}; cannot overlay image modules"
+    return 1
+  fi
+
+  local mods
+  mods="$(seed_native_modules)"
+  if [[ -z "${mods}" ]]; then
+    log "native-seed: seed directory ${seed_dir} contains no native modules; nothing to overlay"
+    return 1
+  fi
+
+  if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
+    local n
+    n="$(printf '%s\n' "${mods}" | grep -c . || true)"
+    log "native-seed: [dry-run] would overlay ${n} image native module(s): $(printf '%s' "${mods}" | tr '\n' ' ')"
+    return 0
+  fi
+
+  mkdir -p "${IOB_NODE_MODULES_DIR}" 2>/dev/null || true
+
+  local ok=0 fail=0 m src dst
+  while IFS= read -r m; do
+    [[ -n "${m}" ]] || continue
+    src="${seed_dir}/${m}"
+    dst="${IOB_NODE_MODULES_DIR}/${m}"
+    [[ -d "${src}" ]] || continue
+    # Replace the volume copy atomically-enough: remove then copy. A partial
+    # failure is recorded and surfaced; it is never fatal here (the caller
+    # decides how to react), so one bad module does not abort the whole overlay.
+    if rm -rf "${dst}" 2>/dev/null \
+       && mkdir -p "$(dirname -- "${dst}")" 2>/dev/null \
+       && cp -a "${src}" "${dst}" 2>/dev/null; then
+      ok=$((ok + 1))
+      log "native-seed: overlaid ${m} from image seed"
+    else
+      fail=$((fail + 1))
+      log "native-seed: WARNING could not overlay ${m} (copy failed)"
+    fi
+  done <<<"${mods}"
+
+  log "native-seed: overlay complete (${ok} ok, ${fail} failed)"
+  [[ "${ok}" -ge 1 ]]
+}
+
+# build_tools_available: true iff a C/C++ toolchain capable of a node-gyp build
+# is present. The runtime image is deliberately toolchain-free, so this is
+# normally false there; it lets the npm-rebuild handler decide between a real
+# source rebuild (dev/build environments) and the copy-only path (shipped
+# runtime image). We require a C compiler AND make — node-gyp needs both.
+build_tools_available() {
+  local cc=false mk=false
+  command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 && cc=true
+  command -v make >/dev/null 2>&1 && mk=true
+  [[ "${cc}" == "true" && "${mk}" == "true" ]]
+}
+
+# native_module_loads: returns 0 iff `require()`-ing the given installed module
+# succeeds under the running Node (i.e. its compiled binding matches the running
+# ABI and is present). Used to VERIFY a repair actually took, so we only advance
+# the ABI marker when the image-shipped modules genuinely load — never on the
+# strength of a copy that might have silently produced an unloadable binding.
+# A missing module path counts as "does not load".
+native_module_loads() {
+  local mod="$1"
+  local path="${IOB_NODE_MODULES_DIR}/${mod}"
+  [[ -d "${path}" ]] || return 1
+  node -e 'require(process.argv[1])' "${path}" >/dev/null 2>&1
+}
+
+# seed_modules_all_load: returns 0 iff EVERY native module the image seed
+# provides currently loads from the volume. This is the honest post-repair
+# check that gates advancing the ABI marker.
+seed_modules_all_load() {
+  local mods m
+  mods="$(seed_native_modules)"
+  [[ -n "${mods}" ]] || return 1
+  while IFS= read -r m; do
+    [[ -n "${m}" ]] || continue
+    native_module_loads "${m}" || return 1
+  done <<<"${mods}"
+  return 0
 }
 
 # -- Collect observations -----------------------------------------------------
@@ -775,9 +910,15 @@ installed_list=""
 native_list=""
 enabled_instance_list=""
 
+native_seed_ok=false
+
 if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
   if registry_reachable; then registry_ok=true; fi
   if abi_mismatch; then abi_bad=true; fi
+  # Whether the image ships a pristine, correct-ABI native-module seed we can
+  # overlay locally (no registry/toolchain needed). This lets the planner emit
+  # npm-rebuild (-> overlay) on an ABI mismatch even fully offline. (Req 8.12)
+  if [[ -n "$(seed_native_modules)" ]]; then native_seed_ok=true; fi
 
   # Newline-separated lists for the observation snapshot.
   desired_list="$(desired_adapters)"
@@ -848,6 +989,7 @@ log "observed: dataVolumeEmpty=${data_empty} registryReachable=${registry_ok} ab
 summary_add_observation "dataVolumeEmpty=${data_empty}"
 summary_add_observation "registryReachable=${registry_ok}"
 summary_add_observation "abiMismatch=${abi_bad}"
+summary_add_observation "nativeSeedAvailable=${native_seed_ok}"
 if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
   summary_add_observation "desiredAdapters=$(printf '%s' "${desired_list}" | grep -c . || true)"
   summary_add_observation "installedAdapters=$(printf '%s' "${installed_list}" | grep -c . || true)"
@@ -864,6 +1006,7 @@ plan="$(
   IOB_R_DATA_EMPTY="${data_empty}" \
   IOB_R_REGISTRY_OK="${registry_ok}" \
   IOB_R_ABI_BAD="${abi_bad}" \
+  IOB_R_NATIVE_SEED_OK="${native_seed_ok}" \
   IOB_R_DESIRED="${desired_list}" \
   IOB_R_INSTALLED="${installed_list}" \
   IOB_R_NATIVE="${native_list}" \
@@ -875,6 +1018,7 @@ plan="$(
       registryReachable: process.env.IOB_R_REGISTRY_OK === 'true',
       abiMismatch: process.env.IOB_R_ABI_BAD === 'true',
       rebuildResourcesReachable: process.env.IOB_R_REGISTRY_OK === 'true',
+      nativeSeedAvailable: process.env.IOB_R_NATIVE_SEED_OK === 'true',
       desiredAdapters: lines(process.env.IOB_R_DESIRED),
       installedAdapters: lines(process.env.IOB_R_INSTALLED),
       nativeModules: lines(process.env.IOB_R_NATIVE),
@@ -1344,38 +1488,101 @@ while IFS=$'\t' read -r action args_rest; do
       ;;
 
     npm-rebuild)
-      # Node ABI mismatch and rebuild resources reachable: rebuild the affected
-      # native modules (Req 8.12).
-      nrb_rc=0
-      if [[ ${#args[@]} -eq 0 ]]; then
-        log "npm-rebuild: no native modules identified; running full npm rebuild"
-        run npm rebuild || nrb_rc=$?
-      else
-        log "npm rebuild of affected native modules (${#args[@]}): ${args[*]}"
-        run npm rebuild "${args[@]}" || nrb_rc=$?
-      fi
-      if [[ "${nrb_rc}" -eq 0 ]]; then
-        summary_add_action "npm-rebuild: ok (${#args[@]} module(s))"
-      else
-        # A required rebuild genuinely failed (the unrebuildable case is planned
-        # as warn-and-start, not npm-rebuild). Preserve the original abort under
-        # set -e: record it and re-raise so the entrypoint refuses to start.
-        summary_add_action "npm-rebuild: FAILED (exit ${nrb_rc}, ${#args[@]} module(s))"
-        RECONCILE_OUTCOME="failed"
-        exit "${nrb_rc}"
-      fi
-      # Refresh the ABI marker to the NOW-running Node ABI. The persisted volume
-      # still carries the OLD marker (that is what triggered this rebuild); if we
-      # left it stale, every subsequent start would detect the same mismatch and
-      # rebuild again. Rewriting it makes the rebuild a one-time cost per Node
-      # major upgrade. Skipped in dry-run so tests observe only the rebuild call.
-      if [[ "${IOB_RECONCILE_DRY_RUN}" != "true" ]]; then
-        if node -e 'process.stdout.write(String(process.versions.modules))' \
-            > "${IOB_NODE_MODULES_DIR}/.node-abi" 2>/dev/null; then
-          log "updated ABI marker to running Node ABI"
+      # Node ABI mismatch: the persisted native modules were compiled for a
+      # DIFFERENT Node ABI than the one now running (e.g. a Node-major image
+      # upgrade, 22 -> 24). Make them loadable again. (Req 8.12)
+      #
+      # The runtime image is TOOLCHAIN-FREE by design, so a source `npm rebuild`
+      # of a NAN module cannot work there — and worse, a failed build can DELETE
+      # the stale binary, leaving the module unloadable with no way back. So the
+      # repair is split by WHO can authoritatively provide a correct-ABI binary:
+      #
+      #   1. Modules the IMAGE ships (js-controller's diskusage + unix-dgram):
+      #      the build stage already compiled them against THIS image's Node and
+      #      stashed them under IOB_NATIVE_SEED_DIR (outside the volume mount).
+      #      We OVERLAY those pristine binaries onto the volume — a copy, not a
+      #      compile — which always works regardless of the toolchain.
+      #
+      #   2. Modules only present in the volume (e.g. an adapter's own native
+      #      dep): the image has no seed for these. We attempt a real
+      #      `npm rebuild` ONLY if a toolchain is actually present; otherwise we
+      #      cannot fix them here. These are the optional/fallback cases
+      #      (ssh2/cpu-features via plugin-docker's remote-SSH path, etc.), so a
+      #      failure is DEGRADED to a warning, never a fatal crash-loop.
+      #
+      # The ABI marker is advanced ONLY after we VERIFY the image-shipped modules
+      # actually load under the running Node (seed_modules_all_load), so we never
+      # again paper over a broken binding the way the old single-marker scheme
+      # did.
+      nrb_warnings=()
+
+      # --- 1. Overlay image-shipped native modules from the pristine seed -----
+      seed_mods="$(seed_native_modules)"
+      if [[ -n "${seed_mods}" ]]; then
+        log "npm-rebuild: overlaying image-shipped native modules from seed instead of recompiling (toolchain-free runtime)"
+        if overlay_native_seed; then
+          summary_add_action "native-seed: overlaid image modules ($(printf '%s' "${seed_mods}" | tr '\n' ' ' | sed 's/ *$//'))"
         else
-          log "could not update ABI marker (continuing; may rebuild again next start)"
+          nrb_warnings+=("could not overlay image native modules from ${IOB_NATIVE_SEED_DIR}")
         fi
+      else
+        log "npm-rebuild: no image native-module seed found; nothing to overlay"
+      fi
+
+      # --- 2. Handle any affected modules NOT covered by the image seed -------
+      # Compute affected-but-not-seeded modules (args are the planner's affected
+      # list; the seed covers the image-shipped ones). In dry-run we skip the
+      # set math and real rebuild so tests observe deterministic behavior.
+      if [[ "${IOB_RECONCILE_DRY_RUN}" != "true" && ${#args[@]} -gt 0 ]]; then
+        uncovered=()
+        for m in "${args[@]}"; do
+          if ! printf '%s\n' "${seed_mods}" | grep -qxF -- "${m}"; then
+            uncovered+=("${m}")
+          fi
+        done
+        if [[ ${#uncovered[@]} -gt 0 ]]; then
+          if build_tools_available; then
+            log "npm-rebuild: toolchain present; rebuilding ${#uncovered[@]} non-image module(s) from source: ${uncovered[*]}"
+            urc=0
+            run npm rebuild "${uncovered[@]}" || urc=$?
+            if [[ "${urc}" -eq 0 ]]; then
+              summary_add_action "npm-rebuild: ok (${#uncovered[@]} non-image module(s))"
+            else
+              nrb_warnings+=("source rebuild of ${uncovered[*]} failed (exit ${urc}); these are optional/fallback natives, continuing")
+            fi
+          else
+            # No compiler: cannot repair these in place. They are the
+            # optional/fallback adapter natives, so we warn and start rather
+            # than refuse (Req 8.13-style graceful degradation).
+            nrb_warnings+=("no build toolchain to rebuild non-image native module(s): ${uncovered[*]}; these are optional/fallback, continuing")
+          fi
+        fi
+      fi
+
+      # --- 3. Advance the ABI marker ONLY if the image modules truly load ------
+      # Skipped in dry-run so tests observe only the overlay decision. On the
+      # real path we require every seeded module to load before advancing the
+      # marker; otherwise we leave the marker stale so a later start (or a fixed
+      # seed) retries the repair instead of silently masking a broken binding.
+      if [[ "${IOB_RECONCILE_DRY_RUN}" != "true" ]]; then
+        if seed_modules_all_load; then
+          if node -e 'process.stdout.write(String(process.versions.modules))' \
+              > "${IOB_NODE_MODULES_DIR}/.node-abi" 2>/dev/null; then
+            log "npm-rebuild: image native modules verified loadable; updated ABI marker to running Node ABI"
+          else
+            log "npm-rebuild: WARNING could not update ABI marker (continuing; may re-run repair next start)"
+          fi
+        else
+          nrb_warnings+=("image native modules still not loadable after overlay; leaving ABI marker stale to retry next start")
+        fi
+      fi
+
+      # --- 4. Surface any degraded outcomes as warnings (never fatal here) ----
+      if [[ ${#nrb_warnings[@]} -gt 0 ]]; then
+        for w in "${nrb_warnings[@]}"; do
+          log "WARNING: npm-rebuild: ${w}"
+          summary_add_action "npm-rebuild: WARN ${w}"
+        done
       fi
       ;;
 

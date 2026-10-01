@@ -23,6 +23,13 @@
 # PRUNES NOTHING; when the tree is already complete it is a fast no-op (npm
 # verifies and exits without downloads).
 #
+# SCOPE: JS dependencies ONLY. The install runs with --ignore-scripts so it never
+# attempts a native (node-gyp) build. On the toolchain-free runtime image such a
+# build would fail AND cause npm to delete the existing compiled binary, breaking
+# modules like unix-dgram that have no JS fallback. Native-module ABI repair is
+# owned by scripts/reconcile.sh (overlay the image's pristine correct-ABI
+# binaries), not by this heal step.
+#
 # It MUST run in the pre-controller window (before js-controller starts), where
 # there is no concurrent writer of package.json/node_modules.
 #
@@ -68,15 +75,30 @@ if [[ "${IOB_HEAL_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IOB_HEAL_TIMEOUT}" -gt 0 ]] 
 fi
 
 # --omit=dev matches how the image and reconcile install adapters (production
-# tree only). unsafe-perm keeps lifecycle scripts runnable when this happens to
-# run as root (it normally runs as uid 1000, where it is a no-op). We do NOT
-# pass --production/--force: the goal is only to ADD what package.json declares
-# but is missing, never to rewrite versions. package.json is already the full
-# restored set, so npm prunes nothing.
+# tree only). We do NOT pass --production/--force: the goal is only to ADD what
+# package.json declares but is missing, never to rewrite versions. package.json
+# is already the full restored set, so npm prunes nothing.
+#
+# --ignore-scripts is CRITICAL on the toolchain-free runtime image. This heal
+# step exists to materialize missing HOISTED JS dependencies (express,
+# @iobroker/adapter-core, ...), NOT to build native modules. Without
+# --ignore-scripts, npm runs lifecycle/install scripts, which for a source-only
+# NAN module (js-controller's unix-dgram, diskusage) means a node-gyp build —
+# and the runtime image has no compiler. That build FAILS and, worse, npm then
+# PRUNES/rolls back the package, DELETING a previously-working .node binary and
+# leaving the module unloadable (unix-dgram has no JS fallback; it is pulled by
+# winston-syslog). So heal would actively BREAK native modules it was never
+# meant to touch. Native-module ABI repair is the reconciler's job
+# (scripts/reconcile.sh -> overlay_native_seed / npm-rebuild), which overlays
+# the image's pristine correct-ABI binaries instead of compiling. Ignoring
+# scripts here keeps heal to its single purpose and never destroys a binding.
+#
+# unsafe-perm is intentionally NOT set anymore: it only mattered for letting
+# lifecycle build scripts write as root, and we no longer run any scripts.
 heal_start="$(date +%s 2>/dev/null || echo 0)"
 rc=0
-( cd "${IOB_ROOT}" && npm_config_unsafe_perm=true \
-    "${runner[@]}" npm install --omit=dev --no-audit --no-fund --loglevel error ) || rc=$?
+( cd "${IOB_ROOT}" && \
+    "${runner[@]}" npm install --omit=dev --ignore-scripts --no-audit --no-fund --loglevel error ) || rc=$?
 heal_end="$(date +%s 2>/dev/null || echo 0)"
 elapsed=$(( heal_end - heal_start ))
 (( elapsed < 0 )) && elapsed=0

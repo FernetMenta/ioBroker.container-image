@@ -224,10 +224,18 @@ INSTALL
 # so the compiled ABI is correct before the artifacts are copied into the
 # Runtime_Image. `npm rebuild` is a no-op when nothing needs rebuilding, keeping
 # the step idempotent. (Req 2.2, 5.4)
+#
+# NOTE: the previous `npm rebuild --build-from-source` was dropped. npm does not
+# understand `--build-from-source` (it is a node-gyp / node-pre-gyp flag), so npm
+# only warned "Unknown cli config" and ran a plain rebuild anyway — the flag was
+# a no-op. The preceding `npm install` already compiled the native modules
+# against this stage's Node, so this `npm rebuild` is the belt-and-suspenders
+# pass that guarantees the compiled ABI is correct before the artifacts travel
+# into the toolchain-free Runtime_Image.
 RUN set -eux; \
     cd "${IOB_DIR}"; \
     if [ -f package.json ]; then \
-        npm rebuild --build-from-source || npm rebuild; \
+        npm rebuild; \
     fi
 
 # Record the Node.js ABI the native node_modules were just compiled against, as
@@ -247,6 +255,53 @@ RUN set -eux; \
     mkdir -p node_modules; \
     node -e 'process.stdout.write(String(process.versions.modules))' > node_modules/.node-abi; \
     test -s node_modules/.node-abi
+
+# Stash a PRISTINE copy of the image's compiled native node_modules OUTSIDE the
+# node_modules VOLUME path, so it survives being shadowed by a mounted volume.
+#
+# WHY THIS IS NEEDED
+# ------------------
+# `/opt/iobroker/node_modules` is declared as a VOLUME (see the runtime stage).
+# On FIRST boot Docker seeds an empty named volume from the image layer, so the
+# compiled native modules are present. But on a Node-MAJOR upgrade (e.g. Node
+# 22 -> 24, ABI 127 -> 137) the operator reuses the EXISTING volume: it keeps
+# the OLD binaries and the image's freshly-compiled copies under the same path
+# are MASKED by the mount. The runtime image is deliberately toolchain-free, so
+# the reconciler cannot `npm rebuild` js-controller's source-only NAN modules
+# (diskusage, unix-dgram) in place — the compile fails and, worse, a heal/install
+# `npm install` can DELETE the stale binary, leaving the module unloadable
+# (unix-dgram has no JS fallback and is pulled by winston-syslog). The result is
+# a volume whose .node-abi marker claims the new ABI while the actual binaries
+# are missing/old, which abi_mismatch() cannot even detect.
+#
+# The fix: keep the image's correct-ABI native modules at a location the volume
+# can never shadow. scripts/reconcile.sh overlays ONLY the native-module dirs
+# (those containing a *.node, i.e. diskusage/unix-dgram) from here onto the
+# persisted volume when it detects an ABI mismatch, then advances the marker.
+# This replaces a compile the runtime image cannot do with a copy of a binary it
+# already built. The seed is a few hundred KB (two small addons), so the image
+# cost is negligible. (Req 8.12)
+RUN set -eux; \
+    cd "${IOB_DIR}"; \
+    rm -rf /opt/iobroker-native-seed; \
+    mkdir -p /opt/iobroker-native-seed; \
+    cp -a node_modules/.node-abi /opt/iobroker-native-seed/.node-abi; \
+    found=0; \
+    # Fold each compiled *.node (which sits a few levels deep, typically at
+    # <pkg>/build/Release/<name>.node) back to its top-level package name,
+    # handling scoped packages (@scope/pkg). This MUST match reconcile.sh's
+    # native_module_names_under() so the overlay keys line up. \
+    for d in $(find node_modules -name '*.node' -printf '%P\n' 2>/dev/null \
+                 | awk -F/ '{ if ($1 ~ /^@/ && NF >= 2) print $1 "/" $2; else print $1 }' \
+                 | sort -u); do \
+        [ -d "node_modules/${d}" ] || continue; \
+        mkdir -p "/opt/iobroker-native-seed/$(dirname "${d}")"; \
+        cp -a "node_modules/${d}" "/opt/iobroker-native-seed/${d}"; \
+        found=$((found + 1)); \
+        echo "native-seed: stashed ${d}"; \
+    done; \
+    echo "native-seed: stashed ${found} native module dir(s)"; \
+    test "${found}" -ge 1
 
 # Drop the js-controller-initialized data directory before it is carried into
 # the Runtime_Image. Installing `iobroker.js-controller` runs a lifecycle step
@@ -372,6 +427,14 @@ RUN set -eux; \
 # the Runtime_Image derives ONLY from this stage, the Build_Stage toolchain and
 # `-dev` headers never reach the shipped image. (Req 2.3, 2.4)
 COPY --from=build /opt/iobroker ${IOB_DIR}
+
+# Bring the pristine native-module seed forward too. It lives OUTSIDE the
+# node_modules VOLUME path on purpose, so it is never shadowed by a mounted
+# volume and remains available as the authoritative source when reconcile.sh
+# repairs an ABI mismatch of the image's source-only NAN modules (diskusage,
+# unix-dgram) on a Node-major upgrade. See the build-stage "native-seed" step
+# and scripts/reconcile.sh -> overlay_native_seed(). (Req 8.12)
+COPY --from=build /opt/iobroker-native-seed /opt/iobroker-native-seed
 
 # Entrypoint pipeline scripts and their sibling `lib/` decision modules. The
 # scripts resolve their modules via `${SCRIPT_DIR}/../lib`, so the scripts/ and

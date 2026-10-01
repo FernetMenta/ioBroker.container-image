@@ -9,7 +9,7 @@
 #   * it is SKIPPED when IOB_HEAL_NODE_MODULES=false,
 #   * it is SKIPPED when there is no package.json,
 #   * when enabled it runs `npm install` from IOB_ROOT with the expected flags
-#     (--omit=dev, non-pruning: no --production/--force),
+#     (--omit=dev, --ignore-scripts, non-pruning: no --production/--force),
 #   * an npm failure is TOLERATED (script still exits 0; startup not blocked).
 #
 # No docker, no real npm, no network -> never skips.
@@ -101,10 +101,14 @@ ok=1
 grep -q "cwd=${r3}\$" "${NPM_LOG}" || ok=0
 echo "${inv}" | grep -q 'args=install' || ok=0
 echo "${inv}" | grep -q -- '--omit=dev' || ok=0
+# must ignore lifecycle scripts: on the toolchain-free runtime image a native
+# build would fail and npm would then DELETE the existing .node binary, breaking
+# modules like unix-dgram. Native repair is the reconciler's job, not heal's.
+echo "${inv}" | grep -q -- '--ignore-scripts' || ok=0
 # must NOT prune/rewrite:
 if echo "${inv}" | grep -qE -- '--production|--force'; then ok=0; fi
 if [[ "${ok}" -eq 1 ]]; then
-  printf '  ok   enabled -> npm install --omit=dev in IOB_ROOT, no prune flags\n'
+  printf '  ok   enabled -> npm install --omit=dev --ignore-scripts in IOB_ROOT, no prune flags\n'
 else
   printf '  FAIL enabled invocation wrong: rc=%s inv=[%s]\n' "${rc}" "${inv//$'\n'/ | }" >&2
   fail="${fail} [enabled-invocation]"

@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Placeholder for the next version (at the beginning of the line):
     ## [WORK IN PROGRESS]
 -->
+## [WORK IN PROGRESS]
+
+### Fixed
+
+- Native modules that ship IN the image (js-controller's `diskusage` and
+  `unix-dgram`) are now repaired correctly after a Node-major upgrade. These are
+  source-only NAN addons bound to the Node ABI, and the slim runtime image has
+  no compiler, so a Node 22 → 24 upgrade (ABI 127 → 137) that reuses the
+  persisted `node_modules` volume left `unix-dgram` with no loadable binary. It
+  has no JS fallback (it backs `winston-syslog`), so it threw on load. The build
+  stage now stashes pristine, correct-ABI copies of these modules under
+  `/opt/iobroker-native-seed` (outside the `node_modules` volume mount, so a
+  mounted volume cannot shadow them), and on an ABI mismatch the reconciler
+  OVERLAYS those binaries onto the volume — a copy, not a compile — then verifies
+  they actually load before advancing the ABI marker. This replaces the previous
+  `npm rebuild`, which could not work without a toolchain and would fail startup.
+- `scripts/heal-node-modules.sh` now runs its `npm install` with
+  `--ignore-scripts`. Without it, npm attempted a native (node-gyp) build of
+  source-only modules on the toolchain-free runtime image; that build failed and
+  npm then pruned the package, DELETING a previously-working `.node` binary. Heal
+  is scoped to materializing missing hoisted JS dependencies only; native-module
+  ABI repair is owned by the reconciler.
+- The ABI marker (`node_modules/.node-abi`) is now advanced only after the
+  image's native modules are verified to load under the running Node, so a stale
+  or missing binary can no longer be silently masked by a marker that claims the
+  new ABI.
+- An ABI mismatch can now be repaired fully offline (via the local native seed),
+  not only when the npm registry is reachable.
+- Native-module detection (`native_modules()` and the build-stage seed step) now
+  finds compiled addons at their real depth (`<pkg>/build/Release/*.node`) and
+  handles scoped packages; the previous depth limit silently matched nothing.
+
+### Changed
+
+- An ABI mismatch that cannot be repaired no longer fails startup: uncovered or
+  uncompilable native modules (e.g. optional/fallback adapter natives) are logged
+  as warnings and the container still starts, consistent with the warn-and-start
+  policy.
+- Dropped the no-op `--build-from-source` flag from the build-stage
+  `npm rebuild` (npm does not recognize it and only emitted an "Unknown cli
+  config" warning).
+
 ## [7.2.2.3] 30.09.2026
 
 ### Changed
