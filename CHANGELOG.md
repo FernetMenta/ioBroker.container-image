@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -->
 ## [WORK IN PROGRESS]
 
+### Added
+
+- The js-controller `node` process now starts with the V8 flag
+  `--scavenger-max-new-space-capacity-mb=8` to work around a Node 24 memory
+  regression ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)).
+  Node 24's V8 raised the default new-space (scavenger) capacity from 8 to 32 MB,
+  which lets a 64 MB external-memory soft limit be reached before the cheap young
+  Scavenge fires — turning routine short-lived Buffer/ArrayBuffer churn into
+  frequent Mark-Compacts and inflating RSS. Pinning the capacity back to 8 MB
+  restores the pre-24 memory profile. This is a V8 flag, so it is placed on the
+  `node` command line (it does not take effect via `NODE_OPTIONS`). The value is
+  overridable via the new `IOB_NODE_OPTIONS` environment variable (default = the
+  workaround flag; set empty to pass no extra flags once the upstream V8 fix
+  lands). See [environment-variables.md](docs/environment-variables.md) for the
+  full explanation and the Node 26 note.
+
 ### Fixed
 
 - Native modules that ship IN the image (js-controller's `diskusage` and

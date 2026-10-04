@@ -739,5 +739,23 @@ else
   log "package.json snapshot watcher disabled (IOB_PKG_WATCH_INTERVAL=0)"
 fi
 
-log "starting js-controller"
-exec node "${JS_CONTROLLER}" "$@"
+# V8 flags for the js-controller node process.
+#
+# Node 24 regressed new-space (scavenger) memory handling: the young-generation
+# semi-space grows far larger than before, inflating RSS for a Buffer-heavy
+# workload like js-controller (see nodejs/node#61967). Pinning the new-space
+# capacity to the pre-regression size restores the old memory profile:
+#
+#   --scavenger-max-new-space-capacity-mb=8
+#
+# This is a V8 flag, NOT a plain Node option. Passing it via NODE_OPTIONS does
+# not reliably take effect (V8 reads its flags from argv, not from the
+# NODE_OPTIONS path), so it must sit on the `node` command line, before the
+# script argument, to actually apply. The value
+# is overridable via IOB_NODE_OPTIONS so an operator can tune it (or clear it,
+# once the upstream regression is fixed) without rebuilding the image. It is
+# intentionally word-split so multiple space-separated flags can be passed.
+IOB_NODE_OPTIONS="${IOB_NODE_OPTIONS:---scavenger-max-new-space-capacity-mb=8}"
+# shellcheck disable=SC2086 # deliberate word-splitting: each token is a node flag
+log "starting js-controller (node flags: ${IOB_NODE_OPTIONS:-<none>})"
+exec node ${IOB_NODE_OPTIONS} "${JS_CONTROLLER}" "$@"

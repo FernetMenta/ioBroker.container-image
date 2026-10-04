@@ -217,6 +217,7 @@ fault.
 | `IOB_PKG_WATCH_INTERVAL` | `10` | `0`–… (seconds) | Poll interval for the background watcher that keeps the `package.json` snapshot on the `node_modules` volume current (it copies `package.json` to the snapshot whenever its content changes, so an adapter installed via admin survives a later recreate). `0` disables the watcher entirely — do this only if you have a reason to stop snapshotting `package.json`; the recreate-prune protection then relies solely on the last snapshot restored at start. See [package.json persistence](#packagejson-persistence-across-recreate). |
 | `IOB_HEAL_NODE_MODULES` | `true` | `true` \| `false` | Whether startup runs one `npm install` (after restoring `package.json`, before js-controller) to rebuild any missing hoisted dependency in `node_modules` — the self-heal that clears `Cannot find module '<dep>'` after a tree was left incomplete. Set `false` to skip it (faster start, but a damaged tree is not repaired). See [package.json persistence](#packagejson-persistence-across-recreate). |
 | `IOB_HEAL_TIMEOUT` | `1800` | `0`–… (seconds) | Maximum time the self-heal `npm install` may run before it is aborted (and startup continues anyway). `0` disables the timeout. Raise it only if a legitimately large first-time heal on a very slow link exceeds the default. |
+| `IOB_NODE_OPTIONS` | `--scavenger-max-new-space-capacity-mb=8` | space-separated `node` flags | V8/`node` command-line flags passed to the js-controller `node` process. The default pins V8's new-space (scavenger) capacity to the pre-Node-24 size to work around a memory-usage regression in Node 24 ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)) that inflates RSS for a Buffer-heavy workload. See [Node 24 memory workaround](#node-24-memory-workaround) below. Set to an empty string to pass no extra flags (e.g. once the upstream regression is fixed), or override with your own space-separated flags. |
 
 ### package.json persistence across recreate
 
@@ -250,6 +251,34 @@ run after damage may take several minutes and logs that it is in progress.
 
 No additional volume is required for any of this — the snapshot lives inside the
 `node_modules` volume you already have.
+
+### Node 24 memory workaround
+
+Node 24 regressed how V8's young-generation heap (the "new space" managed by the
+scavenger garbage collector) grows: the semi-space can expand well beyond its
+pre-24 size, which inflates resident memory (RSS) for a Buffer-heavy workload
+like js-controller and its adapters (see
+[nodejs/node#61967](https://github.com/nodejs/node/issues/61967)). To restore the
+pre-regression memory profile, the container starts the js-controller `node`
+process with the V8 flag:
+
+```
+--scavenger-max-new-space-capacity-mb=8
+```
+
+This caps the new-space capacity at the size Node used before the regression.
+
+**Why not `NODE_OPTIONS`?** This is a **V8** flag, not a plain Node option.
+Passing it through `NODE_OPTIONS` does not reliably take effect — V8 reads its
+flags from the process argument list, not from the `NODE_OPTIONS` path — so the
+new-space cap is silently ignored. The flag therefore has to be placed directly
+on the `node` command line, before the script argument, which is exactly what
+the entrypoint does. `IOB_NODE_OPTIONS` is the knob for it.
+
+Override `IOB_NODE_OPTIONS` to change the value (for example a different
+capacity), to add other `node`/V8 flags (space-separated), or set it to an empty
+string to pass no extra flags at all once the upstream regression is resolved and
+the workaround is no longer needed.
 
 ## Database backends and multihost
 
