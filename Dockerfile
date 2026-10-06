@@ -386,9 +386,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 # raw-socket privilege is therefore left to the runtime layer. See
 # docs/rootless-capabilities.md. (Req 7.5)
 #
+# libjemalloc2 provides the jemalloc allocator (libjemalloc.so.2) the entrypoint
+# LD_PRELOADs into the js-controller node process by default. The long-running
+# controller churns short-lived Buffer/ArrayBuffer allocations; glibc's default
+# malloc (ptmalloc) retains freed arenas and returns them to the OS poorly, so
+# RSS ratchets upward over days even though V8's heap stays flat (a retention
+# problem, not a leak — confirmed by heapUsed staying constant while RSS climbs).
+# jemalloc returns freed pages to the OS aggressively (via madvise), which flattens
+# that RSS growth. It is a pure runtime shared library (no toolchain), so it
+# belongs in this runtime set. Preloading is opt-OUT via IOB_USE_JEMALLOC=false;
+# see scripts/entrypoint.sh and docs/environment-variables.md.
+#
 # Runtime OS packages:  acl, sudo, libcap2-bin, git, curl, ca-certificates,
 #                       unzip, distro-info, net-tools, polkitd, passwd, lsb-release,
-#                       cifs-utils, nfs-common, iputils-ping
+#                       cifs-utils, nfs-common, iputils-ping, libjemalloc2
 # Runtime shared libs:  libcairo2 (libcairo2-dev), libpango-1.0-0 (libpango1.0-dev),
 #                       librsvg2-2 (librsvg2-dev), libpixman-1-0 (libpixman-1-dev),
 #                       libjpeg62-turbo (libjpeg-dev), libgif7 (libgif-dev),
@@ -412,6 +423,7 @@ RUN set -eux; \
         cifs-utils \
         nfs-common \
         iputils-ping \
+        libjemalloc2 \
         libcairo2 \
         libpango-1.0-0 \
         librsvg2-2 \
@@ -722,7 +734,7 @@ echo "=== Runtime-dependency verification gate ==="
 echo "--- [1/4] asserting runtime packages are PRESENT (dpkg -s) ---"
 for pkg in \
     acl sudo libcap2-bin git curl unzip distro-info net-tools polkitd passwd \
-    lsb-release ca-certificates cifs-utils nfs-common iputils-ping libcairo2 libpango-1.0-0 \
+    lsb-release ca-certificates cifs-utils nfs-common iputils-ping libjemalloc2 libcairo2 libpango-1.0-0 \
     librsvg2-2 libpixman-1-0 \
     libjpeg62-turbo libgif7 libudev1 libpam0g libavahi-compat-libdnssd1
 do

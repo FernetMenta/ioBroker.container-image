@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The image now ships the jemalloc allocator (`libjemalloc2`) and
+  `LD_PRELOAD`s it into the js-controller `node` process (and its adapter
+  children) **by default**, as an opt-out via `IOB_USE_JEMALLOC=false`. A
+  long-running controller churns short-lived `Buffer`/`ArrayBuffer`
+  allocations; glibc's default `malloc` retains freed arenas and returns them to
+  the OS poorly, so RSS ratchets upward over days even though V8's heap stays
+  flat (allocator retention, not a leak — `heapUsed` constant while RSS climbs).
+  jemalloc returns freed pages to the OS aggressively, flattening that growth.
+  The library path is architecture-specific, so the entrypoint discovers it via
+  `ldconfig` rather than hardcoding a path (keeping multi-arch correct), and
+  falls back cleanly if it is missing. A complementary knob
+  `IOB_MALLOC_ARENA_MAX` (default `2`) caps glibc's arena count for the cases
+  jemalloc does not cover and when it is disabled. The runtime verification gate
+  now also asserts `libjemalloc2` is present. See
+  [environment-variables.md](docs/environment-variables.md) ("Allocator memory
+  retention").
 - The js-controller `node` process now starts with the V8 flag
   `--scavenger-max-new-space-capacity-mb=8` to work around a Node 24 memory
   regression ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)).

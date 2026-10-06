@@ -756,6 +756,73 @@ fi
 # once the upstream regression is fixed) without rebuilding the image. It is
 # intentionally word-split so multiple space-separated flags can be passed.
 IOB_NODE_OPTIONS="${IOB_NODE_OPTIONS:---scavenger-max-new-space-capacity-mb=8}"
+
+# --- Memory allocator tuning for the long-running controller ----------------
+#
+# js-controller runs for days/weeks and churns short-lived Buffer/ArrayBuffer
+# allocations. glibc's default malloc (ptmalloc) keeps freed memory in per-thread
+# ARENAS and returns it to the OS poorly, so RSS ratchets upward over time even
+# though V8's JS heap stays flat (heapUsed constant, RSS climbing = allocator
+# retention, NOT a leak). Two independent, complementary knobs address this:
+#
+#   1. IOB_MALLOC_ARENA_MAX (default 2): cap the number of glibc malloc arenas.
+#      glibc defaults to up to 8*nCPU arenas, each able to retain freed chunks;
+#      capping them markedly lowers steady-state RSS at a negligible contention
+#      cost for this workload. Exported so it applies to the controller AND the
+#      adapter child processes it spawns. Set empty to leave glibc at its default.
+#
+#   2. IOB_USE_JEMALLOC (default true): LD_PRELOAD the jemalloc allocator
+#      (libjemalloc.so.2, shipped via the libjemalloc2 runtime package). jemalloc
+#      returns freed pages to the OS aggressively (madvise), flattening the slow
+#      RSS creep that remains under glibc even with arenas capped. This is the
+#      primary fix; the arena cap is a cheap complementary measure (and the
+#      fallback when jemalloc is disabled or, defensively, not found). Opt OUT
+#      with IOB_USE_JEMALLOC=false. The library path is multiarch-specific
+#      (/usr/lib/<triplet>/libjemalloc.so.2), so it is DISCOVERED via `ldconfig`
+#      rather than hardcoded, keeping this correct across architectures.
+#
+# LD_PRELOAD is exported so js-controller's child adapter node processes inherit
+# the same allocator — the memory win applies to the whole process tree, not just
+# the controller.
+IOB_MALLOC_ARENA_MAX="${IOB_MALLOC_ARENA_MAX-2}"
+if [[ -n "${IOB_MALLOC_ARENA_MAX}" ]]; then
+  export MALLOC_ARENA_MAX="${IOB_MALLOC_ARENA_MAX}"
+  log "capped glibc malloc arenas: MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX}"
+fi
+
+if [[ "${IOB_USE_JEMALLOC:-true}" == "true" ]]; then
+  # Discover libjemalloc.so.2 at runtime. The library sits at a multiarch path
+  # (/usr/lib/<triplet>/libjemalloc.so.2) that differs per architecture, so we
+  # resolve it rather than hardcode it. Primary method: the dynamic-linker cache
+  # via `ldconfig`. ldconfig lives in /usr/sbin|/sbin, which a non-root login
+  # PATH often omits, so we invoke it by absolute path when `command -v` misses
+  # it. Fallback: glob the canonical multiarch lib dirs directly, so discovery
+  # still succeeds even if ldconfig is unavailable for any reason.
+  JEMALLOC_SO=""
+  _ldconfig="$(command -v ldconfig || true)"
+  [[ -z "${_ldconfig}" && -x /usr/sbin/ldconfig ]] && _ldconfig=/usr/sbin/ldconfig
+  [[ -z "${_ldconfig}" && -x /sbin/ldconfig ]] && _ldconfig=/sbin/ldconfig
+  if [[ -n "${_ldconfig}" ]]; then
+    JEMALLOC_SO="$("${_ldconfig}" -p 2>/dev/null | awk '/libjemalloc\.so\.2/ { print $NF; exit }')"
+  fi
+  if [[ -z "${JEMALLOC_SO}" || ! -e "${JEMALLOC_SO}" ]]; then
+    for _cand in /usr/lib/*/libjemalloc.so.2 /usr/lib/libjemalloc.so.2 /lib/*/libjemalloc.so.2; do
+      [[ -e "${_cand}" ]] && { JEMALLOC_SO="${_cand}"; break; }
+    done
+  fi
+  if [[ -n "${JEMALLOC_SO}" && -e "${JEMALLOC_SO}" ]]; then
+    # Prepend to any existing LD_PRELOAD rather than clobbering it.
+    export LD_PRELOAD="${JEMALLOC_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
+    log "preloading jemalloc allocator: LD_PRELOAD=${LD_PRELOAD} (disable with IOB_USE_JEMALLOC=false)"
+  else
+    log "IOB_USE_JEMALLOC=true but libjemalloc.so.2 was not found via ldconfig; starting without it" \
+      "(glibc malloc with MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-default} still applies)"
+  fi
+else
+  log "jemalloc preload disabled (IOB_USE_JEMALLOC=false); using glibc malloc" \
+    "with MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-default}"
+fi
+
 # shellcheck disable=SC2086 # deliberate word-splitting: each token is a node flag
 log "starting js-controller (node flags: ${IOB_NODE_OPTIONS:-<none>})"
 exec node ${IOB_NODE_OPTIONS} "${JS_CONTROLLER}" "$@"

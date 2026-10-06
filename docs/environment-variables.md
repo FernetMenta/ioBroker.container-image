@@ -218,6 +218,8 @@ fault.
 | `IOB_HEAL_NODE_MODULES` | `true` | `true` \| `false` | Whether startup runs one `npm install` (after restoring `package.json`, before js-controller) to rebuild any missing hoisted dependency in `node_modules` — the self-heal that clears `Cannot find module '<dep>'` after a tree was left incomplete. Set `false` to skip it (faster start, but a damaged tree is not repaired). See [package.json persistence](#packagejson-persistence-across-recreate). |
 | `IOB_HEAL_TIMEOUT` | `1800` | `0`–… (seconds) | Maximum time the self-heal `npm install` may run before it is aborted (and startup continues anyway). `0` disables the timeout. Raise it only if a legitimately large first-time heal on a very slow link exceeds the default. |
 | `IOB_NODE_OPTIONS` | `--scavenger-max-new-space-capacity-mb=8` | space-separated `node` flags | V8/`node` command-line flags passed to the js-controller `node` process. The default pins V8's new-space (scavenger) capacity to the pre-Node-24 size to work around a memory-usage regression in Node 24 ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)) that inflates RSS for a Buffer-heavy workload. See [Node 24 memory workaround](#node-24-memory-workaround) below. Set to an empty string to pass no extra flags (e.g. once the upstream regression is fixed), or override with your own space-separated flags. |
+| `IOB_USE_JEMALLOC` | `true` | `true` \| `false` | Whether to `LD_PRELOAD` the jemalloc allocator (`libjemalloc.so.2`, shipped in the image) into the js-controller `node` process and its adapter children. jemalloc returns freed memory to the OS far more aggressively than glibc's default `malloc`, which flattens the slow RSS creep a long-running controller otherwise shows. Opt **out** with `false` to use glibc `malloc`. See [Allocator memory retention](#allocator-memory-retention) below. |
+| `IOB_MALLOC_ARENA_MAX` | `2` | `0`–… (integer) \| empty | Caps the number of glibc `malloc` arenas via `MALLOC_ARENA_MAX`, applied to the controller and its adapter children. glibc defaults to up to `8 × nCPU` arenas, each retaining freed memory; capping them lowers steady-state RSS. Applies whether or not jemalloc is enabled. Set to an empty string to leave glibc at its default. See [Allocator memory retention](#allocator-memory-retention) below. |
 
 ### package.json persistence across recreate
 
@@ -279,6 +281,62 @@ Override `IOB_NODE_OPTIONS` to change the value (for example a different
 capacity), to add other `node`/V8 flags (space-separated), or set it to an empty
 string to pass no extra flags at all once the upstream regression is resolved and
 the workaround is no longer needed.
+
+### Allocator memory retention
+
+The Node 24 workaround above addresses *garbage-collection scheduling* — it keeps
+V8's heap profile healthy. A separate, lower-level effect governs how much of the
+memory the process has *already freed* is actually returned to the operating
+system. These are different things: V8 (or a native allocation) can free memory
+while the process's resident set (RSS) stays high, because the C memory allocator
+underneath holds onto freed pages instead of giving them back to the kernel.
+
+For a long-running js-controller this shows up as **RSS that climbs over days and
+never fully recedes, while V8's `heapUsed` stays flat.** A flat heap with a rising
+RSS is the signature of **allocator retention, not a memory leak** — nothing is
+leaking at the JS level; the freed memory simply isn't handed back. glibc's
+default `malloc` (ptmalloc) is prone to this with the controller's steady churn of
+short-lived `Buffer`/`ArrayBuffer` allocations, because it keeps freed memory in
+per-thread **arenas** and is conservative about releasing it to the OS.
+
+The image mitigates this with two complementary, independently toggleable knobs,
+both applied just before js-controller starts and both inherited by the adapter
+child processes the controller spawns (so the whole process tree benefits):
+
+- **`IOB_MALLOC_ARENA_MAX` (default `2`).** glibc creates up to `8 × nCPU`
+  allocation arenas, each of which can retain freed chunks; on a multi-core host
+  that is a lot of independently-retained memory. Capping the arena count via
+  `MALLOC_ARENA_MAX` markedly lowers steady-state RSS at a negligible lock-
+  contention cost for this workload. This applies whether or not jemalloc is
+  enabled. Set it to an empty string to leave glibc at its default.
+
+- **`IOB_USE_JEMALLOC` (default `true`).** Preloads the jemalloc allocator
+  (`libjemalloc.so.2`, shipped in the image via the `libjemalloc2` package) ahead
+  of glibc `malloc` using `LD_PRELOAD`. jemalloc returns freed pages to the OS far
+  more aggressively (via `madvise`), which flattens the slow RSS creep that
+  remains under glibc even with the arena cap in place. This is the primary fix;
+  the arena cap is a cheap complement and the fallback for the glibc paths
+  jemalloc does not cover. Opt **out** with `IOB_USE_JEMALLOC=false` to run on
+  plain glibc `malloc`.
+
+The jemalloc library lives at an architecture-specific path
+(`/usr/lib/<triplet>/libjemalloc.so.2`), so the entrypoint **discovers** it via
+the dynamic-linker cache (`ldconfig`) rather than hardcoding a path — this keeps
+it correct on every supported architecture. If `IOB_USE_JEMALLOC=true` but the
+library cannot be found, the container logs that and starts without the preload;
+the glibc arena cap still applies.
+
+**Tuning order if RSS is still a concern.** Change one variable at a time and
+observe RSS over a representative window (hours to a day):
+
+1. Keep the defaults (jemalloc on, `MALLOC_ARENA_MAX=2`). This is the recommended
+   baseline and resolves the retention growth for most installs.
+2. To isolate the allocator's contribution, set `IOB_USE_JEMALLOC=false` and
+   compare — glibc with a capped arena count alone already lowers RSS noticeably,
+   but typically still shows a slow upward creep that jemalloc removes.
+3. The two knobs are orthogonal to `IOB_NODE_OPTIONS`: the V8 flag controls GC
+   behavior (heap churn), the allocator knobs control OS-level memory return.
+   A healthy memory profile usually wants both.
 
 ## Database backends and multihost
 
