@@ -751,11 +751,30 @@ fi
 # This is a V8 flag, NOT a plain Node option. Passing it via NODE_OPTIONS does
 # not reliably take effect (V8 reads its flags from argv, not from the
 # NODE_OPTIONS path), so it must sit on the `node` command line, before the
-# script argument, to actually apply. The value
-# is overridable via IOB_NODE_OPTIONS so an operator can tune it (or clear it,
-# once the upstream regression is fixed) without rebuilding the image. It is
-# intentionally word-split so multiple space-separated flags can be passed.
-IOB_NODE_OPTIONS="${IOB_NODE_OPTIONS:---scavenger-max-new-space-capacity-mb=8}"
+# script argument, to actually apply.
+#
+# VERSION-GATED DEFAULT: the flag only applies to Node 24. It was introduced in
+# V8 13.6 (Node 24) and REMOVED in V8 14.1+, so Node 26 (V8 14.6) does not know
+# it — passing it there makes node exit with an unknown-flag error. We therefore
+# default it ON only when the running Node major is 24, and to nothing on any
+# other major. (Node 26 has the same underlying regression but needs a different
+# flag; the clean fix is the upstream V8 bump, after which no flag is needed.)
+#
+# The default is overridable via IOB_NODE_OPTIONS: an operator can set other
+# flags, or set it to an empty string to pass none at all. The `-` (not `:-`)
+# default below means an explicitly empty IOB_NODE_OPTIONS is honored as "no
+# flags", while an unset variable falls through to the version-gated default.
+if [[ -z "${IOB_NODE_OPTIONS+set}" ]]; then
+  # Unset: compute the version-gated default.
+  NODE_MAJOR_RUNNING="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo '')"
+  if [[ "${NODE_MAJOR_RUNNING}" == "24" ]]; then
+    IOB_NODE_OPTIONS="--scavenger-max-new-space-capacity-mb=8"
+    log "node major ${NODE_MAJOR_RUNNING}: defaulting IOB_NODE_OPTIONS to --scavenger-max-new-space-capacity-mb=8 (nodejs/node#61967)"
+  else
+    IOB_NODE_OPTIONS=""
+    log "node major ${NODE_MAJOR_RUNNING:-unknown}: no default node flags (scavenger workaround applies to Node 24 only)"
+  fi
+fi
 
 # --- Memory allocator tuning for the long-running controller ----------------
 #

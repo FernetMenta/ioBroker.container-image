@@ -217,7 +217,7 @@ fault.
 | `IOB_PKG_WATCH_INTERVAL` | `10` | `0`–… (seconds) | Poll interval for the background watcher that keeps the `package.json` snapshot on the `node_modules` volume current (it copies `package.json` to the snapshot whenever its content changes, so an adapter installed via admin survives a later recreate). `0` disables the watcher entirely — do this only if you have a reason to stop snapshotting `package.json`; the recreate-prune protection then relies solely on the last snapshot restored at start. See [package.json persistence](#packagejson-persistence-across-recreate). |
 | `IOB_HEAL_NODE_MODULES` | `true` | `true` \| `false` | Whether startup runs one `npm install` (after restoring `package.json`, before js-controller) to rebuild any missing hoisted dependency in `node_modules` — the self-heal that clears `Cannot find module '<dep>'` after a tree was left incomplete. Set `false` to skip it (faster start, but a damaged tree is not repaired). See [package.json persistence](#packagejson-persistence-across-recreate). |
 | `IOB_HEAL_TIMEOUT` | `1800` | `0`–… (seconds) | Maximum time the self-heal `npm install` may run before it is aborted (and startup continues anyway). `0` disables the timeout. Raise it only if a legitimately large first-time heal on a very slow link exceeds the default. |
-| `IOB_NODE_OPTIONS` | `--scavenger-max-new-space-capacity-mb=8` | space-separated `node` flags | V8/`node` command-line flags passed to the js-controller `node` process. The default pins V8's new-space (scavenger) capacity to the pre-Node-24 size to work around a memory-usage regression in Node 24 ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)) that inflates RSS for a Buffer-heavy workload. See [Node 24 memory workaround](#node-24-memory-workaround) below. Set to an empty string to pass no extra flags (e.g. once the upstream regression is fixed), or override with your own space-separated flags. |
+| `IOB_NODE_OPTIONS` | `--scavenger-max-new-space-capacity-mb=8` **on Node 24 only** (empty on other majors) | space-separated `node` flags | V8/`node` command-line flags passed to the js-controller `node` process. The default pins V8's new-space (scavenger) capacity to the pre-Node-24 size to work around a memory-usage regression in Node 24 ([nodejs/node#61967](https://github.com/nodejs/node/issues/61967)) that inflates RSS for a Buffer-heavy workload. This flag exists only on Node 24's V8 (introduced in V8 13.6, removed in V8 14.1+), so it is defaulted **only when the running Node major is 24** and left empty otherwise — passing it on Node 26+ would make `node` exit with an unknown-flag error. See [Node 24 memory workaround](#node-24-memory-workaround) below. Set to an empty string to pass no extra flags, or override with your own space-separated flags (an explicit value is used verbatim on any Node major). |
 | `IOB_USE_JEMALLOC` | `true` | `true` \| `false` | Whether to `LD_PRELOAD` the jemalloc allocator (`libjemalloc.so.2`, shipped in the image) into the js-controller `node` process and its adapter children. jemalloc returns freed memory to the OS far more aggressively than glibc's default `malloc`, which flattens the slow RSS creep a long-running controller otherwise shows. Opt **out** with `false` to use glibc `malloc`. See [Allocator memory retention](#allocator-memory-retention) below. |
 | `IOB_MALLOC_ARENA_MAX` | `2` | `0`–… (integer) \| empty | Caps the number of glibc `malloc` arenas via `MALLOC_ARENA_MAX`, applied to the controller and its adapter children. glibc defaults to up to `8 × nCPU` arenas, each retaining freed memory; capping them lowers steady-state RSS. Applies whether or not jemalloc is enabled. Set to an empty string to leave glibc at its default. See [Allocator memory retention](#allocator-memory-retention) below. |
 
@@ -269,6 +269,17 @@ process with the V8 flag:
 ```
 
 This caps the new-space capacity at the size Node used before the regression.
+
+**Node 24 only.** This flag is specific to Node 24's V8: it was introduced in V8
+13.6 (which shipped in Node 24) and **removed in V8 14.1+**, so Node 26 (V8 14.6)
+does not recognize it and `node` would exit with an unknown-flag error if it were
+passed. The entrypoint therefore reads the running Node major and applies the
+default **only on Node 24**, leaving `IOB_NODE_OPTIONS` empty on every other
+major. Node 26 is affected by the same underlying regression but needs a
+different flag; the clean resolution is the upstream V8 fix, after which no flag
+is required. An explicit `IOB_NODE_OPTIONS` value you set yourself is always used
+verbatim, on any Node major — the version gating applies only to the built-in
+default.
 
 **Why not `NODE_OPTIONS`?** This is a **V8** flag, not a plain Node option.
 Passing it through `NODE_OPTIONS` does not reliably take effect — V8 reads its
