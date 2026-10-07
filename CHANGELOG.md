@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Placeholder for the next version (at the beginning of the line):
     ## [WORK IN PROGRESS]
 -->
-## [WORK IN PROGRESS]
+
+## [7.2.2.4] 07.10.2026
 
 ### Added
 
