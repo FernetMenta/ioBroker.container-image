@@ -10,6 +10,12 @@ Ein **rootless**, **Multi-Architektur**-Container-Image für
 auf dem offiziellen Node.js-LTS-Image mit der aktuell von ioBroker empfohlenen
 Version.
 
+> Diese Seite ist nur eine **kurze deutschsprachige Zusammenfassung**. Die
+> vollständige und maßgebliche Dokumentation (auf Englisch) befindet sich im
+> GitHub-Projekt
+> [FernetMenta/ioBroker.container-image](https://github.com/FernetMenta/ioBroker.container-image).
+> Für Details siehe den [Abschnitt am Ende dieser Seite](#ausführliche-dokumentation-englisch).
+
 > **Hinweis:** Dieses Projekt ist eine Überarbeitung von
 > [buanet/ioBroker.docker](https://github.com/buanet/ioBroker.docker). Es baut
 > auf den Ideen dieses weit verbreiteten ioBroker-Container-Images auf und
@@ -19,11 +25,12 @@ Version.
 Das veröffentlichte Image ist über die GitHub Container Registry verfügbar:
 
 ```
-ghcr.io/fernetmenta/iobroker
+ghcr.io/fernetmenta/iobroker:7.2.2
 ```
 
 (Der Paketname unterscheidet sich bewusst vom Quell-Repository
-`ioBroker.container-image`.)
+`ioBroker.container-image`. Die Zahl `7.2.2` ist die gebündelte
+js-controller-Version; sie dient hier als Beispiel für das aktuelle Release.)
 
 ---
 
@@ -66,7 +73,7 @@ docker run -d \
   -p 8082:8082 \
   -v iobroker-data:/opt/iobroker/iobroker-data \
   -v iobroker-log:/opt/iobroker/log \
-  ghcr.io/fernetmenta/iobroker
+  ghcr.io/fernetmenta/iobroker:7.2.2
 ```
 
 ### Podman (rootless)
@@ -78,7 +85,7 @@ podman run -d \
   -p 8082:8082 \
   -v iobroker-data:/opt/iobroker/iobroker-data \
   -v iobroker-log:/opt/iobroker/log \
-  ghcr.io/fernetmenta/iobroker
+  ghcr.io/fernetmenta/iobroker:7.2.2
 ```
 
 Anschließend <http://localhost:8081> für die Admin-Oberfläche öffnen.
