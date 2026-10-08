@@ -1,0 +1,64 @@
+# Build and deploy the German documentation site to GitHub Pages.
+#
+# Source: the ./site folder (a curated German overview, kept separate from the
+# internal English docs in ./docs). It is rendered with GitHub's built-in Jekyll
+# via the official Pages Actions — there is no project-specific site generator
+# to pin or maintain.
+#
+# One-time repo setting required before the first run:
+#   Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+#
+# After that, every push to main that touches the site (or this workflow)
+# rebuilds and deploys it. It can also be run on demand from the Actions tab.
+
+name: Deploy docs to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs-pages.yml'
+  workflow_dispatch:
+
+# Allow the GITHUB_TOKEN to deploy to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; let an in-progress run finish rather than
+# cancelling it (avoids leaving a deployment half-done).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          destination: ./_site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

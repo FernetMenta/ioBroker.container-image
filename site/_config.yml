@@ -1,0 +1,22 @@
+# Jekyll configuration for the German GitHub Pages documentation site.
+#
+# This site is intentionally separate from the internal, task-referenced docs
+# in ../docs. It is a curated German overview that links into the detailed
+# English documentation on GitHub for the deep technical content.
+#
+# Build/deploy is handled by .github/workflows/docs-pages.yml using GitHub's
+# official Pages Actions (no project-specific generator to maintain).
+
+title: ioBroker Container Image
+description: >-
+  Rootless, Multi-Architektur-Container-Image für ioBroker –
+  deutschsprachige Übersicht.
+lang: de-DE
+
+# Clean, built-in GitHub Pages theme. No extra plugins required.
+theme: minima
+
+# Only the site/ folder is the Jekyll source; nothing else in the repo is.
+# (The workflow runs the build with this folder as the source.)
+exclude:
+  - README.md
