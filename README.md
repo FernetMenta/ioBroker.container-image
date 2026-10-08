@@ -2,7 +2,7 @@
 
 A rootless, multi-architecture container image for
 [ioBroker](https://www.iobroker.net/), built as a slim multi-stage image on the
-official Node.js 22 LTS base.
+official Node.js LTS base version currenty recommended by ioBroker.
 
 > **Note:** This project is a revamp of
 > [buanet/ioBroker.docker](https://github.com/buanet/ioBroker.docker). It builds
