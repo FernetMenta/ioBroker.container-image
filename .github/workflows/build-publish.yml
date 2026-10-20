@@ -277,7 +277,10 @@ jobs:
   # (`<version>-r<n>`, e.g. `7.2.2-r2`), and ONLY after BOTH per-arch builds +
   # gates succeed (all-or-nothing). buildx pushes one manifest list referencing
   # both arch variants under the immutable `<version>-r<n>` tag, the moving
-  # `<version>` alias, and `latest`. (Req 1.3, 1.6, 1.8)
+  # `<version>` alias, and — only when this push is the HIGHEST js-controller
+  # `<version>` across all release tags — `latest` (see the "Decide latest tag"
+  # step). A base-refresh of an older version, or a dev build, never moves
+  # `latest`. (Req 1.3, 1.6, 1.8)
   # ---------------------------------------------------------------------------
   publish:
     name: Publish multi-arch manifest
@@ -292,6 +295,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Need the full tag history so the "latest" gate below can compare the
+          # pushed version against every existing `<version>-r<n>` release tag.
+          fetch-depth: 0
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -305,6 +312,65 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # Decide whether THIS push should move the `latest` tag.
+      #
+      # `latest` must point at the newest revision of the HIGHEST js-controller
+      # `<version>` only. Two cases must be excluded:
+      #   - dev tags (`<version>-dev-r<n>`): never move `latest` (is_dev gate).
+      #   - a RELEASE push for an OLDER version, e.g. a base-refresh rebuilding
+      #     7.2.2-r<n> after 7.2.5 already exists. Without this gate the older
+      #     7.2.2 build would wrongly steal `latest`.
+      #
+      # We compute the highest `<version>` across ALL existing `<version>-r<n>`
+      # RELEASE tags (same collection/sort as base-refresh: strip `-r<n>`,
+      # `sort -V`, take the top). The pushed release_version moves `latest` only
+      # when it is >= that highest version (>= so the push that FIRST creates a
+      # brand-new highest version still gets `latest`, since its own tag is
+      # already part of the fetched history here).
+      - name: Decide latest tag
+        id: latest
+        # Only meaningful for release pushes; dev pushes short-circuit to no.
+        env:
+          IS_DEV: ${{ needs.read-build-config.outputs.is_dev }}
+          PUSHED_VERSION: ${{ needs.read-build-config.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$IS_DEV" == "true" || -z "$PUSHED_VERSION" ]]; then
+            echo "Dev build (or no release version) -> do not tag latest."
+            echo "value=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Highest `<version>` across all `<version>-r<n>` RELEASE tags. Dev
+          # tags are excluded by the anchored `-r[0-9]+$` (which `-dev-r<n>`
+          # does not match).
+          highest="$(
+            git tag --list \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$' \
+              | sed -E 's/-r[0-9]+$//' \
+              | sort -u -V \
+              | tail -n 1
+          )"
+          if [[ -z "$highest" ]]; then
+            # No existing release tags visible: the pushed version is the only
+            # (hence highest) release version -> it owns latest.
+            echo "No existing release tags; pushed version '$PUSHED_VERSION' is highest -> tag latest."
+            echo "value=latest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Is PUSHED_VERSION >= highest? True iff, when both are present,
+          # sort -V keeps `highest` first (i.e. PUSHED_VERSION is not strictly
+          # lower). Equivalent check: the max of {PUSHED_VERSION, highest} is
+          # PUSHED_VERSION.
+          max="$(printf '%s\n%s\n' "$PUSHED_VERSION" "$highest" | sort -V | tail -n 1)"
+          if [[ "$max" == "$PUSHED_VERSION" ]]; then
+            echo "Pushed version '$PUSHED_VERSION' >= highest release version '$highest' -> tag latest."
+            echo "value=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "Pushed version '$PUSHED_VERSION' is older than highest release version '$highest' -> do NOT tag latest."
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute tags and labels
         id: meta
@@ -322,10 +388,14 @@ jobs:
             # empty), which metadata-action skips, so a dev build never moves
             # the `<version>` pointer.
             type=raw,value=${{ needs.read-build-config.outputs.release_version }}
-            # `latest` applied only on RELEASE-tag pushes. For dev tags this is
-            # empty (is_dev == true) and metadata-action skips it, so a dev
-            # build never moves `latest`.
-            type=raw,value=${{ needs.read-build-config.outputs.is_dev == 'true' && '' || 'latest' }}
+            # `latest` applied ONLY when the "Decide latest tag" step above
+            # resolved it. That step emits `latest` solely for a RELEASE push
+            # whose `<version>` is the HIGHEST across all `<version>-r<n>` tags,
+            # and emits empty for dev tags and for release pushes of an older
+            # version (e.g. a base-refresh of 7.2.2 after 7.2.5 exists). An
+            # empty value is skipped by metadata-action, so `latest` never moves
+            # in those cases.
+            type=raw,value=${{ steps.latest.outputs.value }}
           labels: |
             # Link the GHCR package (name `iobroker`) back to its source repo.
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
