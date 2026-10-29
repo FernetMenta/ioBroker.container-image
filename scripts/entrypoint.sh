@@ -842,6 +842,40 @@ else
     "with MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-default}"
 fi
 
+# Start the in-container HEALTH WATCHDOG in the BACKGROUND, just before the exec.
+#
+# WHY: the image ships a Docker-style HEALTHCHECK, but under `podman kube play`
+# (the operator's deployment) the runtime does NOT schedule it — `podman inspect`
+# reports State.Health as null and `podman healthcheck run` errors "has no defined
+# healthcheck". So healthcheck.sh is never run on a schedule, the Dockerfile
+# --retries=3 budget is inert, and nothing reacts to an unhealthy container. The
+# watchdog runs healthcheck.sh itself every IOB_WATCHDOG_INTERVAL seconds and, after
+# IOB_WATCHDOG_THRESHOLD consecutive unhealthy results, SIGTERMs the controller so
+# it exits; the pod then exits and systemd's quadlet Restart=always restarts it.
+#
+# PLACEMENT / PPID: this launch sits immediately before the `exec` below. `exec`
+# replaces THIS shell's process image with node WITHOUT changing its PID, so the
+# watchdog — backgrounded from this shell — has its $PPID pointing at the exact
+# process that becomes the js-controller `node`. The watchdog captures that PPID
+# once and SIGTERMs it on sustained unhealthy (see scripts/health-watchdog.sh for
+# the full signal/process-model reasoning). Mirrors the persist-package-json.sh
+# watcher pattern above; reaped by tini (PID 1) on exit.
+#
+# OPT-OUT: IOB_HEALTHCHECK_WATCHDOG=false disables it entirely (default enabled);
+# when disabled the controller starts exactly as before. Best-effort: a failure to
+# launch the watchdog never blocks the controller.
+if [[ "${IOB_HEALTHCHECK_WATCHDOG:-true}" != "false" ]]; then
+  env "${RECONCILE_ENV[@]}" \
+    IOB_WATCHDOG_INTERVAL="${IOB_WATCHDOG_INTERVAL:-30}" \
+    IOB_WATCHDOG_THRESHOLD="${IOB_WATCHDOG_THRESHOLD:-3}" \
+    "${SCRIPT_DIR}/health-watchdog.sh" &
+  log "started health watchdog (pid $!): runs healthcheck.sh every" \
+    "${IOB_WATCHDOG_INTERVAL:-30}s and SIGTERMs the controller after" \
+    "${IOB_WATCHDOG_THRESHOLD:-3} consecutive unhealthy results (disable with IOB_HEALTHCHECK_WATCHDOG=false)"
+else
+  log "health watchdog disabled (IOB_HEALTHCHECK_WATCHDOG=false)"
+fi
+
 # shellcheck disable=SC2086 # deliberate word-splitting: each token is a node flag
 log "starting js-controller (node flags: ${IOB_NODE_OPTIONS:-<none>})"
 exec node ${IOB_NODE_OPTIONS} "${JS_CONTROLLER}" "$@"

@@ -222,6 +222,10 @@ fault.
 | `IOB_MALLOC_ARENA_MAX`         | `2`                                                                                   | `0`–… (integer) \| empty     | Caps the number of glibc `malloc` arenas via `MALLOC_ARENA_MAX`, applied to the controller and its adapter children. glibc defaults to up to `8 × nCPU` arenas, each retaining freed memory; capping them lowers steady-state RSS. Applies whether or not jemalloc is enabled. Set to an empty string to leave glibc at its default. See [Allocator memory retention](#allocator-memory-retention) below.                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `IOB_MESSAGEBOX_PROBE`         | `true`                                                                                | `true` \| `false`            | Whether the healthcheck runs an active messagebox round-trip self-probe after `iobroker status` passes, to detect a host whose inbound message channel died silently after a DB reconnect ([issue #3524](#stale-messagebox-after-db-reconnect-issue-3524) below). Set `false` to revert to status-only behavior (exactly as before the probe existed).                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `IOB_MESSAGEBOX_PROBE_TIMEOUT` | `5`                                                                                   | `1`–`15` (seconds)           | Bound for the messagebox probe's connect + round-trip. The probe must resolve within this time; a timeout where the DB was confirmed reachable is the issue #3524 signature. Matches the controller's own 5s host-liveness timeout. **Clamped to 1–15s** so the probe (plus its backstop) can never push a healthcheck cycle past the Docker `HEALTHCHECK --timeout` of 30s; a value outside that range (including `0` or non-numeric) falls back to `5`. See [Stale messagebox after DB reconnect](#stale-messagebox-after-db-reconnect-issue-3524) below.                                                                                                                                                                                                                                                  |
+| `IOB_HEALTHCHECK_WATCHDOG`     | `true`                                                                                | `true` \| `false`            | Whether the entrypoint starts the in-container **health watchdog** (`scripts/health-watchdog.sh`) in the background. The watchdog exists because under `podman kube play` the image `HEALTHCHECK` is never scheduled by the runtime, so nothing runs the healthcheck or reacts to an unhealthy container; the watchdog runs `healthcheck.sh` itself and restarts the container on sustained unhealthy. Set `false` to disable it entirely — startup then behaves exactly as if the watchdog did not exist. See [kube-play health watchdog](#kube-play-health-watchdog) below.                                                                                                                                                                                                                                |
+| `IOB_WATCHDOG_INTERVAL`        | `30`                                                                                  | `1`–… (seconds)              | Seconds the watchdog waits between `healthcheck.sh` runs. A non-integer or `< 1` value falls back to `30`. Matches the Dockerfile `HEALTHCHECK --interval`. See [kube-play health watchdog](#kube-play-health-watchdog) below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `IOB_WATCHDOG_THRESHOLD`       | `3`                                                                                   | `1`–… (consecutive results)  | Number of **consecutive** unhealthy healthcheck results (exit 1) before the watchdog SIGTERMs the controller so the pod exits and systemd restarts it. A single healthy result resets the count. At the default interval this is ~90s of sustained unhealthiness, deliberately aligned with js-controller's own ~90s database give-up so the two do not fight. A non-integer or `< 1` value falls back to `3`. This consecutive-count debounce is what replaces the (inert under kube-play) Dockerfile `--retries=3`. See [kube-play health watchdog](#kube-play-health-watchdog) below.                                                                                                                                                                                                                     |
+| `IOB_WATCHDOG_LOG_FILE`        | `${IOB_LOG_DIR:-/opt/iobroker/log}/health-watchdog.log`                               | any writable path            | Dedicated, restart-surviving log file for watchdog **issues**. On start the watchdog writes a one-time `started` note; thereafter it appends only problems — unhealthy cycles (with the healthcheck's own reason) and the restart decision/escalation. Healthy cycles are **not** logged at all (no heartbeat), so the file stays quiet and its contents after a restart tell you exactly why. Lives in the bind-mounted log volume so it outlives the pod restart it records. Issue lines also go to stderr/journald. If the path is not writable the watchdog logs to stderr only. See [kube-play health watchdog](#kube-play-health-watchdog) below.                                                                                                                                                      |
 
 ### package.json persistence across recreate
 
@@ -399,6 +403,62 @@ Set `IOB_MESSAGEBOX_PROBE=false` to disable the probe and revert to status-only
 behavior. Reach for the opt-out only while diagnosing — for example if a
 particular states DB type or topology makes the probe noisy, or while isolating
 an unrelated fault and you want the healthcheck back to its pre-probe behavior.
+
+### kube-play health watchdog
+
+The image ships a Docker-style `HEALTHCHECK` that runs `healthcheck.sh` every 30s
+and, after `--retries=3` failures, marks the container unhealthy. Under
+`docker run` / `podman run` the runtime schedules that `HEALTHCHECK` and reacts to
+it. **Under `podman kube play` it does not.** The kube-play runtime does not
+schedule the image `HEALTHCHECK` at all: `podman inspect` reports `State.Health`
+as `null`, and `podman healthcheck run <ctr>` errors `has no defined healthcheck`.
+So in that deployment nothing runs the healthcheck on a schedule, the `--retries`
+budget is inert, and an unhealthy container is never detected or restarted.
+
+To close that gap the entrypoint starts a small in-container **health watchdog**
+(`scripts/health-watchdog.sh`) in the background, just before it execs
+js-controller. Every `IOB_WATCHDOG_INTERVAL` seconds (default 30) the watchdog
+runs the very same `healthcheck.sh` and reads its exit code. It keeps a count of
+**consecutive** unhealthy results (exit 1); a single healthy result (exit 0)
+resets the count to zero. When the count reaches `IOB_WATCHDOG_THRESHOLD`
+consecutive unhealthy results (default 3 — about 90s at the default interval), the
+watchdog sends the controller a single `SIGTERM`. js-controller shuts down
+gracefully, the pod exits, and systemd's quadlet `Restart=always` restarts the
+whole pod — the image's established recovery path, now actually triggered under
+kube-play. This consecutive-count debounce is the direct replacement for the
+`HEALTHCHECK --retries=3` that kube-play ignores, and the ~90s default is
+deliberately aligned with js-controller's own ~90s database give-up so the two do
+not fight.
+
+The watchdog reuses `healthcheck.sh` as-is and only branches on its exit code, so
+it inherits all of the healthcheck's tolerance for free: during the startup-grace,
+live-reconcile, and upgrade windows `healthcheck.sh` returns 0 (`starting`), so
+the watchdog's count stays at zero and it never restarts the container during boot
+or reconciliation. It also fires **at most once** (it latches after the first
+SIGTERM and lets systemd own the restart, so it never spams signals) and it exits
+promptly and quietly when the pod is being stopped intentionally, so it never
+races a deliberate `systemctl stop`.
+
+Logging is deliberately split so a problem is easy to find without trawling
+`journalctl`. All watchdog output goes to stderr (and thus the container's
+journald stream), but only **issues** are additionally written to a dedicated,
+restart-surviving file, `IOB_WATCHDOG_LOG_FILE` (default
+`${IOB_LOG_DIR:-/opt/iobroker/log}/health-watchdog.log`, in the bind-mounted log
+volume). On start the watchdog writes a single `started` note there; thereafter it
+appends only unhealthy cycles — including the healthcheck's own reason — and the
+restart decision and any SIGKILL escalation. Healthy cycles are not logged at all,
+so the file stays empty apart from the startup note until something actually goes
+wrong, and because it lives on the log volume it survives the very pod restart it
+records — so after a restart you can open it and see exactly why. If the log
+directory is not writable the watchdog falls back to stderr-only and keeps running.
+
+Set `IOB_HEALTHCHECK_WATCHDOG=false` to disable the watchdog entirely; startup
+then behaves exactly as if it did not exist. Reach for the opt-out when you are
+diagnosing restart behavior and want to observe an unhealthy container without the
+watchdog restarting it, or when an **external** supervisor already schedules the
+`HEALTHCHECK` for you — for example plain `docker run` / `podman run`, where the
+runtime's own `HEALTHCHECK` scheduling and `--retries` make the in-container
+watchdog redundant.
 
 ## Database backends and multihost
 

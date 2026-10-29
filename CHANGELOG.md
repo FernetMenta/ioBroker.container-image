@@ -10,6 +10,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ## [WORK IN PROGRESS]
 -->
 
+## [WORK IN PROGRESS]
+
+### Added
+
+- An in-container **health watchdog** (`scripts/health-watchdog.sh`, started in
+  the background by the entrypoint) now runs `healthcheck.sh` on a schedule and
+  restarts the container on sustained unhealthy. It exists because under
+  `podman kube play` the runtime does **not** schedule the image `HEALTHCHECK`
+  (`podman inspect` shows `State.Health` as `null` and `podman healthcheck run`
+  errors "has no defined healthcheck"), so the Dockerfile `--retries=3` budget is
+  inert and nothing reacts to an unhealthy container in that deployment. The
+  watchdog runs the existing `healthcheck.sh` every `IOB_WATCHDOG_INTERVAL`
+  seconds (default `30`) and, after `IOB_WATCHDOG_THRESHOLD` **consecutive**
+  unhealthy results (default `3`, ~90s — aligned with js-controller's own ~90s
+  database give-up), sends the controller a single `SIGTERM` so it shuts down
+  gracefully, the pod exits, and systemd's quadlet `Restart=always` restarts it.
+  A single healthy result resets the count; it fires at most once (latches, no
+  signal spam) and exits quietly on a deliberate stop so it never fights
+  `systemctl stop`. Because it only branches on `healthcheck.sh`'s exit code, it
+  inherits the startup-grace / live-reconcile tolerance for free (the healthcheck
+  returns `starting` during boot/reconcile, so the watchdog never restarts then).
+  If the controller does not exit within `IOB_WATCHDOG_KILL_GRACE` seconds of the
+  `SIGTERM` (e.g. an event-loop hang), the watchdog escalates to a single
+  `SIGKILL` so the pod is torn down and restarted even in that case. Watchdog
+  **issues** (unhealthy cycles with the healthcheck's reason, and the restart
+  decision/escalation) are additionally written to a dedicated, restart-surviving
+  log file, `IOB_WATCHDOG_LOG_FILE` (default
+  `${IOB_LOG_DIR:-/opt/iobroker/log}/health-watchdog.log`, on the bind-mounted log
+  volume); healthy cycles are not logged, so the file stays empty apart from a
+  startup `started` note until something goes wrong and survives the restart it
+  records. All watchdog output also goes to stderr/journald.
+  Disable it entirely with `IOB_HEALTHCHECK_WATCHDOG=false` (default enabled);
+  under plain `docker run` / `podman run`, where the runtime schedules the
+  `HEALTHCHECK` itself, the watchdog is redundant. The pure consecutive-count/
+  debounce logic lives in `lib/watchdog-state.js` and is covered by
+  `test/watchdog-state.test.js` and `test/watchdog-state.property.test.js`; the
+  shell wiring (loop, single SIGTERM, reset, knob fallback) is covered by
+  `test/smoke/health-watchdog.sh`. The Dockerfile `HEALTHCHECK` directive is
+  unchanged (a comment documents the kube-play rationale). See
+  [environment-variables.md](docs/environment-variables.md) ("kube-play health
+  watchdog").
+
 ## [7.2.2.4] 07.10.2026
 
 ### Added
@@ -100,7 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   succeed in this rootless image ("sudo: a password is required"). Because the
   controller writes the detected Node version back AFTER that call in the same
   try block, the failure skipped the write-back, so `system.host.<host>
-  .nodeVersion` stayed stale and the controller re-detected a "version change" —
+.nodeVersion` stayed stale and the controller re-detected a "version change" —
   re-attempting setcap and logging the warning — on EVERY start. Skipping setcap
   (which is intentionally incompatible with the image's no-file-capability
   rootless model; NET_BIND_SERVICE / NET_RAW are delivered as runtime ambient

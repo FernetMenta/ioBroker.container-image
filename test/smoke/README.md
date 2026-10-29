@@ -12,14 +12,15 @@ message and exits 0**, so it never hard-fails in a build-less environment.
 
 ## Scripts
 
-| Script                             | Purpose                                                                                                                                                                                                                                      | Requirements                                  |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `manifest-size.sh`                 | Multi-arch manifest + image-size checks                                                                                                                                                                                                      | 1.3, 1.4, 1.5, 1.6, 1.7, 2.5                  |
-| `runtime-deps.sh`                  | Runtime-dependency + packaging checks (dpkg, ldd, smoke start, getcap)                                                                                                                                                                       | 2.3, 2.6, 5.2, 5.3, 7.1                       |
-| `rootless-uid.sh`                  | Non-root default, arbitrary-UID volume access, container-env indicators                                                                                                                                                                      | 3.3, 3.4, 3.5, 3.6, 4.5, 4.6, 6.1, 6.2, 6.3   |
-| `pid1-signals.sh`                  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts                                                                                                             | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
-| `install-source-classify.sh`       | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes                                                                                                | 8.9, 8.10                                     |
-| `fresh-install-admin-bootstrap.sh` | Drives `reconcile.sh` across the entrypoint's two passes (init -> install) to prove the fresh-install `admin` seed survives the split, installs the setup UI AND creates the `admin.0` instance (and does neither again on a normal restart) | 8.6, 8.9, 8.10                                |
+| Script                             | Purpose                                                                                                                                                                                                                                                                                                               | Requirements                                  |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `manifest-size.sh`                 | Multi-arch manifest + image-size checks                                                                                                                                                                                                                                                                               | 1.3, 1.4, 1.5, 1.6, 1.7, 2.5                  |
+| `runtime-deps.sh`                  | Runtime-dependency + packaging checks (dpkg, ldd, smoke start, getcap)                                                                                                                                                                                                                                                | 2.3, 2.6, 5.2, 5.3, 7.1                       |
+| `rootless-uid.sh`                  | Non-root default, arbitrary-UID volume access, container-env indicators                                                                                                                                                                                                                                               | 3.3, 3.4, 3.5, 3.6, 4.5, 4.6, 6.1, 6.2, 6.3   |
+| `pid1-signals.sh`                  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts                                                                                                                                                                                      | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
+| `install-source-classify.sh`       | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes                                                                                                                                                                         | 8.9, 8.10                                     |
+| `fresh-install-admin-bootstrap.sh` | Drives `reconcile.sh` across the entrypoint's two passes (init -> install) to prove the fresh-install `admin` seed survives the split, installs the setup UI AND creates the `admin.0` instance (and does neither again on a normal restart)                                                                          | 8.6, 8.9, 8.10                                |
+| `health-watchdog.sh`               | Drives the `scripts/health-watchdog.sh` loop with an injected fake healthcheck (scripted exit codes) and a disposable target PID; asserts SIGTERM fires exactly at the consecutive-unhealthy threshold, a healthy result resets the streak, the trigger fires once (latch), and malformed knobs fall back to defaults | 9                                             |
 
 ## `manifest-size.sh`
 
@@ -368,3 +369,57 @@ Cases asserted:
   skipped because `node` was unavailable.
 - `1` — regression (admin not installed on a fresh start, or re-installed on a
   routine restart).
+
+## `health-watchdog.sh`
+
+A **no-Docker, no-image** check that pins the WIRING of
+`scripts/health-watchdog.sh` — the loop, the consecutive-unhealthy debounce, the
+single SIGTERM, the reset-on-healthy behavior, and the fallback on malformed
+knobs — without a real controller, DB, or container. The pure counting/decision
+logic is covered by `test/watchdog-state.*test.js`; this harness covers the shell
+glue those module tests cannot reach.
+
+### Why the watchdog exists
+
+Under `podman kube play` the runtime does **not** schedule the image
+`HEALTHCHECK` (`podman inspect` shows `State.Health` as null and
+`podman healthcheck run` errors "has no defined healthcheck"), so the Dockerfile
+`--retries=3` budget is inert and nothing reacts to an unhealthy container. The
+watchdog, started in the background by the entrypoint, runs `healthcheck.sh`
+itself every `IOB_WATCHDOG_INTERVAL` seconds and, after `IOB_WATCHDOG_THRESHOLD`
+consecutive unhealthy results, SIGTERMs the controller so the pod exits and
+systemd (`Restart=always`) restarts it.
+
+### How the harness works
+
+The real healthcheck is replaced via `IOB_WATCHDOG_HEALTHCHECK_CMD` (a stub whose
+exit code is scripted per call from a counter file), the signal target via
+`IOB_WATCHDOG_TARGET_PID` (a disposable `sleep` process), and the run is bounded
+with `IOB_WATCHDOG_MAX_CYCLES` + `IOB_WATCHDOG_INTERVAL=1` so every case is fast
+and terminating. The target `sleep` exits on SIGTERM, so a post-run `kill -0`
+tells the harness whether the watchdog signalled it.
+
+Cases asserted:
+
+1. **Below threshold** — `threshold-1` consecutive unhealthy results do **not**
+   signal the target.
+2. **At threshold** — the `threshold`-th consecutive unhealthy result **does**
+   send SIGTERM (the target terminates).
+3. **Reset on healthy** — a healthy (exit 0) result in the middle resets the
+   streak, so a sub-threshold tail of unhealthy results never signals.
+4. **Fire-once latch** — past the threshold, extra unhealthy cycles trigger no
+   second signal and the watchdog still exits cleanly.
+5. **Malformed knobs** — a non-numeric `IOB_WATCHDOG_THRESHOLD` /
+   `IOB_WATCHDOG_INTERVAL` falls back to the defaults and the script still runs.
+
+### Usage
+
+```bash
+./test/smoke/health-watchdog.sh
+```
+
+### Exit codes
+
+- `0` — every case held, **or** skipped because `node` was unavailable.
+- `1` — a regression (signalled too early/late, missed the reset, re-signalled,
+  or aborted on a malformed knob).

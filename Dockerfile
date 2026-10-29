@@ -659,6 +659,20 @@ USER 1000
 # and its own bounded timeout (IOB_MESSAGEBOX_PROBE_TIMEOUT, default 5s) sits well
 # inside the coarse --timeout below. The --retries/--interval/--timeout values are
 # unchanged by the probe.
+#
+# NOTE on `podman kube play`: this directive is scheduled and honored by
+# `docker run` / `podman run`, but the `podman kube play` runtime does NOT
+# schedule the image HEALTHCHECK — `podman inspect` reports State.Health as null
+# and `podman healthcheck run <ctr>` errors "has no defined healthcheck", so the
+# --retries/--interval here are inert in that deployment and nothing reacts to an
+# unhealthy container. For that reason the entrypoint also starts an in-container
+# HEALTH WATCHDOG (scripts/health-watchdog.sh) that runs this same healthcheck.sh
+# on a schedule and SIGTERMs the controller after a run of consecutive unhealthy
+# results so the pod exits and systemd restarts it (see
+# docs/environment-variables.md "kube-play health watchdog"). The watchdog is what
+# actually enforces health under kube-play; this HEALTHCHECK directive stays valid
+# and is still used under `docker run` / `podman run`. The flags below are
+# unchanged.
 HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD ["/opt/scripts/healthcheck.sh"]
 
