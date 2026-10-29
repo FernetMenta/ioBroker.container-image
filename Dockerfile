@@ -650,6 +650,15 @@ USER 1000
 # primary mechanism: it is kept generous (60s) so that even the very first probes
 # during a normal cold start are not counted, while the reconcile heartbeat (not a
 # fixed window) is what tolerates arbitrarily long first-boot reconciliation.
+#
+# After the status check passes (and only outside the startup-grace/reconcile
+# windows) the same script also runs an active messagebox round-trip self-probe
+# (ioBroker issue #3524): it verifies the host can still receive and answer a host
+# message and flags the container unhealthy when it positively cannot, so the
+# quadlet restarts it. The probe is controlled by IOB_MESSAGEBOX_PROBE (default on)
+# and its own bounded timeout (IOB_MESSAGEBOX_PROBE_TIMEOUT, default 5s) sits well
+# inside the coarse --timeout below. The --retries/--interval/--timeout values are
+# unchanged by the probe.
 HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD ["/opt/scripts/healthcheck.sh"]
 

@@ -62,6 +62,16 @@
 #                         word-split, so it may include arguments
 #   IOB_CHECK_TIMEOUT     per-check timeout in seconds (default 30; Req 9.1)
 #
+# Messagebox self-probe (ioBroker issue #3524; opt-out + tuning):
+#   IOB_MESSAGEBOX_PROBE  enable the active messagebox round-trip self-probe
+#                         (true/false, default true). When false the healthcheck
+#                         behaves EXACTLY as before (status-only). The probe runs
+#                         ONLY after a successful status check and ONLY outside the
+#                         startup-grace / reconcile windows; it detects a host whose
+#                         inbound messagebox subscription died silently after a DB
+#                         reconnect while `iobroker status` still reports healthy.
+#   IOB_MESSAGEBOX_PROBE_TIMEOUT  probe round-trip timeout in seconds (default 5).
+#
 # Exit codes (Req 9.5, 9.10):
 #   0  healthy or starting (a tolerated failure inside a window must NOT kill the
 #      container; Docker treats any non-zero healthcheck exit as unhealthy)
@@ -83,6 +93,13 @@ IOB_RECONCILE_HEARTBEAT="${IOB_RECONCILE_HEARTBEAT:-${IOB_DATA_DIR}/.iob-reconci
 IOB_STATUS_CMD="${IOB_STATUS_CMD:-iobroker status}"
 IOB_CHECK_TIMEOUT="${IOB_CHECK_TIMEOUT:-30}"
 
+# Messagebox self-probe knobs (issue #3524). Enabled by default; disabling reverts
+# to status-only behavior. The probe module path is overridable for the wiring
+# harness (test/smoke) so a stub can stand in for the real DB-touching probe.
+IOB_MESSAGEBOX_PROBE="${IOB_MESSAGEBOX_PROBE:-true}"
+IOB_MESSAGEBOX_PROBE_TIMEOUT="${IOB_MESSAGEBOX_PROBE_TIMEOUT:-5}"
+MESSAGEBOX_PROBE_MODULE="${MESSAGEBOX_PROBE_MODULE:-${REPO_ROOT}/lib/messagebox-probe.js}"
+
 # Window sizes come straight from the environment with the documented defaults.
 # Out-of-range/malformed values are handled defensively by the pure module
 # (a non-finite window is treated as "not inside"), so we do not re-validate
@@ -90,6 +107,22 @@ IOB_CHECK_TIMEOUT="${IOB_CHECK_TIMEOUT:-30}"
 STARTUP_GRACE_PERIOD="${IOB_STARTUP_GRACE_PERIOD:-300}"
 UPGRADE_TOLERANCE_WINDOW="${IOB_UPGRADE_TOLERANCE_WINDOW:-600}"
 RECONCILE_STALL_TOLERANCE="${IOB_RECONCILE_STALL_TOLERANCE:-120}"
+
+# Wall-clock at script entry. Used to budget the messagebox probe against the
+# time ALREADY spent in this invocation (status command + fact gathering), so the
+# probe can never push the WHOLE healthcheck past Docker's single --timeout bound
+# (review finding #2: Docker applies one 30s limit to the entire script, not
+# separate limits to the status check and the probe).
+HEALTHCHECK_START="$(date +%s)"
+
+# Docker's HEALTHCHECK --timeout for this image (Dockerfile). Kept in sync with the
+# Dockerfile directive; the probe budget below is derived from it so a slow status
+# command plus the probe never reach this outer bound. Overridable for tests.
+IOB_HC_DOCKER_TIMEOUT="${IOB_HC_DOCKER_TIMEOUT:-30}"
+# Safety margin (seconds) reserved below the Docker timeout for the final decision
+# node call and process teardown, so the probe's own hard stop lands comfortably
+# inside the outer bound.
+IOB_HC_PROBE_SAFETY_MARGIN="${IOB_HC_PROBE_SAFETY_MARGIN:-3}"
 
 log() { echo "healthcheck: $*" >&2; }
 
@@ -198,6 +231,178 @@ if [[ -f "${IOB_RECONCILE_MARKER}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3c. Active messagebox self-probe (issue #3524).
+#
+# The existing status check stays green when a multihost slave's inbound message
+# channel (messagebox.system.host.<name>) dies silently after a states/objects DB
+# reconnect. This block actively verifies the host can still RECEIVE and ANSWER a
+# host message (a getVersion round-trip) and, when it positively cannot, feeds a
+# messagebox FAILED fact to the decision module so the container is flagged
+# unhealthy (the quadlet then restarts it, which re-subscribes and recovers).
+#
+# Guard rails (avoid false positives / restart loops): the probe runs ONLY when
+#   - IOB_MESSAGEBOX_PROBE is enabled (default true), AND
+#   - the status check SUCCEEDED (a failed status is already handled above), AND
+#   - we are OUTSIDE the startup grace window, AND
+#   - no reconcile is in progress.
+# Those are exactly the windows where a transient messagebox absence is expected,
+# so we deliberately do not probe during boot/reconcile.
+#
+# The UPGRADE tolerance window is deliberately NOT re-checked here. This image
+# never signals an in-progress upgrade (upgrade_in_progress is always false, see
+# step 3; the window is dormant), so gating the probe on it in the shell would be
+# a no-op. More importantly, the "three tolerance windows apply to the probe
+# failure too" guarantee is enforced AUTHORITATIVELY in the pure decision module:
+# computeHealthState suppresses a probe failure inside ANY of the three windows
+# (startup grace, upgrade tolerance, live reconcile). So even if a future change
+# starts signalling an in-progress upgrade, a probe failure during it is already
+# tolerated at the decision layer — this bash gate is a performance/short-circuit
+# optimisation (don't even run the probe during boot/reconcile), not the place
+# that enforces window tolerance. This reliance on the module layer is intentional.
+#
+# Outcome mapping (the probe prints a single `outcome=...` line, exit code ignored):
+#   ok            -> messagebox_ok=true,  messagebox_probed=true
+#   failed        -> messagebox_ok=false, messagebox_probed=true  (the #3524 signature)
+#   inconclusive  -> messagebox_probed=false  (e.g. DB unreachable — already caught
+#                    by `iobroker status`; never reported as a messagebox failure)
+#   node error / timeout -> messagebox_probed=false (fail safe: not a failure)
+# ---------------------------------------------------------------------------
+messagebox_ok=true
+messagebox_probed=false
+
+# The probe is eligible only outside the startup grace window. STARTUP_GRACE_PERIOD
+# is an operator-supplied string that the pure module validates defensively (a
+# non-finite window is treated as "not inside"); we must NOT feed a raw value into
+# Bash arithmetic, because under `set -u` a non-numeric value like `oops` is treated
+# as an (unset) arithmetic variable and ABORTS the whole script — which would flip a
+# healthy host to failing. So we gate the probe on a numeric check: the probe runs
+# only when STARTUP_GRACE_PERIOD is a valid non-negative integer AND startup elapsed
+# is strictly past it. A malformed grace value simply skips the probe, preserving the
+# prior status-only (healthy) behavior rather than turning the host unhealthy.
+grace_is_valid=false
+if [[ "${STARTUP_GRACE_PERIOD}" =~ ^[0-9]+$ ]]; then
+  grace_is_valid=true
+fi
+
+if [[ "${IOB_MESSAGEBOX_PROBE}" == "true" ]] \
+  && [[ "${check_succeeded}" == "true" ]] \
+  && [[ "${grace_is_valid}" == "true" ]] \
+  && [[ "${startup_elapsed_seconds}" -gt "${STARTUP_GRACE_PERIOD}" ]] \
+  && [[ "${reconcile_in_progress}" != "true" ]]; then
+  probe_out=""
+  # Outer `timeout` is a BACKSTOP only — the module applies its own single overall
+  # deadline (the inner timeout) across connect + round-trip + cleanup and prints a
+  # conclusive `outcome=` line within it. The backstop must therefore be the inner
+  # budget PLUS headroom for Node process start and module load, so the module can
+  # emit `outcome=failed` on the #3524 path BEFORE the hard kill (an equal
+  # outer/inner bound would preempt `failed`, the one outcome that must wait out the
+  # full timeout). A backstop timeout/error yields no parseable outcome below and is
+  # treated as inconclusive (not a messagebox failure).
+  #
+  # WHOLE-HEALTHCHECK BUDGET (review finding #2): Docker applies ONE --timeout
+  # (IOB_HC_DOCKER_TIMEOUT, default 30s) to the ENTIRE script — the status command
+  # (up to IOB_CHECK_TIMEOUT) AND the probe together, not to each separately. If the
+  # status command and fact gathering already consumed much of that budget, a probe
+  # sized only against its own knob could push the whole script past Docker's bound;
+  # Docker would then record a FAILED check and could restart the container for a
+  # slow-DB/setup hang that the messagebox probe is explicitly required NOT to
+  # penalize. So we budget the probe's OUTER backstop against the time ALREADY
+  # elapsed in this invocation, reserving a safety margin for the final decision
+  # node call:
+  #     remaining = IOB_HC_DOCKER_TIMEOUT - elapsed_so_far - IOB_HC_PROBE_SAFETY_MARGIN
+  # The outer backstop is clamped to that remaining budget, and the inner deadline is
+  # derived from the backstop (backstop - PROBE_BACKSTOP_HEADROOM, floor 1). If too
+  # little time remains to run even a minimal probe, we SKIP it (status-only;
+  # messagebox_probed stays false — never a failure), exactly as if the probe were
+  # disabled. This keeps the complete healthcheck inside Docker's unchanged
+  # --timeout while never turning a slow-but-healthy host unhealthy.
+  #
+  # The inner knob is still validated and clamped 1..MAX first (same `set -u` hazard
+  # as the grace value: a non-integer must not reach arithmetic); a malformed/
+  # out-of-range value falls back to the default 5.
+  MESSAGEBOX_PROBE_TIMEOUT_MAX=15
+  # Headroom (s) the outer backstop keeps over the inner deadline for Node start +
+  # module load, so the module emits `outcome=failed` before the hard kill.
+  PROBE_BACKSTOP_HEADROOM=10
+  if [[ "${IOB_MESSAGEBOX_PROBE_TIMEOUT}" =~ ^[0-9]+$ ]] \
+    && [[ "${IOB_MESSAGEBOX_PROBE_TIMEOUT}" -ge 1 ]] \
+    && [[ "${IOB_MESSAGEBOX_PROBE_TIMEOUT}" -le "${MESSAGEBOX_PROBE_TIMEOUT_MAX}" ]]; then
+    probe_inner_timeout="${IOB_MESSAGEBOX_PROBE_TIMEOUT}"
+  else
+    probe_inner_timeout=5
+    log "IOB_MESSAGEBOX_PROBE_TIMEOUT='${IOB_MESSAGEBOX_PROBE_TIMEOUT}' is not an integer in" \
+      "1..${MESSAGEBOX_PROBE_TIMEOUT_MAX}; using 5"
+  fi
+  # Desired outer backstop from the (clamped) inner knob.
+  probe_hard_timeout=$(( probe_inner_timeout + PROBE_BACKSTOP_HEADROOM ))
+
+  # Budget against the whole-healthcheck Docker timeout (review finding #2). Only
+  # apply the budget when IOB_HC_DOCKER_TIMEOUT is a sane positive integer; a
+  # malformed override simply disables the budget (keeps the knob-sized backstop).
+  elapsed_so_far=$(( $(date +%s) - HEALTHCHECK_START ))
+  if [[ "${elapsed_so_far}" -lt 0 ]]; then
+    elapsed_so_far=0
+  fi
+  run_probe=true
+  if [[ "${IOB_HC_DOCKER_TIMEOUT}" =~ ^[0-9]+$ ]] && [[ "${IOB_HC_DOCKER_TIMEOUT}" -gt 0 ]]; then
+    safety_margin="${IOB_HC_PROBE_SAFETY_MARGIN}"
+    if ! [[ "${safety_margin}" =~ ^[0-9]+$ ]]; then
+      safety_margin=3
+    fi
+    remaining_budget=$(( IOB_HC_DOCKER_TIMEOUT - elapsed_so_far - safety_margin ))
+    # A minimal probe needs its 1s inner deadline plus start/load headroom. If less
+    # than that remains, skip the probe entirely (status-only; not a failure).
+    probe_min_backstop=$(( 1 + PROBE_BACKSTOP_HEADROOM ))
+    if [[ "${remaining_budget}" -lt "${probe_min_backstop}" ]]; then
+      run_probe=false
+      log "insufficient time budget for messagebox probe" \
+        "(elapsed=${elapsed_so_far}s remaining=${remaining_budget}s <" \
+        "min=${probe_min_backstop}s of Docker --timeout=${IOB_HC_DOCKER_TIMEOUT}s);" \
+        "skipping probe (status-only, not a messagebox failure)"
+    elif [[ "${probe_hard_timeout}" -gt "${remaining_budget}" ]]; then
+      # Shrink the backstop to fit the remaining budget, and derive the inner
+      # deadline from it (keep the start/load headroom, floor the inner at 1s).
+      probe_hard_timeout="${remaining_budget}"
+      probe_inner_timeout=$(( probe_hard_timeout - PROBE_BACKSTOP_HEADROOM ))
+      if [[ "${probe_inner_timeout}" -lt 1 ]]; then
+        probe_inner_timeout=1
+      fi
+      log "reduced messagebox probe budget to fit Docker --timeout" \
+        "(elapsed=${elapsed_so_far}s -> backstop=${probe_hard_timeout}s inner=${probe_inner_timeout}s)"
+    fi
+  fi
+
+  if [[ "${run_probe}" == "true" ]]; then
+    if probe_out="$(IOB_MESSAGEBOX_PROBE_TIMEOUT="${probe_inner_timeout}" \
+        timeout "${probe_hard_timeout}" \
+        node "${MESSAGEBOX_PROBE_MODULE}" 2>/dev/null)"; then
+      :
+    else
+      probe_rc=$?
+      log "messagebox probe process exited ${probe_rc} -> treating as inconclusive"
+    fi
+    # Extract the outcome token from the single `outcome=<value>` line.
+    probe_outcome="$(printf '%s\n' "${probe_out}" | sed -n 's/.*outcome=\([a-z]*\).*/\1/p' | head -n1)"
+    case "${probe_outcome}" in
+      ok)
+        messagebox_probed=true
+        messagebox_ok=true
+        ;;
+      failed)
+        messagebox_probed=true
+        messagebox_ok=false
+        ;;
+      *)
+        # inconclusive / empty / unexpected: do NOT treat as a messagebox failure.
+        messagebox_probed=false
+        ;;
+    esac
+    log "messagebox probe outcome=${probe_outcome:-<none>}" \
+      "(probed=${messagebox_probed} ok=${messagebox_ok})"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Ask the pure module for the state + exit code and act on it.
 #
 # We pass the resolved facts via environment variables (avoiding any shell
@@ -214,6 +419,8 @@ result="$(
   IOB_HC_RECONCILE_IN_PROGRESS="${reconcile_in_progress}" \
   IOB_HC_RECONCILE_HB_AGE="${reconcile_heartbeat_age_seconds}" \
   IOB_HC_RECONCILE_STALL="${RECONCILE_STALL_TOLERANCE}" \
+  IOB_HC_MESSAGEBOX_OK="${messagebox_ok}" \
+  IOB_HC_MESSAGEBOX_PROBED="${messagebox_probed}" \
   node --input-type=module -e "
     import { computeHealthState } from '${HEALTH_MODULE}';
     const num = (v) => Number(String(v ?? '').trim());
@@ -227,6 +434,8 @@ result="$(
       reconcileInProgress: process.env.IOB_HC_RECONCILE_IN_PROGRESS === 'true',
       reconcileHeartbeatAgeSeconds: num(process.env.IOB_HC_RECONCILE_HB_AGE),
       reconcileStallToleranceSeconds: num(process.env.IOB_HC_RECONCILE_STALL),
+      messageboxOk: process.env.IOB_HC_MESSAGEBOX_OK === 'true',
+      messageboxProbed: process.env.IOB_HC_MESSAGEBOX_PROBED === 'true',
     });
     // Emit '<state> <exitCode>' on a single line for the shell to consume.
     process.stdout.write(state + ' ' + exitCode);
@@ -248,6 +457,8 @@ log "state=${state} exit=${exit_code} (checkSucceeded=${check_succeeded}" \
   "upgradeInProgress=${upgrade_in_progress}" \
   "upgradeElapsed=${upgrade_elapsed_seconds}/${UPGRADE_TOLERANCE_WINDOW}" \
   "reconcileInProgress=${reconcile_in_progress}" \
-  "reconcileHeartbeatAge=${reconcile_heartbeat_age_seconds}/${RECONCILE_STALL_TOLERANCE})"
+  "reconcileHeartbeatAge=${reconcile_heartbeat_age_seconds}/${RECONCILE_STALL_TOLERANCE}" \
+  "messageboxProbed=${messagebox_probed}" \
+  "messageboxOk=${messagebox_ok})"
 
 exit "${exit_code}"
