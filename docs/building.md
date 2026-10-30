@@ -184,21 +184,19 @@ git tag 7.2.2.1 && git push origin 7.2.2.1
 
 On that signal, `release-promote.yml` (via `build/scripts/plan-release-tags.sh`):
 
-1. Takes the **latest 2 distinct** 3-component `<version>`s across **all** tags
-   (both `-dev-r<n>` and `-r<n>` reveal a version). Older versions stay frozen.
-2. For each, creates the next release revision and pushes it:
+1. Reduces the signal to its 3-component `<version>` (`7.2.2.1` -> `7.2.2`).
+2. Creates the next release revision of **that version only** and pushes it:
    - `<version>-r<highest+1>` if a `<version>-r<n>` release tag already exists;
-   - `<version>-r1` if only `<version>-dev-r<n>` tags exist (first release of
-     that version).
+   - `<version>-r1` otherwise (e.g. only `<version>-dev-r<n>` tags exist, i.e.
+     the first release of that version).
 
-Re-cutting the **previous** release too is intentional: image/script changes
-made during the new version's dev cycle then flow to the prior release as well.
+A release never touches other versions. Keeping the latest 2 versions current
+on a newer base image is the job of the base-refresh workflow (see below).
 
-> **Example.** You are testing `7.2.2` (tags up to `7.2.2-dev-r7`) and the
-> previous release is `7.1.3-r3`. Pushing `7.2.2` (or `7.2.2.1`) creates
-> **`7.2.2-r1`** (first release of 7.2.2) **and** **`7.1.3-r4`** (the prior
-> release picks up the shared changes). Each pushed release tag then triggers
-> `build-publish.yml`.
+> **Example.** You are testing `7.2.5` (tags up to `7.2.5-dev-r3`) and the
+> previous release is `7.2.2-r11`. Pushing `7.2.5` (or `7.2.5.1`) creates
+> **`7.2.5-r1`** only; `7.2.2` is left as is. The pushed release tag then
+> triggers `build-publish.yml`.
 
 The 4th numeric component in a `<version>.<build>` signal (e.g. the `.1` in
 `7.2.2.1`) is just a way to push a fresh signal tag when `7.2.2` already exists;
@@ -308,7 +306,8 @@ maintain.
 
 Both `release-promote.yml` and `base-refresh.yml` also support
 `workflow_dispatch` with a `dry_run` input to report what they _would_ tag
-without creating anything.
+without creating anything. A manual `release-promote.yml` run additionally
+requires a `version` input (e.g. `7.2.5`) naming the version to release.
 
 ## Configuration (environment overrides)
 

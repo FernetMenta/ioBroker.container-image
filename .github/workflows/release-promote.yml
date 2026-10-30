@@ -8,21 +8,21 @@
 #                            version (the 4th component is just a nudge and is
 #                            NOT part of the 3-component `<version>`).
 #
-# On such a signal this workflow decides which `<version>-r<n>` RELEASE tags to
-# create (via build/scripts/plan-release-tags.sh) and pushes them. Those pushes
-# trigger build-publish.yml, which does the actual multi-arch build + publish.
+# On such a signal this workflow decides which `<version>-r<n>` RELEASE tag to
+# create (via build/scripts/plan-release-tags.sh) and pushes it. That push
+# triggers build-publish.yml, which does the actual multi-arch build + publish.
 # This workflow only DECIDES and TAGS; it never builds or publishes images.
 #
-# What it creates (see the script + docs/building.md): the LATEST 2 distinct
-# 3-component js-controller versions across ALL tags (dev and release), each
+# What it creates (see the script + docs/building.md): a release affects ONLY
+# the version the signal refers to. The signal's 3-component `<version>` is
 # advanced to its next release revision:
 #   - `<version>-r<highest+1>` if a release tag already exists;
-#   - `<version>-r1` if only `<version>-dev-r<n>` tags exist.
-# Re-cutting the previous release too is intentional: image/script changes made
-# during the new version's dev cycle then flow to the prior release as well.
+#   - `<version>-r1` otherwise (e.g. only `<version>-dev-r<n>` tags exist).
+# Other versions are left untouched. Keeping the latest 2 versions current on a
+# newer base image is base-refresh.yml's job.
 #
-# Example: testing 7.2.2 up to 7.2.2-dev-r7 with prior release 7.1.3-r3; push
-# `7.2.2` (or `7.2.2.1`) -> creates `7.2.2-r1` AND `7.1.3-r4`.
+# Example: testing 7.2.5 up to 7.2.5-dev-r3 with prior release 7.2.2-r11; push
+# `7.2.5` (or `7.2.5.1`) -> creates `7.2.5-r1` only. 7.2.2 is not re-cut.
 #
 # TOKEN: like base-refresh.yml, the created tags are pushed with the RELEASE_PAT
 # secret so build-publish IS triggered (a tag pushed with the default
@@ -41,6 +41,10 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Version to release, e.g. 7.2.5 (or 7.2.5.2). Only this version gets a new release tag.'
+        type: string
+        required: true
       dry_run:
         description: 'Only report which release tags would be created; do not push.'
         type: boolean
@@ -51,7 +55,7 @@ permissions:
 
 jobs:
   promote:
-    name: Promote latest 2 versions to a new release revision
+    name: Promote the signalled version to a new release revision
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -69,26 +73,28 @@ jobs:
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           HAS_PAT: ${{ secrets.RELEASE_PAT != '' }}
-          SIGNAL_TAG: ${{ github.ref_name }}
+          # On a tag push the signal is the pushed tag; on a manual run it is
+          # the `version` input. Either way it names the ONE version to release.
+          SIGNAL: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
 
-          # The signal tag itself (7.2.2 / 7.2.2.1) is a lightweight marker; it
-          # is NOT a buildable image tag and plan-release-tags.sh ignores it
-          # (it only reads `<version>-r<n>` / `<version>-dev-r<n>` tags). Log it
-          # for traceability.
+          # The signal (7.2.5 / 7.2.5.2) is a lightweight marker, NOT a
+          # buildable image tag. plan-release-tags.sh reduces it to its
+          # 3-component `<version>` and plans the next `<version>-r<n>` for
+          # that version only.
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "Release signal tag pushed: '${SIGNAL_TAG}'."
+            echo "Release signal tag pushed: '${SIGNAL}'."
           else
-            echo "Manual release-promote run."
+            echo "Manual release-promote run for '${SIGNAL}'."
           fi
 
           mapfile -t all_tags < <(git tag --list)
-          mapfile -t planned < <(build/scripts/plan-release-tags.sh "${all_tags[@]}")
+          mapfile -t planned < <(build/scripts/plan-release-tags.sh "${SIGNAL}" "${all_tags[@]}")
 
           if [[ ${#planned[@]} -eq 0 ]]; then
-            echo "No versions to release (no '<version>-r<n>' or '<version>-dev-r<n>' tags found)."
-            exit 0
+            echo "::error title=No release planned::plan-release-tags.sh produced no tag for '${SIGNAL}'."
+            exit 1
           fi
 
           echo "Planned release tags: ${planned[*]}"

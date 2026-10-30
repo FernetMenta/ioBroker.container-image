@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/smoke/health-watchdog.sh`. See
   [environment-variables.md](docs/environment-variables.md) ("Container health").
 
+### Fixed
+
+- Pushing a release-signal tag (e.g. `7.2.5.2`) no longer also cuts a new
+  release revision for the previous version (e.g. `7.2.2-r<n>`). The
+  `release-promote` workflow now creates a release tag only for the version the
+  signal refers to. A manual `release-promote` run takes a required `version`
+  input. The scheduled base-refresh still maintains the latest 2 versions.
+
 ### Removed
 
 - The Dockerfile `HEALTHCHECK` instruction. `podman kube play` and Kubernetes
