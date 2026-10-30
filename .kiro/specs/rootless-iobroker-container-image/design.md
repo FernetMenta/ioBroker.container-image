@@ -9,7 +9,7 @@ The design is organized around four cooperating concerns:
 1. **Build-time** — a two-stage Dockerfile (`Build_Stage` → `Runtime_Image`), Node major version and Debian codename read from the maintainer-owned Build_Config (`package.json` `containerImage` key), native compilation of modules, a runtime-dependency verification gate, and file capabilities applied to the Node binary. Orchestrated by a GitHub Actions multi-arch pipeline that publishes all-or-nothing. (Req 1, 2, 5, 7)
 2. **Runtime user model** — a non-root `Container_User` (default UID/GID 1000), overridable UID/GID, and OpenShift-style arbitrary-UID support via GID 0 group membership and group-writable directories. (Req 3, 4)
 3. **Entrypoint + reconciliation** — an `Init_Process` as PID 1 (tini) with correct signal handling and zombie reaping, wrapping an entrypoint that validates configuration, applies npm settings and objects/states database-backend settings, reconciles the adapter set against the `Data_Volume`, and `exec`s js-controller. (Req 6, 8, 10, 11, 12, 13, 14)
-4. **Operational surface** — an upgrade-tolerant `Healthcheck_Mechanism` usable by both Docker `HEALTHCHECK` and Kubernetes probes, a reduced persistence layout, and preserved ioBroker installer behaviors. (Req 8, 9)
+4. **Operational surface** — an upgrade-tolerant `Healthcheck_Mechanism` enforced by a built-in health watchdog and invokable directly by orchestrator checks, a reduced persistence layout, and preserved ioBroker installer behaviors. (Req 8, 9)
 
 Where a design decision satisfies a specific acceptance criterion, the requirement number is referenced inline as **(Req N)** or **(Req N.M)**.
 
@@ -181,7 +181,7 @@ flowchart TD
 ### 1. Dockerfile (multi-stage build)
 
 - **Build_Stage** — `FROM node:${NODE_MAJOR}-${DEBIAN_CODENAME}`. Installs the build toolchain and `-dev` headers (Req 5.1), installs the ioBroker **js-controller only** under `/opt/iobroker` (no adapters are bundled — see "Bundled content policy" below), and compiles its native `node_modules`. Accepts `ARG NODE_MAJOR` supplied by CI. This stage is never shipped. (Req 2.2, 2.3)
-- **Runtime_Image** — `FROM node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim`. Installs runtime packages (Req 5.2), `COPY --from=Build_Stage /opt/iobroker /opt/iobroker`, applies **no** file capabilities to the Node binary (the earlier `setcap cap_net_bind_service,cap_net_raw+ep` is intentionally omitted because its effective bit makes the kernel refuse to `exec` node in a fully-rootless container, blocking startup) (Req 7.1), creates `Container_User` (uid/gid 1000) and configures GID 0 group ownership + `g+rwX` on writable dirs (Req 4.6), lays down `/.dockerenv` and `/run/.containerenv` (Req 6.2, 6.3), sets `USER 1000`, declares `VOLUME` mount points, `HEALTHCHECK`, and `ENTRYPOINT ["/usr/bin/tini","--","/entrypoint.sh"]`.
+- **Runtime_Image** — `FROM node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim`. Installs runtime packages (Req 5.2), `COPY --from=Build_Stage /opt/iobroker /opt/iobroker`, applies **no** file capabilities to the Node binary (the earlier `setcap cap_net_bind_service,cap_net_raw+ep` is intentionally omitted because its effective bit makes the kernel refuse to `exec` node in a fully-rootless container, blocking startup) (Req 7.1), creates `Container_User` (uid/gid 1000) and configures GID 0 group ownership + `g+rwX` on writable dirs (Req 4.6), lays down `/.dockerenv` and `/run/.containerenv` (Req 6.2, 6.3), sets `USER 1000`, declares `VOLUME` mount points and `ENTRYPOINT ["/usr/bin/tini","--","/entrypoint.sh"]`.
   - **Interface (build args):** `NODE_MAJOR` (integer, required); `DEBIAN_CODENAME` (Debian release, default `trixie`). Both are shared by the Build_Stage and Runtime_Image so the two stages always use the same base.
   - **Interface (labels):** OCI labels for source, version, and revision.
 
@@ -258,12 +258,12 @@ reconcile() {
 
 ### 6. Healthcheck_Mechanism (`healthcheck.sh`)
 
-A single script used by both Docker `HEALTHCHECK` and k8s probes. (Req 9.6, 9.7)
+A single script, run on a schedule by the built-in health watchdog (`scripts/health-watchdog.sh`) and invokable directly by orchestrator checks such as k8s probes when the watchdog is disabled. The image intentionally ships **no** Dockerfile `HEALTHCHECK` instruction (Req 9.6 was dropped: kube-play and Kubernetes ignore it, and under `docker run` it would duplicate the watchdog). (Req 9.6, 9.7)
 
 - Runs `iobroker status` (js-controller status command) with a 30s per-check timeout; success only on exit 0 within the timeout. (Req 9.1, 9.2)
 - Computes state from these inputs: check result; elapsed time since start vs `Startup_Grace_Period` (default 300s); when an upgrade is in progress, elapsed time within `Upgrade_Tolerance_Window` (default 600s); and, while first-boot/post-upgrade reconciliation is running, the age of a reconcile liveness heartbeat vs `Reconcile_Stall_Tolerance` (default 120s). These tolerance conditions are independent — being inside any one alone prevents an unhealthy report. (Req 9.3, 9.4, 9.8, 9.9, 9.11)
 - The pure module retains an independent `Upgrade_Tolerance_Window` (operator knob `IOB_UPGRADE_TOLERANCE_WINDOW`), but the script does NOT detect an in-progress upgrade: adapter/controller upgrades in this image are quick, so `upgradeInProgress` is always reported false and the window stays dormant unless a future component supplies the fact. The genuinely unbounded phase (reconciliation on a slow link / slow storage / many adapters) is instead covered by a liveness heartbeat: `scripts/reconcile.sh` writes an in-progress marker and advances a heartbeat around every step, and the script reports the heartbeat age. A reconcile is tolerated for ANY total duration while the heartbeat stays fresh; a stale heartbeat (older than `Reconcile_Stall_Tolerance`) is treated as stuck.
-- Exit codes: `0` healthy/starting (Docker treats non-zero as unhealthy, so starting maps to 0 within a tolerance condition), `1` unhealthy outside all tolerance conditions. (Req 9.5, 9.10)
+- Exit codes: `0` healthy/starting (the watchdog and orchestrator checks treat non-zero as unhealthy, so starting maps to 0 within a tolerance condition), `1` unhealthy outside all tolerance conditions. (Req 9.5, 9.10)
 
 State machine:
 
@@ -282,11 +282,11 @@ stateDiagram-v2
     Unhealthy --> Healthy: check ok
 ```
 
-Example Docker `HEALTHCHECK`:
+The image has no Dockerfile `HEALTHCHECK` (dropped intentionally, see Req 9.6). With the watchdog disabled (`IOB_HEALTHCHECK_WATCHDOG=false`), an operator can have Docker/Podman run the same script instead:
 
-```dockerfile
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-  CMD ["/usr/local/bin/healthcheck.sh"]
+```sh
+docker run --health-cmd /opt/scripts/healthcheck.sh --health-interval 30s \
+  --health-timeout 30s --health-retries 3 ...
 ```
 
 Example Kubernetes probes:

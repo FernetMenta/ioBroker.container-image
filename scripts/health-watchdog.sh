@@ -3,24 +3,22 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# The image ships a Docker-style HEALTHCHECK (Dockerfile) that runs
-# scripts/healthcheck.sh with --interval=30s --retries=3. Under `docker run` /
-# `podman run` the runtime schedules that HEALTHCHECK and reacts to it. But under
-# `podman kube play` (the operator's deployment) the runtime does NOT schedule
-# the image HEALTHCHECK: `podman inspect` reports `State.Health` as null and
-# `podman healthcheck run` errors "has no defined healthcheck". So healthcheck.sh
-# is never run on a schedule, the Dockerfile `--retries=3` budget is inert, and
-# nothing reacts to an unhealthy container.
+# The image has no Dockerfile HEALTHCHECK. Orchestrator healthchecks are not a
+# reliable way to enforce health for it: `podman kube play` and Kubernetes ignore
+# a Dockerfile HEALTHCHECK (`podman inspect` reports `State.Health` as null), and
+# under `docker run` / `podman run` it would only duplicate this watchdog. So the
+# image enforces its own health here; operators who prefer an orchestrator check
+# set IOB_HEALTHCHECK_WATCHDOG=false and run scripts/healthcheck.sh themselves.
 #
-# This watchdog closes that gap. It runs INSIDE the container, started in the
+# This watchdog is that built-in health enforcement. It runs INSIDE the container, started in the
 # background by scripts/entrypoint.sh just before it execs js-controller. Every
 # INTERVAL seconds it runs scripts/healthcheck.sh AS-IS and reads its EXIT CODE
 # (0 = healthy/starting, 1 = unhealthy; see lib/health-state.js). It keeps a
 # CONSECUTIVE-unhealthy counter (exit 1 increments, exit 0 resets) and, at
 # THRESHOLD consecutive unhealthy results, sends ONE SIGTERM to the controller so
 # the controller exits, the pod exits, and systemd's quadlet `Restart=always`
-# restarts the whole pod. The consecutive-count debounce is what replaces the now-
-# inert Dockerfile --retries=3.
+# restarts the whole pod. The consecutive-count debounce plays the role a
+# --retries setting would in an orchestrator healthcheck.
 #
 # It does NOT re-implement any health logic: it invokes healthcheck.sh and
 # branches on its exit code only. Because healthcheck.sh returns 0 ("starting")
@@ -81,8 +79,8 @@
 #   * The threshold triggers the SIGTERM->(grace)->SIGKILL escalation EXACTLY
 #     ONCE (via the pure module's `triggerRestart`/`alreadyTriggered` latch); the
 #     watchdog never re-enters the escalation on later cycles. The bounded
-#     escalation — not an unbounded retry — is what replaces the inert
-#     Dockerfile --retries=3: at most one SIGTERM and, only if that does not take
+#     escalation — not an unbounded retry — is what bounds the restart
+#     action: at most one SIGTERM and, only if that does not take
 #     effect within the grace, one SIGKILL.
 #   * The watchdog installs `trap 'running=0' TERM INT` so a signal delivered to
 #     it interrupts the loop promptly without sending a restart signal. On a

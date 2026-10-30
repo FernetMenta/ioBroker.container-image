@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# healthcheck.sh - upgrade-tolerant healthcheck usable by both Docker-style
-# HEALTHCHECK and Kubernetes liveness/readiness probes (design §6; Req 9).
+# healthcheck.sh - upgrade-tolerant healthcheck. Run on a schedule by the
+# built-in health watchdog (scripts/health-watchdog.sh); also usable directly by an
+# orchestrator (`--health-cmd`, compose `healthcheck:`, Kubernetes exec probes) when
+# the watchdog is disabled with IOB_HEALTHCHECK_WATCHDOG=false (design §6; Req 9).
 #
 # A single script (Req 9.6, 9.7) that:
 #   1. runs the Js_Controller status command (`iobroker status`) with a 30s
@@ -110,14 +112,14 @@ RECONCILE_STALL_TOLERANCE="${IOB_RECONCILE_STALL_TOLERANCE:-120}"
 
 # Wall-clock at script entry. Used to budget the messagebox probe against the
 # time ALREADY spent in this invocation (status command + fact gathering), so the
-# probe can never push the WHOLE healthcheck past Docker's single --timeout bound
-# (review finding #2: Docker applies one 30s limit to the entire script, not
-# separate limits to the status check and the probe).
+# probe can never push the WHOLE healthcheck past one 30s per-check bound (an
+# orchestrator timeout such as `--health-timeout 30s` or a probe's `timeoutSeconds:
+# 30` applies to the entire script, not separately to the status check and probe).
 HEALTHCHECK_START="$(date +%s)"
 
-# Docker's HEALTHCHECK --timeout for this image (Dockerfile). Kept in sync with the
-# Dockerfile directive; the probe budget below is derived from it so a slow status
-# command plus the probe never reach this outer bound. Overridable for tests.
+# Whole-check budget in seconds (the documented orchestrator timeout of 30s). The
+# probe budget below is derived from it so a slow status command plus the probe
+# never reach this outer bound. Overridable for tests.
 IOB_HC_DOCKER_TIMEOUT="${IOB_HC_DOCKER_TIMEOUT:-30}"
 # Safety margin (seconds) reserved below the Docker timeout for the final decision
 # node call and process teardown, so the probe's own hard stop lands comfortably
@@ -299,7 +301,7 @@ if [[ "${IOB_MESSAGEBOX_PROBE}" == "true" ]] \
   # full timeout). A backstop timeout/error yields no parseable outcome below and is
   # treated as inconclusive (not a messagebox failure).
   #
-  # WHOLE-HEALTHCHECK BUDGET (review finding #2): Docker applies ONE --timeout
+  # WHOLE-HEALTHCHECK BUDGET: an orchestrator applies ONE timeout
   # (IOB_HC_DOCKER_TIMEOUT, default 30s) to the ENTIRE script — the status command
   # (up to IOB_CHECK_TIMEOUT) AND the probe together, not to each separately. If the
   # status command and fact gathering already consumed much of that budget, a probe

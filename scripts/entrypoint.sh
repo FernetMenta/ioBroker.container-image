@@ -844,12 +844,9 @@ fi
 
 # Start the in-container HEALTH WATCHDOG in the BACKGROUND, just before the exec.
 #
-# WHY: the image ships a Docker-style HEALTHCHECK, but under `podman kube play`
-# (the operator's deployment) the runtime does NOT schedule it — `podman inspect`
-# reports State.Health as null and `podman healthcheck run` errors "has no defined
-# healthcheck". So healthcheck.sh is never run on a schedule, the Dockerfile
-# --retries=3 budget is inert, and nothing reacts to an unhealthy container. The
-# watchdog runs healthcheck.sh itself every IOB_WATCHDOG_INTERVAL seconds and, after
+# WHY: the image has no Dockerfile HEALTHCHECK (`podman kube play` and Kubernetes
+# ignore one, and under `docker run` it would only duplicate this), so the image
+# enforces its own health. The watchdog runs healthcheck.sh itself every IOB_WATCHDOG_INTERVAL seconds and, after
 # IOB_WATCHDOG_THRESHOLD consecutive unhealthy results, SIGTERMs the controller so
 # it exits; the pod then exits and systemd's quadlet Restart=always restarts it.
 #

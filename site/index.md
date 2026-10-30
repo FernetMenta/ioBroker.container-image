@@ -50,9 +50,12 @@ js-controller-Version; sie dient hier als Beispiel für das aktuelle Release.)
   den installierten Adapter-Code entsprechend ab, initialisiert ein frisches
   Daten-Volume beim ersten Lauf und richtet den Admin-Adapter ein, sodass ein
   neuer Container mit funktionierender Setup-Oberfläche hochfährt.
-- **Upgrade-tolerante Healthcheck-Prüfung.** Ein Docker-/Podman-`HEALTHCHECK`
-  (auch als Kubernetes-Liveness-/Readiness-Probe nutzbar) mit konfigurierbarer
-  Start-Toleranz und Upgrade-Toleranzfenstern.
+- **Eingebauter Health-Watchdog.** Das Image prüft seine Gesundheit selbst
+  (js-controller-Status plus Messagebox-Round-Trip, mit Start-, Upgrade- und
+  Reconcile-Toleranz) und startet den Container bei anhaltendem Fehler neu. Das
+  funktioniert gleich unter Docker, Podman, `podman kube play` und Kubernetes und
+  lässt sich mit `IOB_HEALTHCHECK_WATCHDOG=false` abschalten, wenn der
+  Orchestrator `/opt/scripts/healthcheck.sh` selbst ausführen soll.
 - **tini als PID 1.** Korrekte Signalweiterleitung und Zombie-Reaping.
 
 ---

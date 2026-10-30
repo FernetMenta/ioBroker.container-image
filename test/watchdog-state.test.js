@@ -5,7 +5,7 @@
 // counting/debounce cases that the property test covers only in aggregate, so a
 // regression names the exact broken case: the consecutive-unhealthy count, the
 // reset-on-healthy behaviour, the fire-exactly-at-threshold trigger, and the
-// fire-once latch that replaces the inert Dockerfile --retries budget.
+// fire-once latch that plays the role of an orchestrator --retries setting.
 
 import { describe, it, expect } from 'vitest';
 import { evaluateWatchdog, WatchdogExitCode } from '../lib/watchdog-state.js';

@@ -30,9 +30,12 @@ source repository, `ioBroker.container-image`).
   adapter code to match, initializes a fresh Data_Volume on first run, and
   bootstraps the admin adapter so a new container comes up with a working setup
   UI.
-- **Upgrade-tolerant healthcheck.** A Docker/Podman `HEALTHCHECK` (also usable
-  as Kubernetes liveness/readiness probes) with configurable startup grace and
-  upgrade tolerance windows.
+- **Built-in health watchdog.** The image checks its own health (js-controller
+  status plus a messagebox round-trip probe, with startup, upgrade, and reconcile
+  tolerance) and restarts the container on sustained failure. It works the same
+  under Docker, Podman, `podman kube play`, and Kubernetes, and can be disabled
+  with `IOB_HEALTHCHECK_WATCHDOG=false` if you would rather have the orchestrator
+  run `/opt/scripts/healthcheck.sh`.
 - **tini as PID 1.** Proper signal forwarding and zombie reaping.
 
 ## Quick start
@@ -48,7 +51,7 @@ available on port 8081.
 >   `--user $(id -u):$(id -g)`. Otherwise the process — and every file it writes
 >   to your mounts — is owned by real host root.
 > - **Rootless Podman**: everything already runs inside your user namespace, so
->   nothing here is host root. The container's uid 0 maps to *your* host user,
+>   nothing here is host root. The container's uid 0 maps to _your_ host user,
 >   while the image default (uid 1000) maps to a subordinate uid that is not
 >   you. So do **not** pass `--user $(id -u):$(id -g)` (that number lands on a
 >   subuid you don't own and breaks mount ownership). Use named volumes with the

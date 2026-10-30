@@ -3,7 +3,7 @@
 This document describes the persistence layout of the rootless ioBroker
 container image, how data survives restarts and image upgrades, how the startup
 reconciliation behaves, how to run a multihost cluster (networked jsonl or Redis), and how
-to wire the container's healthcheck into Kubernetes liveness/readiness probes.
+to use the container's healthcheck with Kubernetes liveness/readiness probes.
 
 It covers the persistence acceptance criteria of Requirement 8
 (Req 8.2, 8.3, 8.4), the Kubernetes-probe criterion of Requirement 9
@@ -25,10 +25,10 @@ The image persists only the folders that hold configuration, state, logs, and
 (optionally) installed adapter code — you never need to bind-mount the whole
 `/opt/iobroker` installation. Three mount points are declared as volumes:
 
-| Mount point                   | Name           | Required    | What it holds                                                                                                       |
-| ----------------------------- | -------------- | ----------- | ------------------------------------------------------------------------------------------------------------------- |
-| `/opt/iobroker/iobroker-data` | Data_Volume    | Recommended | ioBroker configuration + state. **Source of truth** for the set of installed adapters and their versions. (Req 8.2) |
-| `/opt/iobroker/log`           | Log_Volume     | Recommended | ioBroker logs. (Req 8.3)                                                                                            |
+| Mount point                   | Name           | Required    | What it holds                                                                                                                                                   |
+| ----------------------------- | -------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/opt/iobroker/iobroker-data` | Data_Volume    | Recommended | ioBroker configuration + state. **Source of truth** for the set of installed adapters and their versions. (Req 8.2)                                             |
+| `/opt/iobroker/log`           | Log_Volume     | Recommended | ioBroker logs. (Req 8.3)                                                                                                                                        |
 | `/opt/iobroker/node_modules`  | Modules_Volume | Optional    | Installed adapter code, persisted across container upgrades. Persisting it also speeds up recreates when js-controller is unchanged (see note below). (Req 8.4) |
 
 Key point: the **Data_Volume is authoritative**. It records which adapters (and
@@ -46,7 +46,7 @@ js-controller releases are relatively infrequent, but you may want to pull a new
 base image — and recreate the container against the same volumes. In that case
 the js-controller version is unchanged, so a persisted Modules_Volume lets the
 container reuse the already-installed code instead of reinstalling it on every
-image refresh. When js-controller (or the Node.js major) *does* change, see
+image refresh. When js-controller (or the Node.js major) _does_ change, see
 [Node.js major upgrades and the Modules_Volume](#nodejs-major-upgrades-and-the-modules_volume)
 and the [upgrade guide](upgrading.md) for the one extra step involved.
 
@@ -517,17 +517,29 @@ For a Redis-backed cluster, set the `*_TYPE` values to `redis` and point the
 
 ## Kubernetes liveness / readiness probes (Req 9.7)
 
-The image ships a single upgrade-tolerant healthcheck script at
-`/opt/scripts/healthcheck.sh`. The same script backs the Docker-style
-`HEALTHCHECK` and is invokable directly by Kubernetes probes as an `exec`
-command. The script owns the per-check 30-second timeout and the
-startup-grace / upgrade-tolerance logic, so probe restarts are not triggered by
-expected controller or adapter upgrade restarts.
+The image checks its own health by default: a built-in watchdog runs
+`/opt/scripts/healthcheck.sh` every 30s and restarts the container after three
+consecutive unhealthy results (see
+[Container health](./environment-variables.md#container-health)). The image has
+no Dockerfile `HEALTHCHECK`. Under `podman kube play` keep the built-in watchdog:
+kube-play does not reliably act on probes, and a `restartPolicy` other than
+`Never` fights systemd's control of the pod.
+
+On a real Kubernetes cluster you can let the kubelet do the checking instead.
+Disable the watchdog with `IOB_HEALTHCHECK_WATCHDOG=false` and run the same
+script as an `exec` probe. The script owns the per-check 30-second timeout and
+the startup-grace / upgrade-tolerance logic, so probe restarts are not triggered
+by expected controller or adapter upgrade restarts. A liveness failure only
+restarts the container if the pod's `restartPolicy` allows it (`Always` or
+`OnFailure`).
 
 ```yaml
 containers:
   - name: iobroker
     image: ghcr.io/fernetmenta/iobroker
+    env:
+      - name: IOB_HEALTHCHECK_WATCHDOG
+        value: 'false'
     livenessProbe:
       exec:
         command: ['/opt/scripts/healthcheck.sh']
@@ -543,8 +555,7 @@ containers:
 
 Notes:
 
-- The `exec` form matches the Docker-style `HEALTHCHECK` in the image, which
-  runs `CMD ["/opt/scripts/healthcheck.sh"]`.
+- Do not combine the probes with the built-in watchdog; disable one of them.
 - Tune the tolerance windows with `IOB_STARTUP_GRACE_PERIOD` (default `300`
   seconds) and `IOB_UPGRADE_TOLERANCE_WINDOW` (default `600` seconds). While the
   runtime is inside either window, the healthcheck does not report unhealthy, so

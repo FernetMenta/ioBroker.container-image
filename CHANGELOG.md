@@ -41,16 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   volume); healthy cycles are not logged, so the file stays empty apart from a
   startup `started` note until something goes wrong and survives the restart it
   records. All watchdog output also goes to stderr/journald.
-  Disable it entirely with `IOB_HEALTHCHECK_WATCHDOG=false` (default enabled);
-  under plain `docker run` / `podman run`, where the runtime schedules the
-  `HEALTHCHECK` itself, the watchdog is redundant. The pure consecutive-count/
+  Disable it entirely with `IOB_HEALTHCHECK_WATCHDOG=false` (default enabled),
+  for example to let the orchestrator run `/opt/scripts/healthcheck.sh` instead.
+  The pure consecutive-count/
   debounce logic lives in `lib/watchdog-state.js` and is covered by
   `test/watchdog-state.test.js` and `test/watchdog-state.property.test.js`; the
   shell wiring (loop, single SIGTERM, reset, knob fallback) is covered by
-  `test/smoke/health-watchdog.sh`. The Dockerfile `HEALTHCHECK` directive is
-  unchanged (a comment documents the kube-play rationale). See
-  [environment-variables.md](docs/environment-variables.md) ("kube-play health
-  watchdog").
+  `test/smoke/health-watchdog.sh`. See
+  [environment-variables.md](docs/environment-variables.md) ("Container health").
+
+### Removed
+
+- The Dockerfile `HEALTHCHECK` instruction. `podman kube play` and Kubernetes
+  ignore it, and under `docker run` / `podman run` it would run the healthcheck a
+  second time alongside the built-in watchdog. The image now enforces its own
+  health through the watchdog (enabled by default). To have the orchestrator do
+  the health checking instead, set `IOB_HEALTHCHECK_WATCHDOG=false` and point
+  `--health-cmd`, a compose `healthcheck:`, or a Kubernetes `exec` probe at
+  `/opt/scripts/healthcheck.sh`.
 
 ## [7.2.2.4] 07.10.2026
 

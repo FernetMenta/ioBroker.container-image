@@ -381,11 +381,10 @@ glue those module tests cannot reach.
 
 ### Why the watchdog exists
 
-Under `podman kube play` the runtime does **not** schedule the image
-`HEALTHCHECK` (`podman inspect` shows `State.Health` as null and
-`podman healthcheck run` errors "has no defined healthcheck"), so the Dockerfile
-`--retries=3` budget is inert and nothing reacts to an unhealthy container. The
-watchdog, started in the background by the entrypoint, runs `healthcheck.sh`
+The image has no Dockerfile `HEALTHCHECK`: `podman kube play` and Kubernetes
+ignore one (`podman inspect` shows `State.Health` as null), and under
+`docker run` it would only duplicate the watchdog. So the image enforces its own
+health. The watchdog, started in the background by the entrypoint, runs `healthcheck.sh`
 itself every `IOB_WATCHDOG_INTERVAL` seconds and, after `IOB_WATCHDOG_THRESHOLD`
 consecutive unhealthy results, SIGTERMs the controller so the pod exits and
 systemd (`Restart=always`) restarts it.

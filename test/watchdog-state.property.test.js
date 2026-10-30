@@ -7,7 +7,7 @@
 //
 //   Property 1 (fire once): `triggerRestart` is true on AT MOST one step of any
 //     sequence — the watchdog sends a single SIGTERM and then latches, which is
-//     what replaces the inert Dockerfile --retries budget (no signal spam).
+//     what plays the role of an orchestrator --retries setting (no signal spam).
 //
 //   Property 2 (fire correctly): the step where it fires (if any) is exactly the
 //     first step at which the running count of consecutive unhealthy (exit 1)
