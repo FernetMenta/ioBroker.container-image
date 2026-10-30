@@ -16,6 +16,11 @@ lang: de-DE
 # Clean, built-in GitHub Pages theme. No extra plugins required.
 theme: minima
 
+# Search-engine site verification. Rendered into <head> by jekyll-seo-tag
+# (used by minima) as <meta name="google-site-verification" ...>.
+webmaster_verifications:
+  google: U03KjhqBJW9OhBwC5wU90jCOjbBJKmdYi5BaZLUOdcM
+
 # Only the site/ folder is the Jekyll source; nothing else in the repo is.
 # (The workflow runs the build with this folder as the source.)
 exclude:
