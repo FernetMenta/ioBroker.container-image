@@ -18,4 +18,5 @@ Available now:
 - [Restoring a backup](restore-backup.md) - restore an ioBroker backup at container startup by staging a single backup file in a `restore/` folder, including restoring onto a fresh container/host.
 - [Building the image locally](building.md) - the local build path that mirrors CI (task 16.2).
 - [Volumes, persistence, and multihost](volumes-and-multihost.md) - persistence layout (Data/Log/Modules volumes), reconciliation behavior, Docker/Podman/k8s mount examples, multihost/database-backend usage, and Kubernetes liveness/readiness probe examples (task 17.3).
+- [Networking: multicast, broadcast, and discovery](networking.md) - why mDNS/SSDP/UDP-discovery adapters need the host network or a macvlan, with setup, limitations, and troubleshooting.
 - [Example Compose files](examples/) - runnable [`docker-compose-master.yml`](examples/docker-compose-master.yml) and [`docker-compose-slave.yml`](examples/docker-compose-slave.yml) demonstrating the volume, networking, and multihost setups described in the docs.

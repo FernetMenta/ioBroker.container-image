@@ -30,6 +30,9 @@
 #     `parent` to your host's real interface (here eth0) and align the
 #     subnet/gateway/ip_range with your LAN. macvlan is what makes the static
 #     ipv4_address behave like a real device on the network.
+#   macvlan also lets multicast/broadcast discovery (mDNS, SSDP, UDP) reach the
+#   container. It needs rootful Docker/Podman. See docs/networking.md for the
+#   full explanation, the host-network alternative, and macvlan limitations.
 #
 # Start (from this folder):
 #   docker compose up            # add -d to detach

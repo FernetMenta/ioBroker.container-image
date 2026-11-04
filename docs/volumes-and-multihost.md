@@ -580,3 +580,5 @@ Notes:
   variables including the objects/states database backends and healthcheck tuning.
 - [Rootless capabilities and limitations](./rootless-capabilities.md) — port
   binding, `NET_ADMIN`, and which functions need runtime-granted capabilities.
+- [Networking](./networking.md) — host network and macvlan for multicast /
+  broadcast discovery, and how multihost slaves reach the master.

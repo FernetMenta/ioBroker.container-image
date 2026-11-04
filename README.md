@@ -207,6 +207,16 @@ See [docs/volumes-and-multihost.md](docs/volumes-and-multihost.md) for
 persistence behavior, startup reconciliation, multihost clusters (networked
 jsonl or Redis), and Kubernetes probe examples.
 
+## Networking
+
+Many adapters discover devices via multicast or broadcast (mDNS, SSDP/UPnP, UDP
+discovery). These packets do not cross the default container bridge network, so
+for such adapters run the container on the **host network** or on a **macvlan**
+network. Plain unicast access to devices with a known IP works on the default
+network. See [docs/networking.md](docs/networking.md) for both setups and
+[`docs/examples/docker-compose-master.yml`](docs/examples/docker-compose-master.yml)
+for a macvlan example.
+
 ## Upgrading
 
 You upgrade js-controller and the whole runtime by pulling a newer image and
@@ -250,6 +260,9 @@ environment variable reference.
 - [Volumes, persistence, and multihost](docs/volumes-and-multihost.md) —
   persistence layout, reconciliation, multihost/database backends, Kubernetes
   probes.
+- [Networking: multicast, broadcast, and discovery](docs/networking.md) — run
+  on the host network or a macvlan so adapters using mDNS, SSDP, or UDP
+  discovery can find devices (includes a macvlan Compose example).
 - [Building the image locally](docs/building.md) — the local build path that
   mirrors CI.
 - [Changelog](CHANGELOG.md) — notable changes per release.

@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ## [WORK IN PROGRESS]
 -->
 
+## [WORK IN PROGRESS]
+
+### Added
+
+- New networking guide, `docs/networking.md`. It explains why adapters that use
+  multicast or broadcast discovery (mDNS, SSDP/UPnP, UDP discovery) need the
+  container on the host network or a macvlan network, with setup instructions,
+  macvlan limitations, multihost notes, and troubleshooting. It is linked from
+  the README and the other docs, and `docs/examples/docker-compose-master.yml`
+  now serves as the macvlan example.
+
 ## [7.2.5.3] 30.10.2026
 
 ### Added
