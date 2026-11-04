@@ -60,6 +60,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 RECONCILE_MODULE="${REPO_ROOT}/lib/reconcile-plan.js"
+PREFLIGHT_MODULE="${REPO_ROOT}/lib/native-preflight.js"
+# Set to "false" to skip the native-module preflight (see below the plan loop).
+IOB_NATIVE_PREFLIGHT="${IOB_NATIVE_PREFLIGHT:-true}"
 
 IOB_ROOT="${IOB_ROOT:-/opt/iobroker}"
 IOB_DATA_DIR="${IOB_DATA_DIR:-${IOB_ROOT}/iobroker-data}"
@@ -1016,6 +1019,78 @@ if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
   summary_add_observation "desiredAdapters=$(printf '%s' "${desired_list}" | grep -c . || true)"
   summary_add_observation "installedAdapters=$(printf '%s' "${installed_list}" | grep -c . || true)"
   summary_add_observation "nativeModules=$(printf '%s' "${native_list}" | grep -c . || true)"
+fi
+
+# -- Native-module PREFLIGHT ---------------------------------------------------
+#
+# Runs on EVERY install/all pass (not only on an ABI-marker mismatch), BEFORE any
+# repair or install step, so a fatal result leaves the volume untouched and the
+# operator can still roll back to the previous image. It dlopen()s every host-compatible .node binary under
+# node_modules in a throwaway process and reports packages none of whose
+# binaries load under the running Node (typically an adapter's own native
+# dependency left at the old ABI after a Node-major upgrade; the toolchain-free
+# image cannot rebuild those). Each broken package is attributed to the adapters
+# that depend on it (modules the image seed will overlay are skipped: repairable)
+# and judged by IOB_ADAPTER_INSTALL_FAILURE_POLICY, like a
+# failed install:
+#   * tolerated -> loud WARNING, startup continues
+#   * fatal     -> block_unhealthy (no js-controller, healthcheck unhealthy)
+# STICKY: because it re-runs every start and ignores the ABI marker (which is
+# advanced once the image-shipped modules load), the warning/block repeats until
+# the module actually loads. Disable with IOB_NATIVE_PREFLIGHT=false.
+if [[ "${IOB_RECONCILE_PHASE}" != "init" ]]; then
+  if [[ "${IOB_NATIVE_PREFLIGHT}" == "false" ]]; then
+    log "native preflight: disabled via IOB_NATIVE_PREFLIGHT=false; skipping"
+  elif [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
+    log "native preflight: [dry-run] would probe native modules under ${IOB_NODE_MODULES_DIR}"
+  elif [[ -d "${IOB_NODE_MODULES_DIR}" ]]; then
+    heartbeat
+    log "native preflight: probing native modules under ${IOB_NODE_MODULES_DIR}"
+    pf_rc=0
+    pf_out="$(
+      IOB_P_POLICY="${IOB_ADAPTER_INSTALL_FAILURE_POLICY}" \
+      IOB_P_ENABLED="${enabled_instance_list}" \
+      IOB_P_ENABLED_OK="${ENABLED_INSTANCE_QUERY_OK}" \
+      IOB_P_SKIP="$(seed_native_modules)" \
+      node "${PREFLIGHT_MODULE}" "${IOB_NODE_MODULES_DIR}" 2>/dev/null
+    )" || pf_rc=$?
+    heartbeat
+    if [[ "${pf_rc}" -ne 0 ]]; then
+      log "native preflight: WARNING probe itself failed (exit ${pf_rc}); skipping"
+      summary_add_action "native-preflight: WARN probe failed (exit ${pf_rc})"
+    else
+      pf_fatal=()
+      pf_tolerated=()
+      while IFS=$'\t' read -r pf_kind pf_pkg pf_owners pf_err; do
+        [[ -n "${pf_kind}" ]] || continue
+        pf_desc="${pf_pkg} (used by: ${pf_owners}) - ${pf_err}"
+        if [[ "${pf_kind}" == "fatal" ]]; then
+          pf_fatal+=("${pf_desc}")
+        else
+          pf_tolerated+=("${pf_desc}")
+        fi
+      done <<<"${pf_out}"
+
+      if [[ ${#pf_fatal[@]} -eq 0 && ${#pf_tolerated[@]} -eq 0 ]]; then
+        log "native preflight: all native modules load under the running Node"
+        summary_add_action "native-preflight: ok"
+      else
+        for d in "${pf_tolerated[@]}"; do
+          log "WARNING: native preflight: cannot load native module: ${d}"
+          summary_add_action "native-preflight: WARN unloadable ${d}"
+        done
+        if [[ ${#pf_tolerated[@]} -gt 0 ]]; then
+          log "WARNING: native preflight: the affected adapters will fail to start. The image has no build toolchain; wait for an adapter update with a prebuilt binary for this Node, or use an image with the previous Node major. This warning repeats on every start until the modules load."
+        fi
+        if [[ ${#pf_fatal[@]} -gt 0 ]]; then
+          for d in "${pf_fatal[@]}"; do
+            summary_add_action "native-preflight: FATAL unloadable ${d}"
+          done
+          block_unhealthy "native modules cannot be loaded under the running Node and policy '${IOB_ADAPTER_INSTALL_FAILURE_POLICY}' does not tolerate it: $(printf '%s; ' "${pf_fatal[@]}")"
+        fi
+      fi
+    fi
+  fi
 fi
 
 # -- Ask the pure planner for the ordered actions -----------------------------

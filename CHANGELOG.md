@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native-module preflight in startup reconciliation. Every start now verifies that
+  native `.node` binaries load under the running Node (the image cannot rebuild
+  adapter-owned natives after a Node-major upgrade), attributes failures to the
+  depending adapters, and applies `IOB_ADAPTER_INSTALL_FAILURE_POLICY` (warn or
+  block unhealthy). The warning repeats until fixed. Opt out with
+  `IOB_NATIVE_PREFLIGHT=false`. See `docs/environment-variables.md`.
 - New networking guide, `docs/networking.md`. It explains why adapters that use
   multicast or broadcast discovery (mDNS, SSDP/UPnP, UDP discovery) need the
   container on the host network or a macvlan network, with setup instructions,

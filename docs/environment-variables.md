@@ -187,6 +187,36 @@ the startup grace window). Signals still work
 cleanly. To recover, fix the adapter source (or remove the offending
 adapter/instance) — or relax the policy — and recreate the container.
 
+### Native-module preflight
+
+The runtime image has no compiler. After a Node-major upgrade it repairs only the
+native modules it ships itself (js-controller's `diskusage` and `unix-dgram`). An
+adapter's **own** native dependency (e.g. `serialport`) keeps its old-ABI binary
+if the adapter publishes no prebuilt binary for the new Node, and the adapter
+then fails with `NODE_MODULE_VERSION` / `ERR_DLOPEN_FAILED`.
+
+On every start, before any repair or install step (so a fatal result leaves the volume untouched and you can roll back to the previous image), reconciliation therefore loads each
+host-compatible `.node` binary under `node_modules` in a throwaway process and
+reports packages that cannot be loaded, naming the adapters that depend on them.
+Each one is judged by `IOB_ADAPTER_INSTALL_FAILURE_POLICY`, just like a failed
+install:
+
+| Policy                 | Unloadable native module                                                                                                                        |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strict`               | Fatal.                                                                                                                                          |
+| `tolerate-no-instance` | Fatal if an adapter using it has an enabled instance on this host (or the instance state is unknown), or if it belongs to js-controller itself. |
+| `tolerate-all`         | Warning only.                                                                                                                                   |
+
+"Fatal" means the same as above: the container is held **unhealthy** and
+js-controller is not started (it does not exit). Tolerated cases log a `WARNING`
+and start normally; the affected adapter instances will fail until fixed.
+
+The check is **sticky**: it does not depend on the ABI marker, so the warning (or
+block) repeats on every start, and is recorded in the `reconcile.log` summary,
+until the module loads. Fix it by updating the adapter to a version with a
+prebuilt binary for the running Node, or by using an image with the previous Node
+major. Set `IOB_NATIVE_PREFLIGHT=false` to skip the check.
+
 ### Notes on UID/GID
 
 - The runtime user and group are selected **exclusively by the container
