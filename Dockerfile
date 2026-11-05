@@ -535,6 +535,17 @@ RUN set -eux; \
 # run) can override with `-e IOB_NO_SETCAP=false`. (Req 7.1)
 ENV IOB_NO_SETCAP=true
 
+# Documentation URL surfaced to the user by admin. On this image, admin shows
+# the manual upgrade instructions instead of an in-UI js-controller "upgrade"
+# button (see docs/upgrading.md -> "Why there is no in-admin js-controller
+# upgrade button"). admin reads IOB_CONTAINER_DOCS_URL from the container
+# environment and renders it as the link in those upgrading hints, so the hint
+# always points at this image's own docs. Baked in as a default here so it is
+# present out of the box; operators can override it with `-e
+# IOB_CONTAINER_DOCS_URL=...` (e.g. to pin a tag or mirror the docs). Keep it in
+# sync with lib/defaults.js (DEFAULT_TABLE) and docs/environment-variables.md.
+ENV IOB_CONTAINER_DOCS_URL=https://github.com/FernetMenta/ioBroker.container-image/blob/main/docs/upgrading.md
+
 # Container-environment indicators. The ioBroker installer / runtime detects a
 # container via these entries. `/proc/self/cgroup` (Req 6.1) is inherent to any
 # container runtime and needs no action here. `/.dockerenv` (Req 6.2) and

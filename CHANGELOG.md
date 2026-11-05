@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `IOB_CONTAINER_DOCS_URL` environment variable (default
+  `https://github.com/FernetMenta/ioBroker.container-image/blob/main/docs/upgrading.md`),
+  baked into the image and resolved by the defaults layer. admin reads it to
+  render the documentation link in its upgrading hints — this image has no in-UI
+  js-controller upgrade button, so the hint points at the image's own upgrade
+  docs. Override it to pin a tag or point at a mirror. See
+  `docs/environment-variables.md`.
 - Native-module preflight in startup reconciliation. Every start now verifies that
   native `.node` binaries load under the running Node (the image cannot rebuild
   adapter-owned natives after a Node-major upgrade), attributes failures to the
@@ -26,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macvlan limitations, multihost notes, and troubleshooting. It is linked from
   the README and the other docs, and `docs/examples/docker-compose-master.yml`
   now serves as the macvlan example.
+
+### Changed
+
+- `docs/upgrading.md`: the optional `node_modules` volume is a named volume, not
+  a bind mount, so the upgrade instructions now tell you to delete and recreate
+  it with `docker volume rm node_modules` (recreated empty on next start) instead
+  of emptying a host directory.
 
 ## [7.2.5.3] 30.10.2026
 
