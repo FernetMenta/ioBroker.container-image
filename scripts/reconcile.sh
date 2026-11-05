@@ -61,6 +61,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 RECONCILE_MODULE="${REPO_ROOT}/lib/reconcile-plan.js"
 PREFLIGHT_MODULE="${REPO_ROOT}/lib/native-preflight.js"
+ADAPTER_COMPAT_MODULE="${REPO_ROOT}/lib/adapter-compat.js"
 # Set to "false" to skip the native-module preflight (see below the plan loop).
 IOB_NATIVE_PREFLIGHT="${IOB_NATIVE_PREFLIGHT:-true}"
 
@@ -1132,6 +1133,189 @@ plan="$(
   "
 )"
 
+# -- Fresh-install admin / js-controller compatibility --------------------------
+#
+# On a FRESH container the desired set is seeded with `admin` (see the
+# fresh_install block above) and the install-missing step would run
+# `iobroker install admin`, installing the newest STABLE admin from the active
+# repo. The js-controller is baked into the image at a FIXED version. A newer
+# stable admin can require a newer controller than the image ships (the real
+# case: admin 8.3.5 requires js-controller >=7.2.5 while the image ships 7.2.2),
+# so the unpinned install lands an admin incompatible with the controller.
+#
+# These helpers resolve the NEWEST admin version COMPATIBLE with the installed
+# controller and return the exact version to install, or signal that none is
+# compatible (a FATAL condition -> block_unhealthy). This is applied ONLY to the
+# fresh-install admin bootstrap; every other adapter install is unchanged.
+#
+# The pure decision logic (semver range satisfaction, newest-first ordering)
+# lives in lib/adapter-compat.js; the shell here does only the side effects:
+# read the controller version, enumerate candidate admin versions, fetch each
+# version's io-package.json controller requirement (GitHub raw by tag, npm
+# tarball as a documented fallback), and stop at the first compatible version.
+
+# installed_jscontroller_version: the js-controller version baked into the image,
+# read from node_modules/iobroker.js-controller/package.json (.version). Honors
+# the IOB_NODE_MODULES_DIR override like the rest of reconcile. Prints the
+# version string, or nothing if it cannot be determined.
+installed_jscontroller_version() {
+  local pj="${IOB_NODE_MODULES_DIR}/iobroker.js-controller/package.json"
+  [[ -r "${pj}" ]] || return 0
+  IOB_JSC_PJ="${pj}" node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    try {
+      const o = JSON.parse(readFileSync(process.env.IOB_JSC_PJ, "utf8"));
+      process.stdout.write(typeof o.version === "string" ? o.version : "");
+    } catch { process.stdout.write(""); }
+  ' 2>/dev/null || true
+}
+
+# IOB_ADMIN_COMPAT_PROBE_MAX bounds how many admin versions we probe newest->
+# oldest before giving up (a safety net so a pathological repo cannot make us
+# fetch hundreds of io-package.json files). The compatible version is normally
+# found within the first couple of candidates.
+IOB_ADMIN_COMPAT_PROBE_MAX="${IOB_ADMIN_COMPAT_PROBE_MAX:-40}"
+# GitHub org/repo for the admin adapter; overridable for testing/mirrors.
+IOB_ADMIN_GITHUB_REPO="${IOB_ADMIN_GITHUB_REPO:-ioBroker/ioBroker.admin}"
+
+# admin_controller_range_for_version <version>: print the js-controller RANGE
+# that admin <version> requires, by reading that version's io-package.json
+# `common.dependencies`. PREFERRED source is the GitHub raw io-package.json by
+# tag (a few KB); the ~24MB npm tarball is only a documented FALLBACK when the
+# GitHub fetch fails or the tag is absent. Prints the range (may be empty for a
+# version with no js-controller requirement). Returns non-zero only when NEITHER
+# source could be read (so the caller can skip that version rather than treat an
+# unreadable manifest as "no requirement"). Advances the heartbeat around the
+# network calls like the rest of reconcile.
+admin_controller_range_for_version() {
+  local ver="$1"
+  [[ -n "${ver}" ]] || return 1
+
+  local iopack=""
+  # 1) Preferred: GitHub raw io-package.json by tag (small file).
+  if command -v curl >/dev/null 2>&1; then
+    heartbeat
+    iopack="$(curl -fsSL --max-time 20 \
+      "https://raw.githubusercontent.com/${IOB_ADMIN_GITHUB_REPO}/v${ver}/io-package.json" \
+      2>/dev/null || true)"
+    heartbeat
+  fi
+
+  # 2) Fallback: the npm tarball. Only reached when the GitHub fetch returned
+  #    nothing (network error, missing tag, or curl unavailable). Documented as
+  #    heavy (downloads the package tarball) and therefore the non-preferred
+  #    path; extract ONLY package/io-package.json from it.
+  if [[ -z "${iopack}" ]]; then
+    local tarball tmpd=""
+    heartbeat
+    tarball="$(npm view "iobroker.admin@${ver}" dist.tarball 2>/dev/null | head -n1 || true)"
+    heartbeat
+    if [[ -n "${tarball}" ]] && command -v curl >/dev/null 2>&1; then
+      tmpd="$(mktemp -d 2>/dev/null || true)"
+      if [[ -n "${tmpd}" ]]; then
+        if curl -fsSL --max-time 60 "${tarball}" -o "${tmpd}/admin.tgz" 2>/dev/null; then
+          iopack="$(tar -xzO -f "${tmpd}/admin.tgz" package/io-package.json 2>/dev/null || true)"
+        fi
+        rm -rf -- "${tmpd}" 2>/dev/null || true
+      fi
+      heartbeat
+    fi
+  fi
+
+  [[ -n "${iopack}" ]] || return 1
+  printf '%s' "${iopack}" | node "${ADAPTER_COMPAT_MODULE}" extract
+}
+
+# resolve_compatible_admin_version: resolve the newest admin version COMPATIBLE
+# with the installed js-controller. Echoes the chosen version on stdout and
+# returns 0 on success; returns 1 and echoes nothing when NO compatible version
+# can be found (the caller then treats this as fatal -> block_unhealthy). Logs
+# its reasoning to the reconcile log. Honors IOB_RECONCILE_DRY_RUN (no network).
+#
+# Globals set for the caller's diagnostics:
+#   ADMIN_COMPAT_CONTROLLER   the installed controller version observed
+#   ADMIN_COMPAT_REQUIREMENT  the newest-probed admin's controller requirement
+resolve_compatible_admin_version() {
+  ADMIN_COMPAT_CONTROLLER=""
+  ADMIN_COMPAT_REQUIREMENT=""
+
+  local controller
+  controller="$(installed_jscontroller_version)"
+  ADMIN_COMPAT_CONTROLLER="${controller}"
+  if [[ -z "${controller}" ]]; then
+    # Cannot read the controller version: we cannot resolve compatibility, so do
+    # NOT pin — fall through to the normal unpinned install (return empty, rc 0).
+    log "admin-compat: could not read installed js-controller version; installing admin unpinned"
+    return 0
+  fi
+  log "admin-compat: installed js-controller version is ${controller}"
+
+  if [[ "${IOB_RECONCILE_DRY_RUN}" == "true" ]]; then
+    # Dry-run: do not hit the network. Log the intent and leave the install to
+    # the normal path (which itself only logs in dry-run).
+    log "admin-compat: [dry-run] would resolve newest admin compatible with js-controller ${controller} (no network)"
+    return 0
+  fi
+
+  # Enumerate candidate admin versions from npm, newest-first, stable only
+  # (the pure module drops prereleases and sorts by semver).
+  local versions_json ordered
+  heartbeat
+  versions_json="$(npm view iobroker.admin versions --json 2>/dev/null || true)"
+  heartbeat
+  if [[ -z "${versions_json}" ]]; then
+    log "admin-compat: could not enumerate admin versions from npm; installing admin unpinned"
+    return 0
+  fi
+  # Parse + order newest-first (stable only) in the pure module.
+  ordered="$(node "${ADAPTER_COMPAT_MODULE}" sort "${versions_json}" 2>/dev/null || true)"
+  if [[ -z "${ordered}" ]]; then
+    log "admin-compat: no stable admin versions parsed from npm output; installing admin unpinned"
+    return 0
+  fi
+
+  # Probe newest->oldest, STOP at the first compatible version. Bounded by
+  # IOB_ADMIN_COMPAT_PROBE_MAX so we never fetch an unbounded number of files.
+  local probed=0 ver range verdict
+  local newest_probed_range="" newest_recorded=false
+  while IFS= read -r ver; do
+    [[ -n "${ver}" ]] || continue
+    probed=$((probed + 1))
+    if [[ "${probed}" -gt "${IOB_ADMIN_COMPAT_PROBE_MAX}" ]]; then
+      log "admin-compat: reached probe limit (${IOB_ADMIN_COMPAT_PROBE_MAX}) without a compatible version"
+      break
+    fi
+
+    if ! range="$(admin_controller_range_for_version "${ver}")"; then
+      log "admin-compat: could not read io-package.json for admin ${ver}; skipping"
+      continue
+    fi
+    if [[ "${newest_recorded}" != "true" ]]; then
+      newest_probed_range="${range}"
+      ADMIN_COMPAT_REQUIREMENT="${range}"
+      newest_recorded=true
+    fi
+
+    verdict="$(node "${ADAPTER_COMPAT_MODULE}" check "${controller}" "${range}" 2>/dev/null || true)"
+    case "${verdict}" in
+      compatible)
+        log "admin-compat: admin ${ver} requires js-controller '${range:-<none>}'; compatible with installed ${controller}"
+        printf '%s' "${ver}"
+        return 0
+        ;;
+      incompatible)
+        log "admin-compat: admin ${ver} requires js-controller '${range}'; not satisfied by installed ${controller}; trying older"
+        ;;
+      *)
+        log "admin-compat: admin ${ver} js-controller requirement '${range}' could not be evaluated; skipping"
+        ;;
+    esac
+  done <<<"${ordered}"
+
+  # Nothing compatible found.
+  return 1
+}
+
 # -- Execute the ordered actions ----------------------------------------------
 #
 # In dry-run mode we log the concrete command instead of running it, so tests
@@ -1511,6 +1695,39 @@ while IFS=$'\t' read -r action args_rest; do
               rm -rf -- "${adapter_dir}" 2>/dev/null \
                 || log "  ${adapter}: WARNING could not remove ${adapter_dir}; reinstall may not repair the tree"
             fi
+          fi
+
+          # Fresh-install admin / js-controller COMPATIBILITY bootstrap.
+          #
+          # ONLY on a fresh install, and ONLY for `admin`: the newest STABLE
+          # admin can require a newer js-controller than the image ships. Resolve
+          # the newest admin version COMPATIBLE with the installed controller and
+          # install THAT exact version via `iobroker url iobroker.admin@<ver>`,
+          # rather than the unpinned `iobroker install admin`. If NO compatible
+          # version exists this is FATAL: block_unhealthy (never exit). This does
+          # NOT touch any other adapter or a normal (non-fresh) restart.
+          if [[ "${fresh_install}" == "true" && "${adapter}" == "admin" ]]; then
+            admin_pinned=""
+            admin_rc=0
+            admin_pinned="$(resolve_compatible_admin_version)" || admin_rc=$?
+            if [[ "${admin_rc}" -ne 0 ]]; then
+              # Resolver exhausted all candidates without a compatible version.
+              block_unhealthy "no compatible iobroker.admin version found for the installed js-controller ${ADMIN_COMPAT_CONTROLLER:-unknown}: the newest admin requires js-controller '${ADMIN_COMPAT_REQUIREMENT:-unknown}'. Bake a newer js-controller into the image or pin an older admin. (Fresh-install admin bootstrap cannot proceed.)"
+            fi
+            if [[ -n "${admin_pinned}" ]]; then
+              log "  admin: installing compatibility-resolved version ${admin_pinned} (fresh install)"
+              if run_install iobroker url "iobroker.admin@${admin_pinned}"; then
+                SUMMARY_INSTALL_OK+="${adapter}"$'\n'
+                summary_add_action "admin-compat: installed iobroker.admin@${admin_pinned}"
+              else
+                record_failure "${adapter}" "${adapter} (url: iobroker.admin@${admin_pinned})"
+                SUMMARY_INSTALL_FAIL+="${adapter}"$'\n'
+              fi
+              continue
+            fi
+            # Empty pin with rc 0: resolution was skipped (dry-run, or the
+            # controller/version lookup was unavailable). Fall through to the
+            # normal unpinned install path below.
           fi
 
           src="$(adapter_install_source "${adapter}")"

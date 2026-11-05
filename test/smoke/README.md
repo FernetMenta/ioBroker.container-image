@@ -20,6 +20,7 @@ message and exits 0**, so it never hard-fails in a build-less environment.
 | `pid1-signals.sh`                  | PID 1 = tini, SIGTERM graceful shutdown + exit propagation, zombie reaping, empty Data_Volume init, dropped user startup scripts                                                                                                                                                                                      | 8.6, 13.1, 13.2, 13.3, 14.1, 14.4, 14.5, 14.6 |
 | `install-source-classify.sh`       | Classifies `reconcile.sh`'s `source_is_url` router (repo-by-name vs `iobroker url`), incl. pinned/URL/GitHub and scoped/`@npm:` vendor shapes                                                                                                                                                                         | 8.9, 8.10                                     |
 | `fresh-install-admin-bootstrap.sh` | Drives `reconcile.sh` across the entrypoint's two passes (init -> install) to prove the fresh-install `admin` seed survives the split, installs the setup UI AND creates the `admin.0` instance (and does neither again on a normal restart)                                                                          | 8.6, 8.9, 8.10                                |
+| `admin-jscontroller-compat.sh`     | Drives `reconcile.sh` (non-dry-run, stubbed `npm`/`curl`) to prove the fresh-install admin bootstrap installs the newest admin COMPATIBLE with the baked-in js-controller, and `block_unhealthy`s (never exits) when no compatible admin exists                                                                       | 8.6, 8.9, 8.10                                |
 | `health-watchdog.sh`               | Drives the `scripts/health-watchdog.sh` loop with an injected fake healthcheck (scripted exit codes) and a disposable target PID; asserts SIGTERM fires exactly at the consecutive-unhealthy threshold, a healthy result resets the streak, the trigger fires once (latch), and malformed knobs fall back to defaults | 9                                             |
 
 ## `manifest-size.sh`
@@ -369,6 +370,52 @@ Cases asserted:
   skipped because `node` was unavailable.
 - `1` — regression (admin not installed on a fresh start, or re-installed on a
   routine restart).
+
+## `admin-jscontroller-compat.sh`
+
+A **no-Docker, no-image** check that pins the fresh-install admin /
+js-controller **compatibility resolution** in `scripts/reconcile.sh`. It drives
+the real script in **non-dry-run** mode against temp dirs with tiny stub
+`iobroker` / `npm` / `curl` binaries on `PATH` (modelling the baked-in
+js-controller version, the `npm view iobroker.admin versions` candidate list,
+and the GitHub raw `io-package.json` per tag), so it needs only bash + node +
+`timeout`.
+
+### The problem it pins
+
+On a fresh container the newest STABLE admin can require a NEWER js-controller
+than the image ships (the real case: admin 8.3.5 needs js-controller >=7.2.5
+while the image ships 7.2.2). The unpinned `iobroker install admin` would then
+land an admin incompatible with the baked-in controller. The fix resolves the
+newest admin version COMPATIBLE with the installed controller and installs that
+exact version via `iobroker url iobroker.admin@<ver>`; when none is compatible
+it is FATAL and the container is held unhealthy (`block_unhealthy`, never a
+clean exit). The pure decision logic lives in `lib/adapter-compat.js` (covered
+by `test/adapter-compat.*test.js`); this harness covers the shell glue.
+
+Cases asserted:
+
+1. **Newest incompatible** — controller 7.2.2, candidates 8.3.5 (needs >=7.2.5)
+   / 8.2.0 (needs >=7.0.0): resolves to and installs 8.2.0, never 8.3.5.
+2. **Newest already compatible** — controller 7.5.0: installs the newest, 8.3.5.
+3. **Nothing compatible** — controller 7.2.2, all candidates need >=7.2.5:
+   logs the FATAL message, does **not** start js-controller, and holds the
+   container (so `timeout` kills the `block_unhealthy` sleep rather than a clean
+   exit); no admin version is installed.
+
+### Usage
+
+```bash
+./test/smoke/admin-jscontroller-compat.sh
+```
+
+### Exit codes
+
+- `0` — the compatibility resolution picks the newest compatible admin and
+  blocks when none exists, **or** skipped because `node`/`timeout` was
+  unavailable.
+- `1` — a regression (wrong version chosen, incompatible version installed, or
+  the fatal no-compatible case not held unhealthy).
 
 ## `health-watchdog.sh`
 
