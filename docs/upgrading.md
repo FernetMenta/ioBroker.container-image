@@ -88,23 +88,28 @@ mounted over the image's own copy, the container keeps using the **old**
 js-controller from the volume even after you pull a new image — so the upgrade
 appears to do nothing to the controller version.
 
-To pick up the new js-controller, **empty that volume's directory before
-starting the new image**. With the volume empty, the container fills it from the
-new image on startup (this needs internet so adapters can be reinstalled), and
-your `iobroker-data` stays untouched:
+To pick up the new js-controller, **delete and recreate that named volume
+before starting the new image**. With the volume gone, the container recreates
+it and fills it from the new image on startup (this needs internet so adapters
+can be reinstalled), and your `iobroker-data` stays untouched:
 
 ```bash
 docker compose down
-# delete the contents of the host folder mapped to node_modules, e.g.:
-rm -rf node_modules && mkdir node_modules
+# remove the named node_modules volume (it is recreated empty on next start):
+docker volume rm node_modules
 docker compose up -d
 ```
+
+The volume name is whatever you mapped to `/opt/iobroker/node_modules` — it may
+be prefixed by your Compose project (e.g. `iobroker_node_modules`). List volumes
+with `docker volume ls` to confirm the exact name. On Podman substitute
+`podman volume rm node_modules` / `podman volume ls`.
 
 Notes:
 
 - Your **configuration and state are safe** — this only clears the adapter/
   runtime code, which is reinstalled automatically. Do **not** delete the
-  `iobroker-data` folder.
+  `iobroker-data` volume.
 - If you do **not** mount a `node_modules` volume (the default), skip this
   entirely: the new image already contains the new js-controller.
 - The same step applies when the new image moves to a newer **Node.js major**
